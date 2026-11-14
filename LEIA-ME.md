@@ -1,0 +1,55 @@
+# MemeBot v12 — Paper Trading
+
+O MemeBot v12 analisa tokens Solana e simula operações. Esta versão é exclusivamente de Paper Trading.
+
+## Segurança e limites operacionais
+
+- `mode` tem de permanecer `paper`.
+- `live_trading_enabled` tem de permanecer `false`.
+- Não existem assinaturas nem envio de transações reais. Não introduza chaves privadas, seeds ou credenciais no projeto.
+- Cada compra exige confirmação manual no terminal, vinculada ao identificador completo e ao código da proposta. O Dashboard é somente de leitura e não aprova nem executa ordens.
+- O limite nominal é 5 EUR por operação, convertido para USD pela taxa BCE da sessão. Se a estratégia calcular menos, mantém-se o valor inferior. Uma ordem que não caiba integralmente no saldo é bloqueada; não há compra parcial.
+- O bot não aceita novas compras enquanto houver uma posição aberta. Posições legadas não são liquidadas à força para impor o limite.
+- Uma taxa BCE ausente, inválida, expirada ou não persistida bloqueia novas compras.
+
+A configuração de exemplo está em `config_operacoes.example.json`. A configuração local `config_operacoes.json` é ignorada pelo Git. Confirme os valores de segurança antes de qualquer execução.
+
+## Dashboard
+
+Com o bot já em execução, o Dashboard está disponível apenas na máquina local em <http://127.0.0.1:8000>. Não exponha a porta, não crie encaminhamento de portas e não permita acesso pela rede local. O Dashboard não possui controlos de compra nem de aprovação.
+
+## Componentes
+
+- `bot.py` contém o Scanner, o Analista, o Executor Paper, o Risk e a aplicação web.
+- `paper_trading_limits.py` trata os limites operacionais, a taxa BCE e a exclusividade da instância.
+- `paper_operations.py` mantém o diário idempotente das operações Paper.
+- `smart_filters_market.py` recolhe snapshots observacionais de mercado; `smart_protection_observability.py` regista avaliações de risco para observabilidade.
+- `smart_filters_security.py`, os módulos Smart Money, o monitor de carteiras e o decoder são componentes separados; não os interprete como critérios integrados no decisor principal sem verificar o ponto de ligação no código.
+
+As fontes públicas consultadas podem falhar ou impor limites. Dados indisponíveis não são garantia de segurança nem sinal para comprar.
+
+## Preparação local
+
+1. Use Python 3.10 ou superior e instale as dependências declaradas em `requirements.txt`.
+2. Para uma primeira configuração local, copie `config_operacoes.example.json` para `config_operacoes.json`; não substitua uma configuração existente sem a rever.
+3. Confirme `mode=paper`, `live_trading_enabled=false`, confirmação manual, máximo de 5 EUR e uma posição aberta.
+4. Antes de iniciar, confirme que não existe outra instância do bot a usar o mesmo estado.
+5. Só então, se decidir iniciar o Paper Trading, execute `python bot.py`. Para encerramento normal, use Ctrl+C. Não use reset como procedimento de arranque.
+
+Não abra o Dashboard noutros dispositivos nem altere as configurações de rede.
+
+## Testes
+
+Execute testes apenas numa cópia isolada, nunca sobre os dados operacionais. Os testes podem criar ficheiros temporários ou caches. Os testes de decoder/pipeline que dependem de fixtures on-chain não fazem parte da seleção inicial do repositório.
+
+```text
+python -m py_compile bot.py paper_operations.py paper_trading_limits.py
+python -m unittest discover -p "teste_*.py" -v
+python teste_offline.py
+```
+
+## Dados locais e publicação
+
+Estado, histórico de operações, logs, bases SQLite, fixtures, watchlists reais, credenciais e backups são dados locais e estão excluídos pelo `.gitignore`. Não confie apenas no `.gitignore`: reveja o conteúdo e os ficheiros staged antes de cada commit. A configuração de exemplo e `wallet_watchlist.example.json` contêm apenas parâmetros sanitizados/placeholders.
+
+`AUDITORIA_FASE1.md` e `AUDITORIA_INTEGRACAO_V7.md` são relatórios históricos, não especificações do estado atual. `REQUISITOS_OPERACAO_MANUAL.md` descreve requisitos futuros, não autoriza nem ativa execução real.

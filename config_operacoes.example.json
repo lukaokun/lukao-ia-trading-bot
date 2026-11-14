@@ -1,0 +1,13 @@
+{
+    "mode":  "paper",
+    "live_trading_enabled":  false,
+    "manual_confirmation_required":  true,
+    "max_eur_per_operation":  5.0,
+    "max_open_positions":  1,
+    "reject_duplicate_orders":  true,
+    "require_cost_estimate_before_approval":  true,
+    "require_slippage_estimate_before_approval":  true,
+    "block_if_costs_or_minimum_order_cannot_be_verified":  true,
+    "emergency_stop_enabled":  true,
+    "private_keys_in_application":  false
+}

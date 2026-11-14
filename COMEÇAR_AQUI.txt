@@ -1,0 +1,38 @@
+MEMEBOT V12 — GUIA INICIAL SEGURO
+=================================
+
+Esta versão funciona exclusivamente em Paper Trading. Este guia nao inicia o bot por si.
+
+SEGURANCA
+- mode=paper
+- live_trading_enabled=false
+- Confirmacao manual obrigatoria para cada compra, no terminal.
+- Maximo nominal de 5 EUR por operacao, convertido pela taxa BCE da sessao.
+- Maximo de uma posicao aberta para permitir novas compras.
+- Sem compras parciais: saldo insuficiente bloqueia a ordem completa.
+- Nunca introduza seeds, chaves privadas ou credenciais no projeto.
+
+CONFIGURACAO LOCAL
+1. Use Python 3.10 ou superior.
+2. Instale apenas as dependencias listadas em requirements.txt.
+3. Se ainda nao existir configuracao local, copie config_operacoes.example.json para config_operacoes.json.
+4. Confirme todos os valores de seguranca acima antes de iniciar.
+5. Confirme que nao existe outra instancia a utilizar o mesmo estado.
+
+EXECUCAO (APENAS SE DECIDIR INICIAR PAPER)
+- Comando: python bot.py
+- Cada proposta de compra aguarda confirmacao manual explicita no terminal.
+- O Dashboard abre apenas na mesma maquina: http://127.0.0.1:8000
+- Nao permita acesso por Wi-Fi/LAN, nao altere firewall e nao encaminhe a porta 8000.
+- Para terminar normalmente, use Ctrl+C. Nao use reset para encerrar ou preparar um arranque.
+
+O Dashboard e somente de leitura. Nao aprova nem executa ordens.
+Nao ha execucao real, assinatura ou envio de transacoes.
+
+TESTES
+Execute testes apenas numa copia isolada, nunca junto dos dados operacionais:
+  python -m unittest discover -p "teste_*.py" -v
+  python teste_offline.py
+
+Os testes com fixtures on-chain excluidas podem nao estar disponiveis nesta versao do repositorio.
+Os relatórios AUDITORIA_FASE1.md e AUDITORIA_INTEGRACAO_V7.md sao historicos.
