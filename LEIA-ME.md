@@ -7,7 +7,7 @@ O MemeBot v12 analisa tokens Solana e simula operações. Esta versão é exclus
 - `mode` tem de permanecer `paper`.
 - `live_trading_enabled` tem de permanecer `false`.
 - Não existem assinaturas nem envio de transações reais. Não introduza chaves privadas, seeds ou credenciais no projeto.
-- Cada compra exige confirmação manual no terminal, vinculada ao identificador completo e ao código da proposta. O Dashboard é somente de leitura e não aprova nem executa ordens.
+- Cada compra exige confirmação manual explícita, por operação: no terminal (identificador completo + código da proposta) ou no Dashboard local (botão Aprovar seguido de "Sim, aprovar"). O Dashboard só pode aprovar ou recusar propostas Paper já criadas pelo bot; não cria compras, não vende e não altera limites. Autorizado pelo operador em 14/11/2026 **apenas para Paper Trading**; tem de ser revisto antes de qualquer execução real.
 - O limite nominal é 5 EUR por operação, convertido para USD pela taxa BCE da sessão. Se a estratégia calcular menos, mantém-se o valor inferior. Uma ordem que não caiba integralmente no saldo é bloqueada; não há compra parcial.
 - O bot não aceita novas compras enquanto houver uma posição aberta. Posições legadas não são liquidadas à força para impor o limite.
 - Uma taxa BCE ausente, inválida, expirada ou não persistida bloqueia novas compras.
@@ -16,7 +16,17 @@ A configuração de exemplo está em `config_operacoes.example.json`. A configur
 
 ## Dashboard
 
-Com o bot já em execução, o Dashboard está disponível apenas na máquina local em <http://127.0.0.1:8000>. Não exponha a porta, não crie encaminhamento de portas e não permita acesso pela rede local. O Dashboard não possui controlos de compra nem de aprovação.
+Com o bot já em execução, o Dashboard Neural está disponível apenas na máquina local em <http://127.0.0.1:8000> (o anterior continua em `/classico`). Não exponha a porta, não crie encaminhamento de portas e não permita acesso pela rede local.
+
+O único pedido de escrita é `POST /api/proposta/decisao` (aprovar ou recusar uma proposta Paper pendente). O servidor só o aceita com o endereço e a origem locais, uma chave secreta gerada em cada arranque e servida apenas à própria página, modo Paper com confirmação manual e, para aprovar, sem paragem de emergência ativa. Cada decisão pede confirmação ("Sim") na página e o Executor revalida tudo antes de executar.
+
+## Alterações de 14/11/2026
+
+- Limite máximo de slippage simulado aprovado: 3% (`APPROVED_MAX_SLIPPAGE_PCT` e `max_slippage_pct`).
+- `emergency_stop_enabled` passou a ser carregado da configuração (os comandos `PARAR_PAPER`/`REARMAR_PAPER` ficam funcionais).
+- Observação extra (só leitura, não decide compras): permissões do mint, concentração de holders (RPC público Solana) e cotação Jupiter para tokens aprovados — `observacao_extra.py`.
+- GeckoTerminal como fonte extra de descoberta em modo observação: tokens encontrados só por esta fonte são analisados e gravados, mas nunca geram propostas.
+- Decisão de propostas no Dashboard (ver acima).
 
 ## Componentes
 

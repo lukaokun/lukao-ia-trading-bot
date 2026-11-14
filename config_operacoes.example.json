@@ -4,6 +4,7 @@
     "manual_confirmation_required":  true,
     "max_eur_per_operation":  5.0,
     "max_open_positions":  1,
+    "max_slippage_pct":  3.0,
     "reject_duplicate_orders":  true,
     "require_cost_estimate_before_approval":  true,
     "require_slippage_estimate_before_approval":  true,

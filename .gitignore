@@ -105,7 +105,9 @@ id_ed25519*
 *~
 
 # User-provided binary assets pending publication rights review
-/assets/
+/assets/*
+# O Dashboard Neural e codigo do projeto (HTML/CSS/JS) e deve ser versionado
+!/assets/dashboard_neural.html
 
 # Generated caches, environments, archives and launch scripts
 **/__pycache__/
@@ -136,3 +138,6 @@ Thumbs.db
 !/config_operacoes.example.json
 !/wallet_watchlist.example.json
 !/historico_exemplo.csv
+
+# Chaves de API locais (ex.: Helius) - nunca publicar
+chaves_locais.json

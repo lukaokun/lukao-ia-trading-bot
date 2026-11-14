@@ -26,6 +26,7 @@ import copy
 import csv
 import hashlib
 import io
+import hmac
 import json
 import logging
 import math
@@ -52,15 +53,19 @@ import requests
 from early_accumulation import score_acumulacao
 from smart_filters_market import MarketSnapshotRecorder
 from smart_protection_observability import SmartProtectionObservability
+from observacao_extra import ObservadorExtra, configurar_rpc
 from paper_trading_limits import (
-    ECB_SOURCE, EcbRateError, MAX_RATE_AGE_DAYS, OperationalConfigError, ProcessInstanceLock,
+    ECB_SOURCE, EcbRateError, MAX_RATE_AGE_DAYS, MAX_OPERATION_EUR, MAX_OPEN_POSITIONS,
+    OperationalConfigError, ProcessInstanceLock,
     canonical_reset_paths, fetch_ecb_rate, load_operational_config, usd_cap_from_eur,
     validate_locked_session_rate, validate_rate, state_access_lock,
 )
 from paper_operations import (
-    PaperOperationError, PaperOperationStore, atomic_write_bytes, atomic_write_json,
+    PaperOperationAuthorizationError, PaperOperationError, PaperOperationStore,
+    atomic_write_bytes, atomic_write_json,
     reset_pending_path, sync_state_in_place,
 )
+from paper_audit_log import PaperAuditError, PaperAuditJournal, sanitize_audit_text
 
 # ============================================================================
 # DEFINICOES - altera aqui os valores a teu gosto
@@ -91,7 +96,7 @@ CONFIG = {
     "subida_h1_maxima_pct": 150,     # rejeita se ja subiu mais do que isto na ultima hora (ja "pumpou")
     "subida_m5_maxima_pct": 60,      # rejeita se subiu mais do que isto nos ultimos 5 minutos
     "queda_m5_maxima_pct": -20,      # rejeita se caiu mais do que isto nos ultimos 5 minutos
-    # RugCheck (opcional - se a API nao responder o bot continua sem ela)
+    # RugCheck obrigatorio para candidatos que ainda podem atingir a pontuacao minima; falha fecha a analise.
     "usar_rugcheck": True,
     "rugcheck_rejeitar_perigo": True,   # rejeita tokens com riscos de nivel "danger"
     "rugcheck_score_maximo": 60,        # rejeita se o score normalizado de risco for superior (0 = seguro, 100 = mau)
@@ -99,7 +104,7 @@ CONFIG = {
     # ---------------- Executor (Agente 3) ----------------
     "tamanho_posicao_pct": 12,       # % do capital total usada em cada compra
     "posicao_minima_usd": 1.0,       # nao abre posicoes mais pequenas do que isto
-    "max_posicoes_abertas": 4,       # maximo de posicoes abertas ao mesmo tempo
+    "max_posicoes_abertas": 1,       # maximo operacional Paper, tambem validado no Executor
     "exposicao_maxima_pct": 55,      # % maxima do capital que pode estar investida
     "slippage_pct": 2.0,             # slippage simulado em cada compra E em cada venda
     "taxa_pct": 1.0,                 # taxa simulada em cada compra E em cada venda
@@ -123,6 +128,7 @@ CONFIG = {
                                      # interrompidos (em vez de os fechar com um preco de horas depois)
 
     # ---------------- Laboratorio (descobrir as melhores regras com dados reais) ----------------
+    "observacao_extra": True,        # so leitura: holders, permissoes do mint e cotacao Jupiter dos aprovados (nao decide nada)
     "gravar_percursos": True,        # grava o percurso do preco de cada sinal (comprado ou nao)
     "percurso_minutos": 180,         # durante quantos minutos segue cada sinal
     "percursos_max_ativos": 26,      # quantos sinais segue ao mesmo tempo (26 + 4 posicoes = 1 pedido)
@@ -135,6 +141,8 @@ CONFIG = {
     # intervalo minimo entre pedidos, por tipo (respeita os limites das APIs)
     "intervalo_min_perfis_seg": 1.2,   # DexScreener perfis/boosts: ~60 pedidos/min
     "intervalo_min_pares_seg": 0.25,   # DexScreener pares: ~300 pedidos/min
+    "fonte_geckoterminal": True,       # descoberta extra (pools novas); tokens so desta fonte NAO geram propostas
+    "intervalo_gecko_seg": 60,         # de quantos em quantos segundos consulta o GeckoTerminal
     "intervalo_min_rugcheck_seg": 1.0,
 
     # ---------------- Telegram (opcional) ----------------
@@ -143,7 +151,7 @@ CONFIG = {
     # ---------------- Plataforma web (sinais em direto) ----------------
     "painel_web": True,              # liga a pagina web com os sinais
     "porta_web": 8000,               # abre http://localhost:8000 no browser
-    "painel_web_rede": True,         # True = tambem da para abrir no telemovel (mesma rede Wi-Fi); False = so neste PC
+    "painel_web_rede": False,        # Dashboard exclusivamente local; servidor ligado a 127.0.0.1
     "max_sinais": 60,                # quantos sinais ficam guardados/visiveis
 
     # ---------------- Ecra ----------------
@@ -156,6 +164,11 @@ URL_PERFIS = DEX + "/token-profiles/latest/v1"
 URL_BOOSTS = DEX + "/token-boosts/latest/v1"
 URL_PARES_V1 = DEX + "/tokens/v1/solana/{}"
 URL_PARES_LEGACY = DEX + "/latest/dex/tokens/{}"
+# GeckoTerminal (gratis, sem chave, ~30 pedidos/min): fonte EXTRA de descoberta, em modo observacao
+URL_GECKO_NOVAS_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"
+MINTS_BASE_IGNORADOS = {"So11111111111111111111111111111111111111112",  # SOL
+                        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}  # USDT
 URL_RUGCHECK = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 MAX_ENDERECOS_POR_PEDIDO = 30
 
@@ -241,6 +254,7 @@ class ClienteHTTP:
         self.intervalos = {
             "perfis": cfg["intervalo_min_perfis_seg"],
             "pares": cfg["intervalo_min_pares_seg"],
+            "gecko": 2.5,
             "rugcheck": cfg["intervalo_min_rugcheck_seg"],
         }
         self.cabecalhos = {"Accept": "application/json", "User-Agent": "paper-bot/1.0"}
@@ -388,6 +402,39 @@ class Scanner:
         self.last_new_mints = []
         self.last_reanalysis_mints = []
         self.last_pair_errors = []
+        # GeckoTerminal: inativo por defeito; main() ativa-o no modo Paper com mercado real.
+        self.gecko_ativo = False
+        self.origem_gecko = set()      # mints encontrados so pelo GeckoTerminal (modo observacao)
+        self.gecko_ultimo = None
+        self.last_gecko_count = 0
+
+    def tokens_gecko(self):
+        """Pools novas de Solana no GeckoTerminal com liquidez minima. Devolve lista de mints."""
+        if not self.gecko_ativo or not self.cfg.get("fonte_geckoterminal"):
+            return []
+        if (self.gecko_ultimo is not None
+                and time.monotonic() - self.gecko_ultimo < max(30, num(self.cfg.get("intervalo_gecko_seg"), 60))):
+            return []
+        self.gecko_ultimo = time.monotonic()
+        dados = self.http.get_json(URL_GECKO_NOVAS_POOLS, "gecko", tentativas=1)
+        lista = dados.get("data") if isinstance(dados, dict) else None
+        if not isinstance(lista, list):
+            self.last_gecko_count = 0
+            return []
+        minimo = num(self.cfg.get("liquidez_minima_usd"), 0)
+        mints = []
+        for pool in lista[:40]:
+            if not isinstance(pool, dict):
+                continue
+            liq = num(obter(pool, "attributes", "reserve_in_usd"))
+            ident = obter(pool, "relationships", "base_token", "data", "id")
+            if liq < minimo or not isinstance(ident, str) or not ident.startswith("solana_"):
+                continue
+            mint = ident[len("solana_"):]
+            if MINT_VALIDO.fullmatch(mint) and mint not in mints and mint not in MINTS_BASE_IGNORADOS:
+                mints.append(mint)
+        self.last_gecko_count = len(mints)
+        return mints
 
     def tokens_recentes(self):
         """Devolve a lista de enderecos (mints) de Solana encontrados agora."""
@@ -411,6 +458,21 @@ class Scanner:
                     recebidos += 1
                     if mint not in mints:
                         mints.append(mint)
+        # Fonte extra (observacao): so acrescenta mints que o DexScreener nao trouxe.
+        for mint in mints:
+            self.origem_gecko.discard(mint)
+        try:
+            extra = self.tokens_gecko()
+        except Exception:
+            log.exception("GeckoTerminal ignorado neste ciclo")
+            extra = []
+        for mint in extra:
+            if mint not in mints:
+                recebidos += 1
+                mints.append(mint)
+                self.origem_gecko.add(mint)
+        if len(self.origem_gecko) > 5000:
+            self.origem_gecko = set(list(self.origem_gecko)[-2000:])
         self.last_received_count = recebidos
         self.last_received_unique_mints = list(mints)
         return mints
@@ -539,7 +601,11 @@ class Analista:
         """Consulta o RugCheck. Devolve None se nao estiver disponivel."""
         if not self.cfg["usar_rugcheck"]:
             return None
-        dados = self.http.get_json(URL_RUGCHECK.format(mint), "rugcheck", tentativas=2)
+        try:
+            dados = self.http.get_json(URL_RUGCHECK.format(mint), "rugcheck", tentativas=2)
+        except Exception as exc:
+            log.warning("RugCheck indisponivel (%s); analise permanece pendente", type(exc).__name__)
+            return None
         if not isinstance(dados, dict) or not isinstance(dados.get("risks"), list):
             return None
         riscos = dados["risks"]
@@ -756,10 +822,12 @@ class Analista:
         if cfg["usar_rugcheck"] and parcial + 10 >= cfg["pontuacao_minima"]:
             rc = self.rugcheck(mint)
         if rc is None:
-            if cfg["usar_rugcheck"] and parcial + 10 >= cfg["pontuacao_minima"]:
+            if parcial + 10 >= cfg["pontuacao_minima"]:
                 return self._bloquear(criterios, "rugcheck", "RugCheck", None,
                                       cfg["rugcheck_score_maximo"],
-                                      "RugCheck indisponivel; analise incompleta.",
+                                      ("RugCheck indisponivel ou desativado; analise incompleta."
+                                       if cfg["usar_rugcheck"] else
+                                       "RugCheck obrigatorio desativado; analise incompleta."),
                                       status="pending_data", reavaliar=True,
                                       campos_ausentes=["rugcheck"])
             d["rugcheck"] = 5  # componente opcional desativado / token sem hipotese de passar
@@ -1112,7 +1180,7 @@ class PaperProposal:
 
 class ManualApprovalManager:
     """One-use, in-memory approvals bound to a single Paper order proposal."""
-    def __init__(self, ttl_seconds=90):
+    def __init__(self, ttl_seconds=90, terminal_command_handler=None):
         self.ttl_seconds = max(15, min(int(ttl_seconds), 300))
         self._lock = threading.Lock()
         self._pending = {}
@@ -1121,6 +1189,10 @@ class ManualApprovalManager:
         self._permits = {}
         self._issued_ids = set()
         self._issued_codes = set()
+        self._forced_reasons = {}
+        self._dashboard_decided = {}  # proposal_id -> "aprovar" | "recusar" (decisoes feitas no dashboard)
+        self._terminal_command_handler = terminal_command_handler
+        self._terminal_buffer = ""
         self._requests = queue.Queue()
         self._results = queue.Queue()
         self._stop = threading.Event()
@@ -1129,6 +1201,7 @@ class ManualApprovalManager:
     def start(self):
         if self._thread is None or not self._thread.is_alive():
             self._stop.clear()
+            print("Comandos Paper no terminal: PARAR_PAPER <motivo> | REARMAR_PAPER <ID_PARAGEM> <motivo>")
             self._thread = threading.Thread(target=self._terminal_worker,
                                            name="paper-manual-approval", daemon=True)
             self._thread.start()
@@ -1231,33 +1304,194 @@ class ManualApprovalManager:
                 chars += char
         return None
 
+    @staticmethod
+    def _read_terminal_char(timeout, stop_event):
+        """Read terminal input in short slices; Scanner/Risk never waits for input."""
+        if stop_event.is_set():
+            return None
+        if os.name == "nt":
+            import msvcrt
+            if not msvcrt.kbhit():
+                time.sleep(max(0.01, min(timeout, 0.1)))
+                return None
+            char = msvcrt.getwch()
+            if char == "\003":
+                return "\003"
+            if char in ("\r", "\n"):
+                print()
+                return "\n"
+            if char == "\b":
+                print("\b \b", end="", flush=True)
+                return "\b"
+            if char.isprintable():
+                print(char, end="", flush=True)
+                return char
+            return None
+        import select
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], max(0.0, min(timeout, 0.1)))
+            if not ready:
+                return None
+            data = os.read(sys.stdin.fileno(), 1)
+            if not data:
+                return "\004"
+            return data.decode(getattr(sys.stdin, "encoding", None) or "utf-8", errors="replace")
+        except (OSError, ValueError):
+            return "\004"
+
     def _terminal_worker(self):
-        while not self._stop.is_set():
-            try:
-                proposal_id = self._requests.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if proposal_id is None:
-                return
-            with self._lock:
-                proposal = self._pending.get(proposal_id)
-                if not proposal or self._statuses.get(proposal_id) != "pending":
+        if self._terminal_command_handler is None:
+            # Preserve the simple approval-only worker for isolated manager fixtures.
+            while not self._stop.is_set():
+                try:
+                    proposal_id = self._requests.get(timeout=0.2)
+                except queue.Empty:
                     continue
-                remaining = proposal.expires_monotonic - time.monotonic()
-            if remaining <= 0:
-                self._results.put((proposal_id, ""))
-                continue
-            print("\nPROPOSTA PAPER")
-            for line in proposal.terminal_lines():
-                print(line)
-            print(f"Confirme apenas no terminal: APROVAR {proposal.proposal_id} {proposal.confirmation_code}")
-            print("Resposta ausente, incompleta, incorreta ou expirada rejeita a proposta.")
+                if proposal_id is None:
+                    return
+                with self._lock:
+                    proposal = self._pending.get(proposal_id)
+                    if not proposal or self._statuses.get(proposal_id) != "pending":
+                        continue
+                    remaining = proposal.expires_monotonic - time.monotonic()
+                if remaining <= 0:
+                    self._results.put((proposal_id, ""))
+                    continue
+                try:
+                    answer = self._read_line_until(time.monotonic() + remaining, self._stop)
+                except Exception:
+                    log.exception("Erro a ler confirmacao manual; proposta recusada")
+                    answer = None
+                self._results.put((proposal_id, answer.strip() if isinstance(answer, str) else ""))
+            return
+        active_id = None
+        active_deadline = None
+        while not self._stop.is_set():
+            if active_id is None:
+                try:
+                    proposal_id = self._requests.get_nowait()
+                except queue.Empty:
+                    proposal_id = None
+                if proposal_id is None and self._stop.is_set():
+                    return
+                if proposal_id is not None:
+                    with self._lock:
+                        proposal = self._pending.get(proposal_id)
+                        if proposal and self._statuses.get(proposal_id) == "pending":
+                            active_id = proposal_id
+                            active_deadline = proposal.expires_monotonic
+                            print("\nPROPOSTA PAPER")
+                            for line in proposal.terminal_lines():
+                                print(line)
+                            print(f"Confirme apenas no terminal: APROVAR {proposal.proposal_id} {proposal.confirmation_code}")
+                            print("Comandos terminais: PARAR_PAPER <motivo> | REARMAR_PAPER <ID_PARAGEM> <motivo>")
+                            print("Resposta ausente, incompleta, incorreta ou expirada rejeita a proposta.")
+            if active_id is not None and active_id in self._dashboard_decided:
+                print(f"\nProposta {active_id[:12]} decidida no dashboard ({self._dashboard_decided[active_id]}).")
+                active_id = active_deadline = None
+                self._terminal_buffer = ""
+            if active_id is not None and time.monotonic() >= active_deadline:
+                self._forced_reasons[active_id] = "proposta expirada"
+                self._results.put((active_id, ""))
+                active_id = active_deadline = None
             try:
-                answer = self._read_line_until(time.monotonic() + remaining, self._stop)
+                char = self._read_terminal_char(0.05, self._stop)
             except Exception:
-                log.exception("Erro a ler confirmacao manual; proposta recusada")
-                answer = None
-            self._results.put((proposal_id, answer.strip() if isinstance(answer, str) else ""))
+                log.exception("Erro a ler terminal Paper; propostas recusadas")
+                char = "\004"
+            if char in ("\003", "\004"):
+                self._stop.set()
+                if active_id is not None:
+                    self._forced_reasons[active_id] = "interrupção ou EOF no terminal"
+                    self._results.put((active_id, ""))
+                    active_id = None
+                continue
+            if char == "\b":
+                self._terminal_buffer = self._terminal_buffer[:-1]
+                continue
+            if char not in (None, "\n"):
+                self._terminal_buffer = (self._terminal_buffer + char)[-512:]
+                continue
+            if char != "\n":
+                continue
+            answer, self._terminal_buffer = self._terminal_buffer.strip(), ""
+            if not answer:
+                continue
+            upper = answer.upper()
+            if upper.startswith("PARAR_PAPER ") or upper.startswith("REARMAR_PAPER "):
+                parts = answer.split(maxsplit=2)
+                action = "activate" if parts[0].upper() == "PARAR_PAPER" else "rearm"
+                argument = (answer.partition(" ")[2].strip() if action == "activate" else
+                            (parts[1] + " " + parts[2] if action == "rearm" and len(parts) > 2 else ""))
+                try:
+                    result = (self._terminal_command_handler(action, argument)
+                              if callable(self._terminal_command_handler) else (False, "comando indisponível"))
+                    ok, message = result if isinstance(result, tuple) else (bool(result), "")
+                except Exception as exc:
+                    log.exception("Falha no comando terminal de emergência Paper")
+                    ok, message = False, type(exc).__name__
+                print(("Paragem Paper atualizada: " if ok else "Comando Paper recusado: ") + str(message))
+                if action == "activate":
+                    self.invalidate_pending("paragem de emergência ativa")
+                    active_id = active_deadline = None
+                continue
+            if active_id is not None:
+                self._results.put((active_id, answer))
+                active_id = active_deadline = None
+            else:
+                print("Sem proposta ativa. Comando: PARAR_PAPER <motivo> ou REARMAR_PAPER <ID_PARAGEM> <motivo>.")
+
+    def decidir_dashboard(self, proposal_id, decisao):
+        """Decisao explicita vinda do dashboard local (Paper). Usa a mesma fila que o terminal.
+
+        Aprovar equivale a escrever no terminal a linha APROVAR <id> <codigo>; o Executor continua a
+        revalidar tudo (plano, limites, paragem de emergencia) antes de executar. Devolve (ok, mensagem).
+        """
+        if decisao not in ("aprovar", "recusar"):
+            return False, "decisao invalida"
+        with self._lock:
+            proposal = self._pending.get(proposal_id)
+            if proposal is None or self._statuses.get(proposal_id) != "pending":
+                return False, "proposta inexistente ou ja decidida"
+            if proposal_id in self._dashboard_decided:
+                return False, "proposta ja decidida no dashboard"
+            if proposal.expires_monotonic <= time.monotonic():
+                return False, "proposta expirada"
+            self._dashboard_decided[proposal_id] = decisao
+            if decisao == "aprovar":
+                self._results.put((proposal_id, f"APROVAR {proposal.proposal_id} {proposal.confirmation_code}"))
+                return True, "aprovada; o Executor vai revalidar e executar em Paper"
+        self.cancel(proposal_id, "recusada no dashboard")
+        return True, "recusada"
+
+    def invalidate_pending(self, reason):
+        with self._lock:
+            pending_ids = {proposal_id for proposal_id, status in self._statuses.items()
+                           if status in ("pending", "approved")}
+            for token, proposal_id in list(self._permits.items()):
+                if proposal_id in pending_ids:
+                    self._permits.pop(token, None)
+            for proposal_id, proposal in self._pending.items():
+                if self._statuses.get(proposal_id) not in ("pending", "approved"):
+                    continue
+                self._statuses[proposal_id] = "forced_rejected"
+                self._forced_reasons[proposal_id] = str(reason)
+                self._pending_mints.pop(proposal.mint, None)
+                self._results.put((proposal_id, ""))
+
+    def cancel(self, proposal_id, reason):
+        with self._lock:
+            proposal = self._pending.get(proposal_id)
+            if proposal is None or self._statuses.get(proposal_id) not in ("pending", "approved"):
+                return False
+            self._statuses[proposal_id] = "forced_rejected"
+            self._forced_reasons[proposal_id] = str(reason)
+            self._pending_mints.pop(proposal.mint, None)
+            for token, pid in list(self._permits.items()):
+                if pid == proposal_id:
+                    self._permits.pop(token, None)
+            self._results.put((proposal_id, ""))
+            return True
 
     def drain_results(self):
         found = []
@@ -1268,11 +1502,21 @@ class ManualApprovalManager:
                 break
             with self._lock:
                 proposal = self._pending.get(proposal_id)
-                if proposal is None or self._statuses.get(proposal_id) != "pending":
+                if proposal is None:
+                    continue
+                status = self._statuses.get(proposal_id)
+                if status == "forced_rejected":
+                    accepted = False
+                    reason = self._forced_reasons.pop(proposal_id, "proposta invalidada")
+                    self._statuses[proposal_id] = "rejected"
+                    found.append((proposal, None, accepted, reason))
+                    continue
+                if status != "pending":
                     continue
                 accepted = (proposal.expires_monotonic > time.monotonic()
                             and answer == f"APROVAR {proposal.proposal_id} {proposal.confirmation_code}")
-                reason = "aprovada manualmente" if accepted else (
+                reason = ("aprovada no dashboard" if self._dashboard_decided.get(proposal_id) == "aprovar"
+                          else "aprovada manualmente") if accepted else (
                     "proposta expirada" if proposal.expires_monotonic <= time.monotonic()
                     else "ID ou codigo incorreto")
                 self._statuses[proposal_id] = "approved" if accepted else "rejected"
@@ -1299,6 +1543,10 @@ class ManualApprovalManager:
                     and proposal.execution_json == current_plan
                     and proposal.amount_usd == (_decimal_canonico(amount) if amount is not None else ""))
 
+    def proposal_id_for_token(self, token):
+        with self._lock:
+            return self._permits.get(token) if isinstance(token, str) else None
+
     def discard(self, token):
         if not isinstance(token, str):
             return False
@@ -1318,6 +1566,7 @@ class ManualApprovalManager:
             self._permits.clear()
             self._issued_ids.clear()
             self._issued_codes.clear()
+            self._forced_reasons.clear()
 
 
 class Executor:
@@ -1328,6 +1577,9 @@ class Executor:
         self.estado = estado
         self.bot = bot
         self._purchase_lock = threading.Lock()
+        self._buy_commit_capability = object()
+        self.bot.paper_operations.bind_buy_guard(self._validar_commit_compra,
+                                                 self._buy_commit_capability)
 
     def capital(self):
         """Saldo livre + custo das posicoes abertas."""
@@ -1339,6 +1591,60 @@ class Executor:
             "slippage_pct": _decimal_canonico(self.cfg.get("slippage_pct")),
             "simular_impacto_preco": bool(self.cfg.get("simular_impacto_preco")),
         }
+
+    def _validar_commit_compra(self, authorization, current_state, candidate_state, trade_row):
+        """Final storage-boundary validation; raw PaperOperationStore BUYs are refused."""
+        if (not isinstance(authorization, dict)
+                or authorization.get("manual_confirmation_consumed") is not True
+                or authorization.get("execution_plan") is None
+                or not authorization.get("proposal_id")):
+            return False
+        emergency_check = getattr(self.bot, "_emergency_stop_is_active", None)
+        if not callable(emergency_check) or emergency_check():
+            return False
+        amount, _reason = self.pode_comprar()
+        if amount <= 0:
+            return False
+        try:
+            plan = json.loads(authorization["execution_plan"])
+            if _json_canonico(authorization.get("plan_fields")) != authorization["execution_plan"]:
+                return False
+            debit = Decimal(plan["debit_total_usd"])
+            fx = validate_locked_session_rate(current_state.get("operational_session", {}))
+            eur_limit = min(Decimal(str(self.cfg["max_eur_per_operation"])), MAX_OPERATION_EUR)
+            max_usd = usd_cap_from_eur(eur_limit, fx)
+            positions_before = current_state.get("posicoes", {})
+            positions_after = candidate_state.get("posicoes", {})
+            new_mints = set(positions_after) - set(positions_before)
+            if (debit > max_usd or debit != Decimal(_decimal_canonico(amount))
+                    or len(positions_before) >= MAX_OPEN_POSITIONS
+                    or len(positions_after) > MAX_OPEN_POSITIONS or len(new_mints) != 1):
+                return False
+            mint = next(iter(new_mints))
+            fields = authorization.get("plan_fields")
+            if not isinstance(fields, dict) or fields.get("mint") != mint:
+                return False
+            position = positions_after[mint]
+            checks = (
+                Decimal(_decimal_canonico(position.get("custo"))) == debit,
+                Decimal(_decimal_canonico(position.get("tokens"))) == Decimal(fields["net_tokens"]),
+                Decimal(_decimal_canonico(position.get("preco_efetivo"))) == Decimal(fields["effective_price_usd"]),
+                Decimal(_decimal_canonico(trade_row.get("valor_usd"))) == debit,
+                str(trade_row.get("preco_efetivo")) == fields["effective_price_usd"],
+                str(trade_row.get("quantidade_liquida")) == fields["net_tokens"],
+                str(trade_row.get("debito_total_usd")) == fields["debit_total_usd"],
+            )
+            cash_delta = Decimal(_decimal_canonico(current_state.get("saldo"))) - Decimal(
+                _decimal_canonico(candidate_state.get("saldo")))
+            cash_before = Decimal(_decimal_canonico(current_state.get("saldo")))
+            cash_after = Decimal(_decimal_canonico(candidate_state.get("saldo")))
+            # State balances are existing floats; accept only their bounded binary
+            # representation error, never a meaningful debit discrepancy.
+            tolerance = max(Decimal("1e-12"), max(abs(cash_before), abs(cash_after), Decimal(1))
+                            * Decimal("1e-15"))
+            return all(checks) and abs(cash_delta - debit) <= tolerance
+        except (KeyError, TypeError, ValueError, InvalidOperation, EcbRateError):
+            return False
 
     def preparar_execucao(self, mint, par, amount):
         """Calculate one canonical buy plan using the same Paper formulas as the Executor."""
@@ -1415,31 +1721,44 @@ class Executor:
         """Devolve (valor_a_investir, motivo_se_nao_puder)."""
         cfg, e = self.cfg, self.estado
         operational_path = cfg.get("_operational_config_path")
-        if cfg.get("limites_operacionais_ativos") and operational_path:
-            try:
-                policy = load_operational_config(operational_path)
-            except OperationalConfigError:
-                return 0.0, "configuracao Paper invalida ou indisponivel; compras bloqueadas"
-            cfg["mode"] = policy["mode"]
-            cfg["live_trading_enabled"] = policy["live_trading_enabled"]
-            cfg["private_keys_in_application"] = policy["private_keys_in_application"]
-            cfg["manual_confirmation_required"] = policy["manual_confirmation_required"]
-            cfg["max_eur_per_operation"] = policy["max_eur_per_operation"]
-            cfg["max_posicoes_abertas"] = policy["max_open_positions"]
-        if cfg.get("limites_operacionais_ativos") and (
-                cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False
+        if not cfg.get("limites_operacionais_ativos") or not operational_path:
+            return 0.0, "politica operacional Paper nao carregada; compras bloqueadas"
+        emergency_check = getattr(self.bot, "_emergency_stop_is_active", None)
+        if not callable(emergency_check) or emergency_check():
+            return 0.0, "paragem de emergência Paper ativa; novas propostas e compras bloqueadas"
+        audit_journal = getattr(self.bot, "paper_audit", None)
+        if audit_journal is None or audit_journal.blocked:
+            return 0.0, f"diário de auditoria Paper indisponível; compras bloqueadas: {getattr(audit_journal, 'error', 'ausente')}"
+        if cfg.get("erro_config_operacional"):
+            return 0.0, "configuracao operacional indisponivel; compras bloqueadas"
+        try:
+            policy = load_operational_config(operational_path)
+        except OperationalConfigError:
+            return 0.0, "configuracao Paper invalida ou indisponivel; compras bloqueadas"
+        cfg["mode"] = policy["mode"]
+        cfg["live_trading_enabled"] = policy["live_trading_enabled"]
+        cfg["private_keys_in_application"] = policy["private_keys_in_application"]
+        cfg["manual_confirmation_required"] = policy["manual_confirmation_required"]
+        cfg["max_eur_per_operation"] = policy["max_eur_per_operation"]
+        cfg["max_posicoes_abertas"] = policy["max_open_positions"]
+        cfg["max_slippage_pct"] = policy["max_slippage_pct"]
+        if (cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False
                 or cfg.get("private_keys_in_application") is not False
                 or cfg.get("manual_confirmation_required") is not True):
             return 0.0, "modo Paper ou confirmacao manual obrigatoria indisponivel; compras bloqueadas"
-        if cfg.get("limites_operacionais_ativos") and cfg.get("erro_config_operacional"):
-            return 0.0, "configuracao operacional indisponivel; compras bloqueadas"
+        if (cfg.get("max_posicoes_abertas") != MAX_OPEN_POSITIONS
+                or cfg.get("max_eur_per_operation") is None
+                or Decimal(str(cfg["max_eur_per_operation"])) > MAX_OPERATION_EUR):
+            return 0.0, "limites operacionais excedem a politica Paper; compras bloqueadas"
+        if cfg.get("max_slippage_pct") is None:
+            return 0.0, "limite máximo de slippage ainda não foi aprovado; propostas bloqueadas"
         store = getattr(self.bot, "paper_operations", None)
         if store is None or store.blocked:
             return 0.0, "diario Paper pendente ou indisponivel; compras bloqueadas"
-        if cfg.get("limites_operacionais_ativos") and not getattr(self.bot, "_fx_rate_persisted", False):
+        if not getattr(self.bot, "_fx_rate_persisted", False):
             return 0.0, "taxa BCE ainda nao confirmada em estado.json; compras bloqueadas"
-        if len(e["posicoes"]) >= cfg["max_posicoes_abertas"]:
-            return 0.0, f"maximo de {cfg['max_posicoes_abertas']} posicoes abertas"
+        if len(e["posicoes"]) >= MAX_OPEN_POSITIONS:
+            return 0.0, f"maximo de {MAX_OPEN_POSITIONS} posicoes abertas"
         capital = self.capital()
         limite = cfg["parar_compras_se_perda_pct"]
         if limite and capital <= e["saldo_inicial"] * (1 - limite / 100.0):
@@ -1447,40 +1766,70 @@ class Executor:
         investido = capital - e["saldo"]
         folga = capital * cfg["exposicao_maxima_pct"] / 100.0 - investido
         valor_planeado = min(capital * cfg["tamanho_posicao_pct"] / 100.0, folga)
-        if cfg.get("limites_operacionais_ativos"):
-            sessao = e.get("operational_session")
-            if not isinstance(sessao, dict) or not sessao.get("fx_usd_per_eur"):
-                return 0.0, "taxa BCE USD/EUR indisponivel; compras bloqueadas"
-            try:
-                fx = validate_locked_session_rate(sessao)
-                teto = float(usd_cap_from_eur(cfg["max_eur_per_operation"], fx))
-            except (EcbRateError, KeyError, TypeError, ValueError):
-                return 0.0, "taxa BCE USD/EUR invalida ou desatualizada; compras bloqueadas"
-            valor = min(valor_planeado, teto)
-            if e["saldo"] < valor:
-                return 0.0, "saldo livre insuficiente para financiar a ordem completa"
-        else:
-            valor = min(valor_planeado, e["saldo"])
+        sessao = e.get("operational_session")
+        if not isinstance(sessao, dict) or not sessao.get("fx_usd_per_eur"):
+            return 0.0, "taxa BCE USD/EUR indisponivel; compras bloqueadas"
+        try:
+            fx = validate_locked_session_rate(sessao)
+            eur_limit = min(Decimal(str(cfg["max_eur_per_operation"])), MAX_OPERATION_EUR)
+            teto = float(usd_cap_from_eur(eur_limit, fx))
+        except (EcbRateError, KeyError, TypeError, ValueError, InvalidOperation):
+            return 0.0, "taxa BCE USD/EUR invalida ou desatualizada; compras bloqueadas"
+        valor = min(valor_planeado, teto)
+        if e["saldo"] < valor:
+            return 0.0, "saldo livre insuficiente para financiar a ordem completa"
         if valor < cfg["posicao_minima_usd"]:
             return 0.0, "exposicao maxima atingida ou saldo insuficiente"
         return valor, ""
+
+    def bloqueio_plano_financeiro(self, plan):
+        """Fail closed unless liquidity and impact are observed and within approved cap."""
+        fields = plan.fields() if isinstance(plan, PaperExecutionPlan) else plan
+        if fields.get("liquidity_status") != "observed":
+            return "liquidez indisponível, zero ou inválida; proposta bloqueada"
+        try:
+            liquidity = Decimal(fields["liquidity_observed_usd"])
+            impact = Decimal(fields["market_impact_pct"])
+            total = Decimal(fields["slippage_total_pct"])
+            cap = Decimal(str(self.cfg.get("max_slippage_pct")))
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return "estimativa de impacto ou limite de slippage indisponível; proposta bloqueada"
+        if not liquidity.is_finite() or liquidity <= 0:
+            return "liquidez observada inválida; proposta bloqueada"
+        if fields.get("impact_fallback") or not impact.is_finite():
+            return "não existe estimativa fiável de impacto; proposta bloqueada"
+        if not fields.get("execution_conditions", {}).get("simular_impacto_preco"):
+            return "simulação de impacto desativada; proposta bloqueada"
+        if not total.is_finite() or total > cap:
+            return f"slippage total excede o limite operacional aprovado ({cap}%); proposta bloqueada"
+        return ""
 
     def comprar(self, mint, par, analise, approval_token=None, execution_plan=None):
         cfg, e = self.cfg, self.estado
         simbolo = simbolo_limpo(par)
         with self._purchase_lock:
+            approvals = getattr(self.bot, "manual_approvals", None)
             if mint in e["posicoes"]:
+                if approvals is not None:
+                    approvals.discard(approval_token)
                 return None
             valor, motivo = self.pode_comprar()
             if valor <= 0:
+                if approvals is not None:
+                    approvals.discard(approval_token)
                 self.bot.acao(f"{simbolo}: aprovado ({analise['pontuacao']}) mas nao comprado - {motivo}")
                 return None
             plan = self.preparar_execucao(mint, par, valor)
             plan_fields = plan.fields()
-            approvals = getattr(self.bot, "manual_approvals", None)
+            bloqueio_plano = self.bloqueio_plano_financeiro(plan)
+            if bloqueio_plano:
+                if approvals is not None:
+                    approvals.discard(approval_token)
+                return None
             approval_par = dict(par)
             approval_par["_paper_execution_conditions"] = self.execution_conditions()
             approval_par["_paper_execution_plan"] = plan.canonical_json
+            proposal_id = approvals.proposal_id_for_token(approval_token) if approvals is not None else None
             if approvals is None or not approvals.consume(approval_token, mint, approval_par, valor):
                 self.bot.acao(f"{simbolo}: compra bloqueada - falta aprovacao manual valida e nao utilizada")
                 return None
@@ -1529,7 +1878,17 @@ class Executor:
             "liquidez_estado": plan_fields["liquidity_status"],
             "fallback_execucao": "slippage_cap_95pct" if plan_fields["impact_fallback"] else "none",
             }
-            self.bot.paper_operations.commit(e, candidato, linha, "BUY")
+            authorization = {
+                "capability": self._buy_commit_capability,
+                "manual_confirmation_consumed": True,
+                "proposal_id": proposal_id,
+                "execution_plan": plan.canonical_json,
+                "plan_fields": plan_fields,
+            }
+            operation_id = self.bot.paper_operations.commit(
+                e, candidato, linha, "BUY", authorization=authorization,
+                metadata={"proposal_id": authorization["proposal_id"]})
+            self.bot._last_paper_operation_id = operation_id
             pos = e["posicoes"][mint]
         self.bot.acao(f"COMPRA {simbolo} debito=${plan_fields['debit_total_usd']} "
                       f"preco_efetivo=${plan_fields['effective_price_usd']} "
@@ -2101,6 +2460,8 @@ background:rgba(4,14,15,.86);border:2px solid var(--ou);box-shadow:0 0 30px rgba
 .blip-identidade{min-width:0;display:grid;line-height:1.15}.blip-identidade b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:650}.blip-identidade small{color:#9eb5b7;font-size:9px}
 .blip-status{flex:none;padding:2px 5px;border-radius:99px;background:color-mix(in srgb,var(--k) 14%,transparent);color:var(--k);font-size:8px;white-space:nowrap}
 .blip-card-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px 8px}.blip-card-grid span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9eb5b7;font-size:8px}.blip-card-grid b{color:#edf5f4;font-size:9px;font-weight:550}
+:where(.blip-card-grid) span{display:grid;line-height:1.25}.blip-card-grid b{overflow:hidden;text-overflow:ellipsis}
+.blip-card-motivo{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;padding-top:4px;border-top:1px solid rgba(255,255,255,.08);color:#ffb3b3;font-size:8px;line-height:1.3;white-space:normal}
 .blip-melhor{display:none;color:#ffd788;font-size:8px;white-space:nowrap}.blip-orbita.destaque .blip-melhor{display:inline}
 @keyframes orbita-moeda{from{transform:scaleY(.64) rotate(var(--fase))}to{transform:scaleY(.64) rotate(calc(var(--fase) + 360deg))}}
 @keyframes contra-orbita-moeda{from{transform:translate(-50%,-50%) rotate(var(--fase-neg)) scaleY(1.5625)}to{transform:translate(-50%,-50%) rotate(calc(var(--fase-neg) - 360deg)) scaleY(1.5625)}}
@@ -2288,7 +2649,7 @@ h2 small{font-size:12.5px;color:var(--mut);font-weight:400}
 }
 @media(max-width:699px){
  .blip{width:22px;height:22px;margin:0}
- .blip-cartao{width:128px;padding:6px 7px}.blip-card-variacao,.blip-card-score{display:none}
+ .blip-cartao{width:128px;padding:6px 7px}.blip-card-variacao,.blip-card-score{display:none}.blip-card-mcap,.blip-card-idade,.blip-card-motivo{display:none}
  .lista-moedas{max-height:48vh}
  .scanner-filtros{gap:4px}.scanner-filtros button{padding:8px 2px;font-size:11px}
  .melhor{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:12px}
@@ -2490,9 +2851,11 @@ function urlImagemRadar(valor){if(typeof valor!=='string'||!valor)return'';try{c
 function atualizarImagemRadar(n,o){const img=n.querySelector('.blip-img'),fallback=n.querySelector('.blip-fallback'),url=urlImagemRadar(o.img);fallback.textContent=String(o.simbolo||'?').replace(/[^\p{L}\p{N}]/gu,'').slice(0,3).toUpperCase()||'?';if(!url){img.removeAttribute('src');img.hidden=true;img.style.opacity='0';fallback.hidden=false;n.dataset.img='';return}if(n.dataset.img!==url){n.dataset.img=url;img.hidden=false;img.style.opacity='0';fallback.hidden=false;img.src=url}else if(img.complete){const valida=img.naturalWidth>0;img.hidden=!valida;img.style.opacity=valida?'1':'0';fallback.hidden=valida}else{img.hidden=false;img.style.opacity='0';fallback.hidden=false}}
 function melhorSinalRadar(){const sinais=D&&Array.isArray(D.sinais)?D.sinais:[],comprados=sinais.filter(s=>s.estado==='comprado').sort((a,b)=>b.pontuacao-a.pontuacao);return comprados[0]||sinais[0]||null}
 function valorCartaoRadar(v,fmt){return disponivel(v)&&Number.isFinite(Number(v))?fmt(Number(v)):'\u2014'}
-function atualizarCartaoRadar(n,o,melhor){const c=n.cartaoDados;if(!c)return;c.nome.textContent=typeof o.nome==='string'&&o.nome.trim()?o.nome.trim():'\u2014';c.simbolo.textContent=o.simbolo?'$'+o.simbolo:'\u2014';c.preco.textContent=disponivel(o.preco)&&Number.isFinite(Number(o.preco))&&Number(o.preco)>=0?'$'+Number(o.preco).toLocaleString('en-US',{maximumSignificantDigits:9}):'\u2014';c.variacao.textContent=valorCartaoRadar(o.var_h1,v=>pct(v));c.score.textContent=disponivel(o.pontuacao)?Math.round(Number(o.pontuacao))+'/100':'\u2014';c.estado.textContent=nomeEstadoRadar(o);c.melhor.hidden=!melhor;n.orbita.classList.toggle('destaque',melhor)}
+function criterioRadar(o,id){const c=(Array.isArray(o.criteria)?o.criteria:[]).find(x=>x&&x.id===id&&(x.status==='passed'||x.status==='rejected'));return c&&disponivel(c.observed)&&Number(c.observed)>=0?Number(c.observed):null}
+function idadeTxt(m){return m<60?Math.round(m)+' min':pt(m/60,1)+' h'}
+function atualizarCartaoRadar(n,o,melhor){const c=n.cartaoDados;if(!c)return;c.nome.textContent=typeof o.nome==='string'&&o.nome.trim()?o.nome.trim():'\u2014';c.simbolo.textContent=o.simbolo?'$'+o.simbolo:'\u2014';c.preco.textContent=disponivel(o.preco)&&Number.isFinite(Number(o.preco))&&Number(o.preco)>=0?'$'+Number(o.preco).toLocaleString('en-US',{maximumSignificantDigits:9}):'\u2014';c.variacao.textContent=valorCartaoRadar(o.var_h1,v=>pct(v));c.score.textContent=disponivel(o.pontuacao)?Math.round(Number(o.pontuacao))+'/100':'\u2014';c.liq.textContent=valorCartaoRadar(disponivel(o.liq)&&Number(o.liq)>=0?o.liq:criterioRadar(o,'liquidez'),curto);c.mcap.textContent=valorCartaoRadar(criterioRadar(o,'market_cap'),curto);c.idade.textContent=valorCartaoRadar(criterioRadar(o,'idade_par'),idadeTxt);const est=estadoRadar(o),txt=typeof o.resultado_analise==='string'?o.resultado_analise.trim():'';c.motivo.textContent=txt;c.motivo.hidden=!txt||!['rejeitada','sem_par','erro_tecnico','indisponivel'].includes(est);c.estado.textContent=nomeEstadoRadar(o);c.melhor.hidden=!melhor;n.orbita.classList.toggle('destaque',melhor)}
 function radar(){const c=$('blips'),l=moedasRadar(),ids=new Set(l.map(o=>o.mint)),melhor=melhorSinalRadar(),melhorMint=melhor&&melhor.mint;for(const[m,n]of blips)if(!ids.has(m)){n.orbita.remove();blips.delete(m);if(radarHoverMint===m)radarHoverMint=null;if(radarCartaoAbertoMint===m)radarCartaoAbertoMint=null}
- for(const o of l){let n=blips.get(o.mint);if(!n){n=el('button','blip entra');n.type='button';n.dataset.mint=o.mint;n.dataset.novo='1';const p=alocarPonto(o.mint),raio=Math.hypot(p.x-50,p.y-50),fase=Math.atan2(p.y-50,p.x-50)*180/Math.PI,orbita=el('div','blip-orbita');orbita.style.setProperty('--raio',raio.toFixed(2)+'%');orbita.style.setProperty('--diametro',(raio*2).toFixed(2)+'%');orbita.style.setProperty('--fase',fase.toFixed(2)+'deg');orbita.style.setProperty('--fase-neg',(-fase).toFixed(2)+'deg');orbita.style.setProperty('--dur',(30+p.slot%9*1.7).toFixed(1)+'s');n.dataset.slot=String(p.slot);const img=el('img','blip-img');img.alt='';img.loading='lazy';img.decoding='async';img.referrerPolicy='no-referrer';img.hidden=true;const fallback=el('span','blip-fallback','?');const cartao=el('span','blip-cartao'),head=el('span','blip-card-head'),ident=el('span','blip-identidade'),nome=el('b','bc-nome','\u2014'),simbolo=el('small','bc-simbolo','\u2014'),estado=el('span','blip-status','\u2014'),destaque=el('span','blip-melhor','Melhor');ident.append(nome,simbolo);head.append(ident,estado,destaque);const grade=el('span','blip-card-grid'),campo=(cls,titulo)=>{const caixa=el('span',cls);caixa.append(el('small',null,titulo),el('b',null,'\u2014'));grade.append(caixa);return caixa.lastChild};const preco=campo('blip-card-preco','Pre\u00e7o'),variacao=campo('blip-card-variacao','Varia\u00e7\u00e3o'),score=campo('blip-card-score','Score');cartao.append(head,grade);n.append(img,fallback,cartao);n.cartaoDados={nome,simbolo,estado,melhor:destaque,preco,variacao,score};img.addEventListener('load',()=>{if(n.dataset.img===img.src&&img.naturalWidth){img.hidden=false;img.style.opacity='1';fallback.hidden=true}});img.addEventListener('error',()=>{if(n.dataset.img===img.src){img.hidden=true;img.style.opacity='0';fallback.hidden=false}});n.addEventListener('animationend',()=>{delete n.dataset.novo;n.classList.remove('entra')},{once:true});if(p.x>50)cartao.classList.add('blip-cartao-esq');orbita.classList.add(estadoRadar(o));orbita.append(n);n.orbita=orbita;n.style.setProperty('--raio',raio.toFixed(2)+'%');n.style.setProperty('--fase-neg',(-fase).toFixed(2)+'deg');n.style.setProperty('--dur',(30+p.slot%9*1.7).toFixed(1)+'s');n.addEventListener('click',()=>{const mesma=radarSelecionado===o.mint,cartaoAberto=radarCartaoAbertoMint===o.mint,toque=matchMedia('(hover: none), (pointer: coarse)').matches;selecionarMoeda(o.mint);if(toque&&mesma&&cartaoAberto){radarCartaoAbertoMint=null;atualizarCartoesRadar()}});n.addEventListener('mouseenter',()=>{if(matchMedia('(hover: hover) and (pointer: fine)').matches){radarHoverMint=o.mint;atualizarCartoesRadar()}});n.addEventListener('mouseleave',()=>{if(radarHoverMint===o.mint)radarHoverMint=null;atualizarCartoesRadar()});n.addEventListener('focus',()=>{n.orbita.style.zIndex='8'});n.addEventListener('blur',()=>atualizarCartoesRadar());c.append(orbita);blips.set(o.mint,n)}
+ for(const o of l){let n=blips.get(o.mint);if(!n){n=el('button','blip entra');n.type='button';n.dataset.mint=o.mint;n.dataset.novo='1';const p=alocarPonto(o.mint),raio=Math.hypot(p.x-50,p.y-50),fase=Math.atan2(p.y-50,p.x-50)*180/Math.PI,orbita=el('div','blip-orbita');orbita.style.setProperty('--raio',raio.toFixed(2)+'%');orbita.style.setProperty('--diametro',(raio*2).toFixed(2)+'%');orbita.style.setProperty('--fase',fase.toFixed(2)+'deg');orbita.style.setProperty('--fase-neg',(-fase).toFixed(2)+'deg');orbita.style.setProperty('--dur',(30+p.slot%9*1.7).toFixed(1)+'s');n.dataset.slot=String(p.slot);const img=el('img','blip-img');img.alt='';img.loading='lazy';img.decoding='async';img.referrerPolicy='no-referrer';img.hidden=true;const fallback=el('span','blip-fallback','?');const cartao=el('span','blip-cartao'),head=el('span','blip-card-head'),ident=el('span','blip-identidade'),nome=el('b','bc-nome','\u2014'),simbolo=el('small','bc-simbolo','\u2014'),estado=el('span','blip-status','\u2014'),destaque=el('span','blip-melhor','Melhor');ident.append(nome,simbolo);head.append(ident,estado,destaque);const grade=el('span','blip-card-grid'),campo=(cls,titulo)=>{const caixa=el('span',cls);caixa.append(el('small',null,titulo),el('b',null,'\u2014'));grade.append(caixa);return caixa.lastChild};const preco=campo('blip-card-preco','Pre\u00e7o'),variacao=campo('blip-card-variacao','Varia\u00e7\u00e3o'),score=campo('blip-card-score','Score'),liq=campo('blip-card-liq','Liquidez'),mcap=campo('blip-card-mcap','Market cap'),idade=campo('blip-card-idade','Idade');idade.parentNode.title='Idade do par no momento da an\u00e1lise';const motivo=el('span','blip-card-motivo');motivo.hidden=true;cartao.append(head,grade,motivo);n.append(img,fallback,cartao);n.cartaoDados={nome,simbolo,estado,melhor:destaque,preco,variacao,score,liq,mcap,idade,motivo};img.addEventListener('load',()=>{if(n.dataset.img===img.src&&img.naturalWidth){img.hidden=false;img.style.opacity='1';fallback.hidden=true}});img.addEventListener('error',()=>{if(n.dataset.img===img.src){img.hidden=true;img.style.opacity='0';fallback.hidden=false}});n.addEventListener('animationend',()=>{delete n.dataset.novo;n.classList.remove('entra')},{once:true});if(p.x>50)cartao.classList.add('blip-cartao-esq');orbita.classList.add(estadoRadar(o));orbita.append(n);n.orbita=orbita;n.style.setProperty('--raio',raio.toFixed(2)+'%');n.style.setProperty('--fase-neg',(-fase).toFixed(2)+'deg');n.style.setProperty('--dur',(30+p.slot%9*1.7).toFixed(1)+'s');n.addEventListener('click',()=>{const mesma=radarSelecionado===o.mint,cartaoAberto=radarCartaoAbertoMint===o.mint,toque=matchMedia('(hover: none), (pointer: coarse)').matches;selecionarMoeda(o.mint);if(toque&&mesma&&cartaoAberto){radarCartaoAbertoMint=null;atualizarCartoesRadar()}});n.addEventListener('mouseenter',()=>{if(matchMedia('(hover: hover) and (pointer: fine)').matches){radarHoverMint=o.mint;atualizarCartoesRadar()}});n.addEventListener('mouseleave',()=>{if(radarHoverMint===o.mint)radarHoverMint=null;atualizarCartoesRadar()});n.addEventListener('focus',()=>{n.orbita.style.zIndex='8'});n.addEventListener('blur',()=>atualizarCartoesRadar());c.append(orbita);blips.set(o.mint,n)}
   const estado=estadoRadar(o),isMelhor=o.mint===melhorMint;atualizarImagemRadar(n,o);atualizarCartaoRadar(n,o,isMelhor);n.className='blip '+estado+(n.dataset.novo?' entra':'')+(radarSelecionado===o.mint?' selecionado':'');n.orbita.classList.remove('analise','aprovada','rejeitada');n.orbita.classList.add(estado);const estadoTexto=nomeEstadoRadar(o),nome=typeof o.nome==='string'&&o.nome.trim()?o.nome.trim():o.simbolo||'Moeda';n.setAttribute('aria-label',nome+' ($'+(o.simbolo||'Indispon\u00edvel')+') - '+estadoTexto);n.setAttribute('aria-pressed',String(radarSelecionado===o.mint));n.title=nome+' ($'+(o.simbolo||'Indispon\u00edvel')+') - '+estadoTexto}
  atualizarCartoesRadar();
  const atual=radarSelecionado&&l.find(o=>o.mint===radarSelecionado);if(atual)mostrarDetalhe(atual);else if(!radarSelecionado)mostrarDetalhe(null);const s=(D.sinais||[])[0],a=$('aviso'),ch=s?s.id+s.estado+(D.agora-s.ts<600):'-';
@@ -2590,6 +2953,19 @@ ciclo();
 '''
 
 
+CAMINHO_PAGINA_NEURAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "dashboard_neural.html")
+
+
+def _pagina_neural():
+    """Le o Dashboard Neural (HTML estatico, so leitura). Devolve None se nao existir ou for invalido."""
+    try:
+        with open(CAMINHO_PAGINA_NEURAL, "r", encoding="utf-8") as ficheiro:
+            pagina = ficheiro.read(2_000_000)
+    except (OSError, UnicodeError):
+        return None
+    return pagina if pagina.startswith("<!DOCTYPE html>") and "/api/estado" in pagina else None
+
+
 class _ServidorWeb(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = os.name != "nt"  # no Windows, reutilizar deixava dois bots abrir a mesma porta
@@ -2601,6 +2977,12 @@ class _PedidoWeb(BaseHTTPRequestHandler):
     def do_GET(self):
         caminho = self.path.split("?", 1)[0]
         if caminho in ("/", "/index.html"):
+            # Dashboard Neural (so leitura); se o ficheiro faltar ou falhar, serve o dashboard classico.
+            neural = _pagina_neural()
+            if neural is not None:
+                neural = neural.replace("__MEMEBOT_TOKEN__", getattr(self.server.bot, "dashboard_token", None) or "")
+            corpo, tipo = (neural or PAGINA_HTML).encode("utf-8"), "text/html; charset=utf-8"
+        elif caminho == "/classico":
             corpo, tipo = PAGINA_HTML.encode("utf-8"), "text/html; charset=utf-8"
         elif caminho == "/api/estado":
             corpo, tipo = self.server.bot.snapshot.encode("utf-8"), "application/json; charset=utf-8"
@@ -2624,8 +3006,79 @@ class _PedidoWeb(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(corpo)
 
+    def do_POST(self):
+        """Unico endpoint de escrita: aprovar/recusar uma proposta Paper JA criada pelo bot."""
+        if self.path.split("?", 1)[0] != "/api/proposta/decisao":
+            self.send_error(404)
+            return
+        try:
+            codigo, resposta = _decisao_dashboard(self)
+        except Exception:
+            log.exception("Falha ao processar decisao do dashboard; nada foi executado")
+            codigo, resposta = 500, {"ok": False, "mensagem": "erro interno; nada foi executado"}
+        corpo = json.dumps(resposta, ensure_ascii=False).encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(corpo)
+
     def log_message(self, *args):  # nao enche a consola
         pass
+
+
+DECISAO_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _decisao_dashboard(pedido):
+    """Valida e aplica uma decisao do dashboard. Devolve (codigo_http, dict). Falha sempre fechada."""
+    bot = pedido.server.bot
+    recusa = lambda codigo, msg: (codigo, {"ok": False, "mensagem": msg})
+    token = getattr(bot, "dashboard_token", None)
+    if not token:
+        return recusa(403, "decisoes no dashboard indisponiveis")
+    porta = pedido.server.server_address[1]
+    locais = (f"127.0.0.1:{porta}", f"localhost:{porta}")
+    if pedido.headers.get("Host", "") not in locais:
+        return recusa(403, "endereco nao permitido")
+    if pedido.headers.get("Origin", "") not in tuple("http://" + h for h in locais):
+        return recusa(403, "origem nao permitida")
+    if not hmac.compare_digest(str(pedido.headers.get("X-MemeBot-Token", "")), token):
+        return recusa(403, "chave da sessao invalida; recarrega o dashboard")
+    if not str(pedido.headers.get("Content-Type", "")).startswith("application/json"):
+        return recusa(415, "formato invalido")
+    try:
+        tamanho = int(pedido.headers.get("Content-Length", "0"))
+    except ValueError:
+        tamanho = -1
+    if not 0 < tamanho <= 2048:
+        return recusa(400, "pedido invalido")
+    try:
+        dados = json.loads(pedido.rfile.read(tamanho).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return recusa(400, "JSON invalido")
+    if not isinstance(dados, dict):
+        return recusa(400, "pedido invalido")
+    proposal_id, decisao = dados.get("proposal_id"), dados.get("decisao")
+    if not isinstance(proposal_id, str) or not DECISAO_ID_RE.fullmatch(proposal_id) or decisao not in ("aprovar", "recusar"):
+        return recusa(400, "proposta ou decisao invalida")
+    cfg = getattr(bot, "cfg", {}) or {}
+    if (cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False
+            or cfg.get("manual_confirmation_required") is not True):
+        return recusa(409, "modo Paper com confirmacao manual indisponivel; nada foi feito")
+    emergencia = getattr(bot, "_emergency_stop_is_active", None)
+    if decisao == "aprovar" and (not callable(emergencia) or emergencia()):
+        return recusa(409, "paragem de emergencia ativa; aprovacao recusada")
+    gestor = getattr(bot, "manual_approvals", None)
+    if not isinstance(gestor, ManualApprovalManager):
+        return recusa(409, "gestor de propostas indisponivel")
+    ok, mensagem = gestor.decidir_dashboard(proposal_id, decisao)
+    texto = f"Proposta PAPER {proposal_id[:12]} {'aprovada' if decisao == 'aprovar' else 'recusada'} no dashboard"
+    if ok:
+        log.info("%s", texto)  # o ciclo principal regista a acao e a auditoria ao processar a decisao
+    return (200 if ok else 409), {"ok": ok, "mensagem": mensagem}
 
 
 def ip_local():
@@ -2735,6 +3188,10 @@ class Bot:
 
     def __init__(self, cfg=None, process_lock=None):
         self.cfg = cfg or CONFIG
+        if not self.cfg.get("limites_operacionais_ativos") or not self.cfg.get("_operational_config_path"):
+            project_config = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "config_operacoes.json")
+            aplicar_config_operacional(self.cfg, project_config)
         self._owns_process_lock = process_lock is None
         self.process_lock = process_lock or ProcessInstanceLock(self.cfg["ficheiro_estado"])
         if not self.process_lock.acquire():
@@ -2761,9 +3218,22 @@ class Bot:
             self.paper_operations.recover(self.estado)
         except PaperOperationError:
             log.exception("Diario Paper ambiguo; novas compras bloqueadas ate recuperacao")
+        self._emergency_lock = threading.RLock()
+        self._emergency_active = False
+        audit_path = os.path.join(os.path.dirname(os.path.abspath(self.cfg["ficheiro_estado"])),
+                                  "paper_audit.jsonl")
+        self.paper_audit = PaperAuditJournal(audit_path)
+        if self.paper_audit.blocked:
+            log.error("Diario de auditoria Paper inválido; novas propostas e compras bloqueadas: %s",
+                      self.paper_audit.error)
+        self._inicializar_paragem_emergencia()
+        self._reconciliar_auditoria_operacoes()
         self.http = ClienteHTTP(self.cfg)
         self.telegram = Telegram()
-        self.manual_approvals = ManualApprovalManager(ttl_seconds=90)
+        self.manual_approvals = ManualApprovalManager(
+            ttl_seconds=90, terminal_command_handler=self._comando_emergencia_terminal)
+        # Chave secreta por arranque: so a pagina servida por este bot a conhece (protege contra pedidos de outros sites).
+        self.dashboard_token = secrets.token_urlsafe(32)
         self._latest_market_pairs = {}
         self.scanner = Scanner(self.cfg, self.http)
         self.analista = Analista(self.cfg, self.http)
@@ -2792,6 +3262,8 @@ class Bot:
             self._fx_rate_persisted = any(sessao_inicial.get(key) is not None for key in (
                 "fx_usd_per_eur", "fx_reference_date", "fx_locked_at_utc", "fx_source"
             ))
+        # Observacao extra (so leitura). Inativa por defeito; main() ativa-a no modo Paper com mercado real.
+        self.obs_extra = ObservadorExtra(ativo=False, logger=log)
         estado_path = os.path.abspath(self.cfg.get("ficheiro_estado", "estado.json"))
         market_db = os.path.join(os.path.dirname(estado_path), "smart_filters_market.db")
         protection_db = os.path.join(os.path.dirname(estado_path), "smart_protection_observability.db")
@@ -2807,6 +3279,172 @@ class Bot:
             self.market_snapshots = None
             log.exception("Snapshots Smart Filters indisponíveis; o bot continua sem histórico de mercado")
         self.atualizar_snapshot()
+
+    def _inicializar_paragem_emergencia(self):
+        with self._emergency_lock:
+            stored = self.estado.get("emergency_stop")
+            if not isinstance(stored, dict):
+                stored = {"active": False, "stop_id": None, "changed_at_utc": None, "reason": None}
+                self.estado["emergency_stop"] = stored
+            self._emergency_active = stored.get("active") is True
+            if self.paper_audit.blocked:
+                return
+            try:
+                events = self.paper_audit.verify()["events"]
+            except PaperAuditError:
+                return
+            emergency_events = [event for event in events
+                                if event.get("event") in ("emergency_stop_activated", "emergency_stop_rearmed")]
+            if emergency_events:
+                latest = emergency_events[-1]
+                if latest["event"] == "emergency_stop_activated":
+                    fields = latest.get("fields", {})
+                    self._emergency_active = True
+                    if stored.get("active") is not True:
+                        self.estado["emergency_stop"] = {
+                            "active": True, "stop_id": fields.get("stop_id"),
+                            "changed_at_utc": latest.get("occurred_at_utc"),
+                            "reason": fields.get("reason"),
+                        }
+                        try:
+                            guardar_estado(self.cfg, self.estado, strict=True)
+                        except Exception:
+                            log.exception("Paragem Paper recuperada do diário, mas estado não pôde ser sincronizado")
+                elif stored.get("active") is not True:
+                    self._emergency_active = False
+            if stored.get("active") is True:
+                self._emergency_active = True
+
+    def _emergency_stop_is_active(self):
+        return (self._emergency_active
+                or self.estado.get("emergency_stop", {}).get("active") is True
+                or self.paper_audit.blocked)
+
+    def _comando_emergencia_terminal(self, action, argument):
+        """Terminal-only, latched Paper stop; Risk keeps managing existing positions."""
+        if not self.cfg.get("emergency_stop_enabled"):
+            return False, "emergency_stop_enabled não está ativo; compras permanecem bloqueadas"
+        with self.executor._purchase_lock:
+            with self._emergency_lock:
+                current = self.estado.get("emergency_stop", {})
+                if action == "activate":
+                    reason = sanitize_audit_text(argument)
+                    if not reason:
+                        return False, "indique um motivo não vazio: PARAR_PAPER <motivo>"
+                    if self._emergency_stop_is_active() and current.get("stop_id"):
+                        return True, f"já ativa ({current['stop_id']}); motivo preservado"
+                    stop_id = uuid.uuid4().hex
+                    record = {"active": True, "stop_id": stop_id,
+                              "changed_at_utc": datetime.now(timezone.utc).isoformat(),
+                              "reason": reason}
+                    self._emergency_active = True
+                    self.estado["emergency_stop"] = record
+                    audit_ok = False
+                    try:
+                        self.paper_audit.append("emergency_stop_activated", {
+                            "active": True, "stop_id": stop_id, "reason": reason,
+                            "source": "terminal",
+                        })
+                        audit_ok = True
+                    except PaperAuditError:
+                        log.exception("Paragem ativada, mas diário B13 indisponível")
+                    try:
+                        guardar_estado(self.cfg, self.estado, strict=True)
+                    except Exception as exc:
+                        # Keep the in-process latch active even if durable storage fails.
+                        return False, f"ativa em memória; falha ao persistir ({type(exc).__name__}); compras bloqueadas"
+                    return True, (f"ativa ({stop_id}); posições existentes continuam sob Risco"
+                                  if audit_ok else f"ativa ({stop_id}); diário B13 indisponível, compras bloqueadas")
+
+                if action != "rearm":
+                    return False, "ação desconhecida"
+                parts = str(argument or "").strip().split(maxsplit=1)
+                if len(parts) != 2 or not parts[1].strip():
+                    return False, "formato: REARMAR_PAPER <ID_PARAGEM> <motivo>"
+                stop_id, reason = parts[0], sanitize_audit_text(parts[1])
+                if not self._emergency_stop_is_active() or stop_id != current.get("stop_id"):
+                    return False, "ID da paragem inválido ou paragem não ativa"
+                record = {"active": False, "stop_id": stop_id,
+                          "changed_at_utc": datetime.now(timezone.utc).isoformat(),
+                          "reason": reason}
+                self.estado["emergency_stop"] = record
+                try:
+                    guardar_estado(self.cfg, self.estado, strict=True)
+                except Exception as exc:
+                    self.estado["emergency_stop"] = current
+                    self._emergency_active = True
+                    return False, f"rearmamento recusado; falha ao persistir ({type(exc).__name__})"
+                try:
+                    self.paper_audit.append("emergency_stop_rearmed", {
+                        "active": False, "stop_id": stop_id, "reason": reason,
+                        "source": "terminal",
+                    })
+                except PaperAuditError as exc:
+                    self.estado["emergency_stop"] = current
+                    self._emergency_active = True
+                    try:
+                        guardar_estado(self.cfg, self.estado, strict=True)
+                    except Exception:
+                        log.exception("Falha a restaurar latch de emergência após erro do diário")
+                    return False, f"rearmamento bloqueado pelo diário de auditoria ({exc})"
+                self._emergency_active = False
+                return True, f"rearmada por comando terminal; motivo: {reason}"
+
+    def _reconciliar_auditoria_operacoes(self):
+        if self.paper_audit.blocked or self.paper_operations.blocked:
+            return
+        try:
+            operation_audit = self.paper_operations.audit()
+            audit_events = self.paper_audit.verify()["events"]
+            operations = {operation.get("operation_id"): operation
+                          for operation in operation_audit.get("operations", [])}
+            committed = {}
+            for event in audit_events:
+                if event.get("event") != "execution_committed":
+                    continue
+                fields = event.get("fields", {})
+                operation_id = fields.get("operation_id")
+                if not operation_id:
+                    continue
+                operation = operations.get(operation_id)
+                try:
+                    event_amount = _decimal_canonico(fields.get("amount_usd"))
+                    paper_amount = _decimal_canonico(
+                        operation.get("trade_row", {}).get("debito_total_usd")
+                    ) if operation else None
+                except (TypeError, ValueError, InvalidOperation):
+                    event_amount, paper_amount = None, None
+                if (operation is None or operation.get("operation_type") != "BUY"
+                        or operation.get("metadata", {}).get("proposal_id") != fields.get("proposal_id")
+                        or operation.get("trade_row", {}).get("mint") != fields.get("mint")
+                        or event_amount is None or paper_amount is None
+                        or event_amount != paper_amount):
+                    raise PaperOperationError(
+                        f"evento execution_committed diverge do diario Paper: {operation_id}"
+                    )
+                committed[operation_id] = fields.get("proposal_id")
+            for operation in operation_audit.get("operations", []):
+                if (operation.get("operation_type") == "BUY"
+                        and operation.get("metadata", {}).get("proposal_id")):
+                    expected_proposal = operation["metadata"]["proposal_id"]
+                    existing_proposal = committed.get(operation["operation_id"])
+                    if existing_proposal is not None:
+                        if existing_proposal != expected_proposal:
+                            raise PaperOperationError(
+                                f"proposal_id diverge para operacao {operation['operation_id']}"
+                            )
+                        continue
+                    self.paper_audit.append("execution_committed", {
+                        "proposal_id": expected_proposal,
+                        "operation_id": operation["operation_id"],
+                        "mint": operation.get("trade_row", {}).get("mint"),
+                        "amount_usd": operation.get("trade_row", {}).get("debito_total_usd"),
+                        "source": "paper_journal_recovery",
+                    })
+        except (PaperOperationError, PaperAuditError):
+            log.exception("Reconciliação B13 falhou; novas compras bloqueadas")
+            if isinstance(self.paper_audit, PaperAuditJournal):
+                self.paper_audit.block("falha na reconciliação com o diário Paper")
 
     def close(self):
         """Close owned writers and release this instance's shared-state lock."""
@@ -3126,6 +3764,16 @@ class Bot:
         del e["sinais"][:-self.cfg["max_sinais"]]
         e["sinais_ts"] = [t for t in e["sinais_ts"] if agora() - num(t) < 86400][-5000:] + [int(agora())]
 
+    def _recentes_com_observacao(self):
+        obs = getattr(self, "obs_extra", None)
+        if obs is None:
+            return self.recentes
+        dados = obs.todos()
+        if not dados:
+            return self.recentes
+        return [dict(r, observacao_extra=dados[r["mint"]]) if isinstance(r, dict) and r.get("mint") in dados else r
+                for r in self.recentes]
+
     def registar_analise(self, mint, par, analise):
         """Guarda os ultimos tokens analisados (aprovados ou nao) para o radar e as listas."""
         if not MINT_VALIDO.fullmatch(mint):
@@ -3156,6 +3804,7 @@ class Bot:
             "criteria": analise.get("criteria", []), "missing_fields": analise.get("missing_fields", []),
             "invalid_fields": analise.get("invalid_fields", []),
             "technical_error": analise.get("technical_error"), "partial_score": analise.get("partial_score"),
+            "fonte": "geckoterminal" if mint in getattr(getattr(self, "scanner", None), "origem_gecko", ()) else "dexscreener",
         }
         for r in self.recentes:
             if r.get("mint") == mint:
@@ -3213,6 +3862,13 @@ class Bot:
         total = self.valor_total()
         inicial = e["saldo_inicial"] or 1.0
         trades = ler_trades_paper(cfg)
+        try:
+            valor_pre_proposta, bloqueio_pre_proposta = self.executor.pode_comprar()
+            pre_proposta_status = ("Elegível para proposta; aprovação manual obrigatória"
+                                   if valor_pre_proposta > 0 else bloqueio_pre_proposta)
+        except Exception as readiness_error:
+            valor_pre_proposta = 0.0
+            pre_proposta_status = f"Indisponível ({type(readiness_error).__name__})"
         posicoes = []
         for pos in e["posicoes"].values():
             pe = pos["preco_entrada"] or 1.0
@@ -3226,12 +3882,18 @@ class Bot:
                 "liquido": (receita / pos["custo"] - 1) * 100 if pos["custo"] else 0.0,
                 "min": (agora() - pos["aberta_em"]) / 60, "trailing": bool(pos.get("trailing")),
                 "hist": [num(v) for v in pos.get("hist", [])][-240:],
+                # Grafico "Posicao ao vivo" (so leitura): par, pico, liquidez e regras de saida do Risco.
+                "par": str(pos.get("par") or ""), "pico": num(pos.get("pico")), "liq_atual": num(pos.get("liq_atual")),
+                "valor_atual_usd": receita, "pnl_usd": receita - num(pos.get("custo")),
+                "intervalo_seg": cfg["intervalo_risco_seg"],
+                "regras_saida": {k: cfg.get(k) for k in ("stop_loss_pct", "take_profit_pct", "trailing_ativar_pct",
+                                                          "trailing_distancia_pct", "tempo_maximo_min")},
             })
         dados = {
             "modo": self.modo, "hora": hora_txt(), "agora": agora(),
             "limite_atualizacao_seg": max(30, 3 * min(cfg["intervalo_risco_seg"], cfg["intervalo_scanner_seg"])),
             "saldo": e["saldo"], "total": total,
-            "analisados": self.analisados, "hoje": self.escaneadas_hoje(), "recentes": self.recentes,
+            "analisados": self.analisados, "hoje": self.escaneadas_hoje(), "recentes": self._recentes_com_observacao(),
             "descobertas": self.descobertas,
             "scanner_counts": self._contadores_scanner_publicos(),
             "pendentes_scanner": [
@@ -3248,6 +3910,7 @@ class Bot:
                 ["Pontuação mínima para sinal", f"{cfg['pontuacao_minima']}/100"],
                 ["Tamanho de cada posição", f"{cfg['tamanho_posicao_pct']}% do capital"],
                 ["Máximo de posições abertas", str(cfg["max_posicoes_abertas"])],
+                ["Estado das pré-condições de compra", pre_proposta_status],
                 ["Exposição máxima", f"{cfg['exposicao_maxima_pct']}%"],
                 ["Stop loss", f"{cfg['stop_loss_pct']}%"],
                 ["Take profit", f"+{cfg['take_profit_pct']}%" if cfg["take_profit_pct"] else "desligado"],
@@ -3277,6 +3940,25 @@ class Bot:
             "sinais": list(reversed(e["sinais"][-cfg["max_sinais"]:])),
             "acoes": list(reversed(e["acoes"][-12:])),
             "propostas_paper": self.manual_approvals.public_pending(),
+            "rpc_observacao": getattr(getattr(self, "obs_extra", None), "origem_rpc", "publico")
+                              if getattr(getattr(self, "obs_extra", None), "ativo", False) else "inativa",
+            "paper_purchase_readiness": {
+                "eligible_for_proposal": valor_pre_proposta > 0,
+                "status": pre_proposta_status,
+                "manual_confirmation_required": True,
+                "max_open_positions": MAX_OPEN_POSITIONS,
+                "max_eur_per_operation": (_decimal_canonico(cfg["max_eur_per_operation"])
+                                          if cfg.get("max_eur_per_operation") is not None
+                                          else "Indisponível"),
+            },
+            "emergency_stop": {
+                "enabled": cfg.get("emergency_stop_enabled") is True,
+                "active": self._emergency_stop_is_active(),
+                "stop_id": self.estado.get("emergency_stop", {}).get("stop_id"),
+                "changed_at_utc": self.estado.get("emergency_stop", {}).get("changed_at_utc"),
+                "reason": self.estado.get("emergency_stop", {}).get("reason"),
+                "terminal_control_only": True,
+            },
             "minimo": cfg["pontuacao_minima"], "max_pos": cfg["max_posicoes_abertas"],
         }
         if cfg.get("limites_operacionais_ativos"):
@@ -3295,7 +3977,7 @@ class Bot:
             dados["limites_operacionais"] = {
                 "estado_configuracao": "invalida" if cfg.get("erro_config_operacional") else "valida",
                 "erro_configuracao": cfg.get("erro_config_operacional") or None,
-                "max_eur_per_operation": (str(cfg["max_eur_per_operation"])
+                "max_eur_per_operation": (_decimal_canonico(cfg["max_eur_per_operation"])
                                           if cfg.get("max_eur_per_operation") is not None else None),
                 "max_open_positions": cfg["max_posicoes_abertas"],
                 "fx_status": fx["status"], "fx_usd_per_eur": fx["rate"],
@@ -3311,6 +3993,48 @@ class Bot:
         log.info(texto)
         self.estado["acoes"].append(linha)
         del self.estado["acoes"][:-30]
+
+    def _registar_auditoria_aprovacao(self, event, proposal, reason=None):
+        """Persist a secret-free lifecycle event, then mirror it to log/Dashboard actions."""
+        try:
+            proposal_id = proposal.proposal_id if isinstance(proposal, PaperProposal) else proposal.get("proposal_id")
+            fields = proposal.public_fields() if isinstance(proposal, PaperProposal) else proposal
+            event_names = {
+                "proposed": "proposal_created",
+                "approved": "manual_confirmation_accepted",
+                "validation_passed": "execution_validation_passed",
+                "executed": "execution_committed",
+                "execution_blocked": "execution_blocked",
+                "invalidated": "execution_blocked",
+                "expired": "proposal_expired",
+                "rejected": "proposal_rejected",
+            }
+            journal_event = event_names.get(event)
+            if journal_event is None or self.paper_audit.blocked:
+                return False
+            record = {
+                "proposal_id": proposal_id,
+                "mint": fields.get("mint"),
+                "pair_address": fields.get("pair_address"),
+                "amount_usd": fields.get("debit_total_usd", fields.get("amount_usd")),
+                "price_usd": fields.get("reference_price_usd", fields.get("price_usd")),
+                "reason": sanitize_audit_text(reason) if reason else None,
+            }
+            if event == "executed":
+                record["operation_id"] = getattr(self, "_last_paper_operation_id", None)
+                record["source"] = "Executor"
+            elif event == "validation_passed":
+                record["source"] = "Executor"
+            self.paper_audit.append(journal_event, record)
+            serialized = json.dumps({"event": journal_event, **record}, ensure_ascii=True,
+                                    sort_keys=True, separators=(",", ":"))
+            log.info("PAPER_APPROVAL_AUDIT %s", serialized)
+            self.estado["acoes"].append(f"{hora_txt()}  PAPER_APPROVAL_AUDIT {serialized}")
+            del self.estado["acoes"][:-30]
+            return True
+        except Exception:
+            log.exception("Falha ao registar auditoria da proposta Paper")
+            return False
 
     def guardar(self):
         self.estado["ultimo_ciclo"] = agora()
@@ -3474,13 +4198,44 @@ class Bot:
         compras_confirmadas = 0
         for _, mint, par, analise in sorted(aprovados, key=lambda x: -x[0]):
             valor, motivo = self.executor.pode_comprar()
+            self._pedir_observacao_extra(mint, par, valor)
+            if mint in getattr(self.scanner, "origem_gecko", ()):
+                # Fonte GeckoTerminal em modo observacao: regista e grava o percurso, mas nunca propoe compra.
+                self.acao(f"{simbolo_limpo(par)}: aprovado ({analise['pontuacao']}) [GeckoTerminal - observacao] - sem proposta")
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+                continue
             if valor <= 0:
                 self.acao(f"{simbolo_limpo(par)}: aprovado ({analise['pontuacao']}) mas sem proposta - {motivo}")
+                self._registar_auditoria_aprovacao("execution_blocked", {
+                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                    "amount_usd": None, "price_usd": par.get("priceUsd"),
+                }, motivo)
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+                continue
+            try:
+                execution_plan = self.executor.preparar_execucao(mint, par, valor)
+            except (TypeError, ValueError, InvalidOperation) as exc:
+                self.acao(f"{simbolo_limpo(par)}: sem proposta - plano financeiro indisponível")
+                self._registar_auditoria_aprovacao("execution_blocked", {
+                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                    "amount_usd": valor, "price_usd": par.get("priceUsd"),
+                }, f"plano financeiro inválido ({type(exc).__name__})")
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+                continue
+            plan_block = self.executor.bloqueio_plano_financeiro(execution_plan)
+            if plan_block:
+                self.acao(f"{simbolo_limpo(par)}: aprovado mas proposta bloqueada - {plan_block}")
+                self._registar_auditoria_aprovacao("execution_blocked", {
+                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                    "amount_usd": valor, "price_usd": par.get("priceUsd"),
+                }, plan_block)
                 self.registar_sinal(mint, par, analise, False)
                 self.iniciar_percurso(mint, par, analise)
                 continue
             if isinstance(self.manual_approvals, ManualApprovalManager):
-                execution_plan = self.executor.preparar_execucao(mint, par, valor)
                 proposta = self.manual_approvals.propose(
                     mint, par, analise, valor, execution_plan)
             else:
@@ -3488,6 +4243,12 @@ class Bot:
             propostas += 1
             log.info("PROPOSTA PAPER %s %s valor=$%.4f score=%s expira em 90s",
                      proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"], proposta["score"])
+            if not self._registar_auditoria_aprovacao("proposed", proposta):
+                cancel = getattr(self.manual_approvals, "cancel", None)
+                if callable(cancel):
+                    cancel(proposta["proposal_id"], "diário de auditoria indisponível")
+                self.acao("Proposta cancelada: diário de auditoria indisponível")
+                continue
             self.registar_sinal(mint, par, analise, False, proposta["proposal_id"])
             self.iniciar_percurso(mint, par, analise)
             _, compras = self._processar_respostas_aprovacao()
@@ -3517,11 +4278,23 @@ class Bot:
             alterou = True
             if not aceite:
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                if token:
+                    descartar(token)
+                self._registar_auditoria_aprovacao(
+                    "expired" if motivo == "proposta expirada" else "rejected", proposta, motivo)
                 self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} recusada - {motivo}")
+                continue
+            if not self._registar_auditoria_aprovacao(
+                    "approved", proposta, "confirmação manual aceite pelo gestor"
+                    + (" (dashboard)" if motivo == "aprovada no dashboard" else "")):
+                descartar(token)
+                resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self.acao("Compra bloqueada: não foi possível persistir a confirmação manual")
                 continue
             if time.monotonic() >= proposta["expires_monotonic"]:
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao("expired", proposta, "expirou antes da execucao")
                 self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} expirada; compra bloqueada")
                 continue
             valor, bloqueio = self.executor.pode_comprar()
@@ -3531,6 +4304,8 @@ class Bot:
             if valor <= 0 or _decimal_canonico(valor) != _decimal_canonico(valor_proposto):
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao("invalidated", proposta,
+                                                    bloqueio or "valor da ordem mudou")
                 self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} invalidada - "
                           f"{bloqueio or 'valor da ordem mudou'}")
                 continue
@@ -3538,6 +4313,7 @@ class Bot:
             if cotacao is None:
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao("invalidated", proposta, motivo_cotacao)
                 self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} invalidada - {motivo_cotacao}")
                 continue
             try:
@@ -3555,16 +4331,45 @@ class Bot:
             if plano_atual is None or plano_atual.canonical_json != execution_json:
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao(
+                    "invalidated", proposta, "preco, liquidez ou condicoes de execucao mudaram")
                 self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} invalidada - "
                           "preco ou condicoes de execucao mudaram; exige nova analise e aprovacao")
                 continue
-            posicao = self.executor.comprar(proposta["mint"], cotacao,
-                                            proposta["analysis"], token, plano_atual)
+            bloqueio_plano = self.executor.bloqueio_plano_financeiro(plano_atual)
+            if bloqueio_plano:
+                descartar(token)
+                resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao("execution_blocked", proposta, bloqueio_plano)
+                self.acao(f"Proposta bloqueada - {bloqueio_plano}")
+                continue
+            if not self._registar_auditoria_aprovacao(
+                    "validation_passed", proposta, "limites, liquidez, impacto e plano revalidados"):
+                descartar(token)
+                resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self.acao("Compra bloqueada: diário de auditoria indisponível")
+                continue
+            self._last_paper_operation_id = None
+            try:
+                posicao = self.executor.comprar(proposta["mint"], cotacao,
+                                                proposta["analysis"], token, plano_atual)
+            except (PaperOperationAuthorizationError, PaperOperationError) as exc:
+                descartar(token)
+                resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao(
+                    "execution_blocked", proposta,
+                    f"persistencia Paper recusada ({type(exc).__name__})",
+                )
+                self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]} bloqueada na persistencia Paper")
+                continue
             if posicao:
                 compras += 1
                 resolver_sinal(proposta["proposal_id"], "comprado")
+                self._registar_auditoria_aprovacao("executed", proposta, "operacao Paper persistida")
             else:
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                self._registar_auditoria_aprovacao("execution_blocked", proposta,
+                                                    "Executor recusou a operacao")
         if alterou:
             self.atualizar_snapshot()
         return alterou, compras
@@ -3592,6 +4397,20 @@ class Bot:
             log.exception("Erro a gravar percursos")
         return vendas
 
+    def _pedir_observacao_extra(self, mint, par, valor_usd):
+        """So leitura: pede holders/mint/Jupiter em segundo plano. Nunca bloqueia nem decide."""
+        obs = getattr(self, "obs_extra", None)
+        if obs is None or not obs.ativo:
+            return
+        try:
+            valor = float(valor_usd) if valor_usd and float(valor_usd) > 0 else 5.0 * 1.08  # ~5 EUR nominal
+            preco = num(par.get("priceUsd"))
+            liq = num(obter(par, "liquidity", "usd"))
+            sim = round(slippage_total(self.cfg, valor, liq) * 100, 4) if liq > 0 else None
+            obs.pedir(mint, round(valor, 4), preco if preco > 0 else None, sim)
+        except Exception:
+            log.exception("Observacao extra ignorada para %s", mint)
+
     # ---------- laboratorio: gravar o percurso real do preco de cada sinal ----------
     def iniciar_percurso(self, mint, par, analise):
         cfg, pc = self.cfg, self.estado["percursos"]
@@ -3601,12 +4420,19 @@ class Bot:
             return
         pc[mint] = {"simbolo": simbolo_limpo(par), "pontuacao": int(analise["pontuacao"]), "ts": int(agora()),
                     "preco0": preco, "liq0": num(obter(par, "liquidity", "usd")),
-                    "par": str(par.get("pairAddress", "")), "pts": [[0, 1.0]], "sem_dados": 0}
+                    "par": str(par.get("pairAddress", "")), "pts": [[0, 1.0]], "sem_dados": 0,
+                    "fonte": "geckoterminal" if mint in getattr(self.scanner, "origem_gecko", ()) else "dexscreener"}
 
     def _fechar_percurso(self, mint, fim, liq_fim):
         pc = self.estado["percursos"].pop(mint)
         linha = {"mint": mint, "simbolo": pc["simbolo"], "pontuacao": pc["pontuacao"], "ts": pc["ts"],
                  "preco0": pc["preco0"], "liq0": pc["liq0"], "fim": fim, "liq_fim": liq_fim, "pts": pc["pts"]}
+        obs = getattr(self, "obs_extra", None)
+        extra = obs.obter(mint) if obs is not None else None
+        if extra:
+            linha["obs"] = extra
+        if pc.get("fonte"):
+            linha["fonte"] = pc["fonte"]
         try:
             with open(self.cfg["ficheiro_percursos"], "a", encoding="utf-8") as f:
                 f.write(json.dumps(linha, ensure_ascii=False) + "\n")
@@ -3965,6 +4791,13 @@ def analisar(cfg):
               f"    1.a metade: {m_a:+6.2f}% por trade     2.a metade: {m_b:+6.2f}% por trade (acerto {ac_b:.1f}%)",
               "    Se a 2.a metade for muito pior, a regra so 'acertou' por acaso - nao confies nela."]
 
+    L += _secao_observacao_extra(percursos, atual, cfg)
+    L += ["", "  POR FONTE DE DESCOBERTA (com as regras atuais)"]
+    for fonte in ("dexscreener", "geckoterminal"):
+        grupo = [pc for pc in percursos if pc.get("fonte", "dexscreener") == fonte]
+        if grupo:
+            media, acerto = _medir(grupo, atual, cfg)
+            L.append(f"    {fonte:<14} {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
     L += ["", "  POR PONTUACAO DO ANALISTA (com as regras atuais)"]
     for lo, hi in ((70, 79), (80, 89), (90, 100)):
         grupo = [pc for pc in percursos if lo <= num(pc.get("pontuacao")) <= hi]
@@ -3977,6 +4810,37 @@ def analisar(cfg):
           "      nao nas saidas: nenhuma regra de venda salva compras sem vantagem.",
           "    - Resultado em simulacao nao garante resultado com dinheiro real.", "=" * 74]
     return "\n".join(L)
+
+
+def _secao_observacao_extra(percursos, regra, cfg):
+    """Laboratorio: cruza a observacao extra (so leitura) com o resultado real dos percursos."""
+    com = [pc for pc in percursos if isinstance(pc.get("obs"), dict)]
+    L = ["", f"  OBSERVACAO EXTRA (holders, mint e Jupiter) - {len(com)} de {len(percursos)} percursos com dados"]
+    if not com:
+        return L + ["    Ainda sem dados: so os percursos gravados depois desta versao os tem."]
+
+    def grupo(nome, sel):
+        g = [pc for pc in com if sel(pc)]
+        if not g:
+            return
+        media, acerto = _medir(g, regra, cfg)
+        maxi = sum(max(p[1] for p in pc["pts"]) for pc in g) / len(g)
+        L.append(f"    {nome:<34} {len(g):>4}   media {media:+6.2f}%   acerto {acerto:5.1f}%   pico medio {100 * (maxi - 1):+6.1f}%")
+
+    top10 = lambda pc: num(obter(pc, "obs", "holders", "top10_pct"), -1)
+    grupo("top10 holders <= 40%", lambda pc: 0 <= top10(pc) <= 40)
+    grupo("top10 holders 40-70%", lambda pc: 40 < top10(pc) <= 70)
+    grupo("top10 holders > 70%", lambda pc: top10(pc) > 70)
+    estado_auth = lambda pc, k: obter(pc, "obs", "mint", k)
+    grupo("mint ou freeze authority ATIVA", lambda pc: "active" in (estado_auth(pc, "mint_authority"), estado_auth(pc, "freeze_authority")))
+    grupo("mint e freeze authority revogadas", lambda pc: estado_auth(pc, "mint_authority") == "revoked" and estado_auth(pc, "freeze_authority") == "revoked")
+    reais = [(num(obter(pc, "obs", "jupiter", "slippage_real_pct"), None), num(obter(pc, "obs", "slippage_simulado_pct"), None)) for pc in com]
+    reais = [(r, s) for r, s in reais if r is not None and s is not None]
+    if reais:
+        L.append(f"    Slippage de entrada: simulado medio {sum(s for _, s in reais) / len(reais):.2f}%   "
+                 f"real Jupiter medio {sum(r for r, _ in reais) / len(reais):.2f}%   ({len(reais)} cotacoes)")
+    L.append("    (So observacao: estes dados ainda nao filtram compras.)")
+    return L
 
 
 def _pedido_de_paragem(*_):
@@ -4015,6 +4879,7 @@ def aplicar_config_operacional(cfg, config_path=None):
         cfg["live_trading_enabled"] = limites["live_trading_enabled"]
         cfg["private_keys_in_application"] = limites["private_keys_in_application"]
         cfg["manual_confirmation_required"] = limites["manual_confirmation_required"]
+        cfg["emergency_stop_enabled"] = limites["emergency_stop_enabled"] is True
     return cfg
 
 
@@ -4174,6 +5039,10 @@ def main(argv=None):
         if args.reset:
             reiniciar(cfg, confirmado=args.confirmar_reset)
         bot = Bot(cfg, process_lock=process_lock)
+        bot.obs_extra.ativo = bool(cfg.get("observacao_extra")) and not args.demo
+        bot.obs_extra.rpc_url, bot.obs_extra.origem_rpc = configurar_rpc(pasta)
+        log.info("Observacao extra: RPC %s", bot.obs_extra.origem_rpc)  # nunca regista a chave
+        bot.scanner.gecko_ativo = bool(cfg.get("fonte_geckoterminal")) and not args.demo
         if args.demo:
             bot.modo = "demo"
             bot.risco.data_source = "demo_simulated"

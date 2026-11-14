@@ -12,6 +12,8 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 import bot
+import paper_trading_limits as limits_module
+from paper_audit_log import PaperAuditJournal
 from teste_paper_trading_limits import executor_fixture, sample_pair
 
 
@@ -19,6 +21,9 @@ class ManualApprovalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self._slippage_policy = patch.object(limits_module, "APPROVED_MAX_SLIPPAGE_PCT", Decimal("95"))
+        self._slippage_policy.start()
+        self.addCleanup(self._slippage_policy.stop)
 
     def new_executor(self):
         folder = tempfile.TemporaryDirectory()
@@ -203,6 +208,29 @@ class ManualApprovalTests(unittest.TestCase):
         self.assertIn("Slippage base aplicado (%): '+v(p.slippage_base_applied_pct)",
                       bot.PAGINA_HTML)
 
+    def test_structured_approval_audit_records_outcome_without_confirmation_code(self):
+        manager = bot.ManualApprovalManager()
+        self.addCleanup(manager.close)
+        proposal, _executor = self.make_proposal(
+            manager, "mint-audit", sample_pair("AUDIT"), {"pontuacao": 82, "motivo": "fixture"})
+        audit_bot = bot.Bot.__new__(bot.Bot)
+        audit_bot.estado = {"acoes": []}
+        audit_bot.paper_audit = PaperAuditJournal(os.path.join(self.temp.name, "paper_audit.jsonl"))
+        with patch.object(bot.log, "info") as log_info:
+            audit_bot._registar_auditoria_aprovacao("rejected", proposal, "codigo incorreto")
+        structured = next(call.args[1] for call in log_info.call_args_list
+                          if call.args and call.args[0] == "PAPER_APPROVAL_AUDIT %s")
+        record = json.loads(structured)
+        self.assertEqual(record["event"], "proposal_rejected")
+        self.assertEqual(record["proposal_id"], proposal.proposal_id)
+        self.assertEqual(record["mint"], proposal.mint)
+        self.assertEqual(record["pair_address"], proposal.pair_address)
+        self.assertNotIn(proposal.confirmation_code, structured)
+        self.assertIn('"event":"proposal_rejected"', audit_bot.estado["acoes"][-1])
+        verified = audit_bot.paper_audit.verify()
+        self.assertEqual(verified["count"], 1)
+        self.assertEqual(verified["events"][0]["event"], "proposal_rejected")
+
     def test_changed_mint_pair_amount_price_liquidity_or_conditions_consumes_and_rejects(self):
         cases = (
             ("mint-other", None, 5),
@@ -298,6 +326,65 @@ class ManualApprovalTests(unittest.TestCase):
         self.assertEqual(Decimal(disabled["slippage_total_pct"]), Decimal("2"))
         self.assertEqual(Decimal(disabled["market_impact_pct"]), Decimal("0"))
         self.assertFalse(disabled["impact_fallback"])
+
+    def test_proposal_financial_guard_rejects_unobserved_liquidity_and_unreliable_impact(self):
+        executor = self.new_executor()
+        executor.pode_comprar()  # load the isolated fixture policy
+        for liquidity in (0, None, "invalid"):
+            with self.subTest(liquidity=liquidity):
+                pair = sample_pair("NO-LIQ")
+                if liquidity is None:
+                    pair.pop("liquidity")
+                else:
+                    pair["liquidity"]["usd"] = liquidity
+                plan = executor.preparar_execucao("mint-no-liq", pair, 5)
+                self.assertIn("liquidez", executor.bloqueio_plano_financeiro(plan))
+        pair = sample_pair("NO-IMPACT")
+        executor.cfg["simular_impacto_preco"] = False
+        plan = executor.preparar_execucao("mint-no-impact", pair, 5)
+        self.assertIn("impacto", executor.bloqueio_plano_financeiro(plan))
+
+    def test_slippage_above_configured_test_policy_limit_blocks_proposal(self):
+        executor = self.new_executor()
+        executor.pode_comprar()
+        executor.cfg["max_slippage_pct"] = "1"
+        plan = executor.preparar_execucao("mint-over-cap", sample_pair("OVER-CAP"), 5)
+        self.assertIn("excede", executor.bloqueio_plano_financeiro(plan))
+
+    def test_emergency_stop_invalidates_approved_pending_permit_and_blocks_buy(self):
+        executor, state, _cfg = executor_fixture(self.temp.name, capital=100)
+        manager = bot.ManualApprovalManager()
+        self.addCleanup(manager.close)
+        executor.bot.manual_approvals = manager
+        pair = sample_pair("STOP")
+        amount, reason = executor.pode_comprar()
+        self.assertGreater(amount, 0, reason)
+        plan = executor.preparar_execucao("mint-stop", pair, amount)
+        proposal = manager.propose("mint-stop", pair, {"pontuacao": 90}, amount, plan)
+        manager._results.put((proposal.proposal_id,
+                              f"APROVAR {proposal.proposal_id} {proposal.confirmation_code}"))
+        _proposal, token, accepted, _reason = manager.drain_results()[0]
+        self.assertTrue(accepted)
+        executor.bot.emergency_stop["active"] = True
+        manager.invalidate_pending("paragem de emergência ativa")
+        self.assertIsNone(executor.comprar("mint-stop", pair, {"pontuacao": 90}, token, plan))
+        self.assertEqual(state["saldo"], 100)
+        self.assertEqual(state["posicoes"], {})
+        self.assertFalse(manager._permits)
+
+    def test_emergency_stop_while_proposal_waits_rejects_without_permit(self):
+        manager = bot.ManualApprovalManager()
+        self.addCleanup(manager.close)
+        proposal, _executor = self.make_proposal(
+            manager, "mint-stop-pending", sample_pair("STOP-PENDING"), {"pontuacao": 80})
+        manager.invalidate_pending("paragem de emergencia ativa")
+        result = manager.drain_results()
+        self.assertEqual(len(result), 1)
+        _proposal, token, accepted, _reason = result[0]
+        self.assertEqual(_proposal.proposal_id, proposal.proposal_id)
+        self.assertFalse(accepted)
+        self.assertIsNone(token)
+        self.assertFalse(manager._permits)
 
     def test_dashboard_public_proposal_never_contains_confirmation_code(self):
         manager = bot.ManualApprovalManager()

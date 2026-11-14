@@ -13,9 +13,11 @@ import tempfile
 import time
 import copy
 from datetime import datetime, timezone
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot as B  # noqa: E402
+import paper_trading_limits as PTL  # noqa: E402
 
 # ---------------------------------------------------------------- mercado falso
 RELOGIO = {"t": 1_800_000_000.0}
@@ -28,6 +30,7 @@ class _AutoApprovalFixture:
     def __init__(self):
         self.pending = []
         self.used = set()
+        self.token_proposals = {}
         self.counter = 0
 
     def start(self):
@@ -44,7 +47,9 @@ class _AutoApprovalFixture:
             "expires_monotonic": time.monotonic() + 90, "pair": copy.deepcopy(pair),
             "analysis": copy.deepcopy(analysis), "status": "approved",
         }
-        self.pending.append((proposal, "fixture-token-" + str(self.counter), True, "fixture approval"))
+        token = "fixture-token-" + str(self.counter)
+        self.token_proposals[token] = proposal["proposal_id"]
+        self.pending.append((proposal, token, True, "fixture approval"))
         return proposal
 
     def drain_results(self):
@@ -55,6 +60,13 @@ class _AutoApprovalFixture:
         if token in self.used or not token or not token.startswith("fixture-token-"):
             return False
         self.used.add(token)
+        return True
+
+    def proposal_id_for_token(self, token):
+        return self.token_proposals.get(token)
+
+    def discard(self, token):
+        self.token_proposals.pop(token, None)
         return True
 
     def public_pending(self):
@@ -173,8 +185,33 @@ def novo_bot(pasta, limpar=True):
                # os testes usam regras fixas, independentes dos valores por defeito do bot
                stop_loss_pct=-6.0, take_profit_pct=25.0, trailing_ativar_pct=10.0, trailing_distancia_pct=8.0,
                tempo_maximo_min=60, percurso_minutos=90)
+    # Test-only approved ceiling. The project operational config remains unset and fail-closed.
+    PTL.APPROVED_MAX_SLIPPAGE_PCT = Decimal("95")
+    policy_path = os.path.join(pasta, "config_operacoes.json")
+    with open(policy_path, "w", encoding="utf-8") as policy_file:
+        json.dump({
+            "mode": "paper", "live_trading_enabled": False,
+            "private_keys_in_application": False, "manual_confirmation_required": True,
+            "max_eur_per_operation": 5, "max_open_positions": 1,
+            "reject_duplicate_orders": True, "require_cost_estimate_before_approval": True,
+            "require_slippage_estimate_before_approval": True,
+            "block_if_costs_or_minimum_order_cannot_be_verified": True,
+            "emergency_stop_enabled": True, "max_slippage_pct": "95",
+        }, policy_file)
+    B.aplicar_config_operacional(cfg, policy_path)
     B.configurar_log(cfg)
     bot = B.Bot(cfg)
+    # Isolated Paper fixtures use a fixed, valid ECB observation so the operational
+    # ceiling is exercised without a network request.
+    sessao = bot.estado["operational_session"]
+    sessao.update({
+        "fx_usd_per_eur": "1.1052",
+        "fx_reference_date": datetime.now(timezone.utc).date().isoformat(),
+        "fx_locked_at_utc": datetime.now(timezone.utc).isoformat(),
+        "fx_source": B.ECB_SOURCE,
+    })
+    B.guardar_estado(cfg, bot.estado, strict=True)
+    bot._fx_rate_persisted = True
     bot.manual_approvals.close()
     bot.manual_approvals = _AutoApprovalFixture()
     _BOTS_COM_SNAPSHOTS.append(bot)
@@ -211,13 +248,17 @@ def t_fluxo_completo(pasta):
     assert analisadas["LIXO"]["estado_analise"] == "rejeitada"
     assert analisadas["LIXO"]["resultado_analise"]
     pos = bot.estado["posicoes"][mint_de("BOM")]
-    assert abs(pos["custo"] - 12.0) < 1e-9 and abs(bot.estado["saldo"] - 88.0) < 1e-9
+    assert abs(pos["custo"] - 5.5260) < 1e-9 and abs(bot.estado["saldo"] - 94.4740) < 1e-9
     assert pos["preco_efetivo"] > pos["preco_entrada"]            # pagou slippage
-    assert pos["tokens"] * pos["preco_entrada"] < 12.0            # pagou taxa
+    assert pos["tokens"] * pos["preco_entrada"] < 5.5260          # pagou taxa
     assert bot.valor_total() < 100.0                              # custos ja contam no valor total
     assert len(trades(cfg)) == 1 and trades(cfg)[0]["tipo"] == "COMPRA"
     assert bot.ciclo_scanner() == 0                               # nao volta a comprar o mesmo
     assert len(bot.estado["posicoes"]) == 1
+    bot.atualizar_snapshot()
+    snap_pos = json.loads(bot.snapshot)["posicoes"][0]                # grafico "Posicao ao vivo"
+    assert snap_pos["regras_saida"]["stop_loss_pct"] == cfg["stop_loss_pct"] and snap_pos["intervalo_seg"] == cfg["intervalo_risco_seg"]
+    assert snap_pos["par"] and snap_pos["pico"] > 0 and abs(snap_pos["pnl_usd"] - (snap_pos["valor_atual_usd"] - pos["custo"])) < 1e-9
 
 
 def comprar_um(pasta, nome="BOM", **kw):
@@ -268,7 +309,7 @@ def t_rug_liquidez(pasta):
     assert bot.ciclo_risco() == 1
     v = trades(cfg)[-1]
     assert v["motivo"].startswith("RUG") and float(v["pnl_pct"]) < -90, v
-    assert bot.estado["saldo"] >= 88.0
+    assert bot.estado["saldo"] >= 94.4740
 
 
 def t_rug_par_desaparece(pasta):
@@ -279,7 +320,7 @@ def t_rug_par_desaparece(pasta):
     assert bot.ciclo_risco() == 1
     v = trades(cfg)[-1]
     assert "perda total" in v["motivo"] and float(v["pnl_pct"]) == -100.0
-    assert abs(bot.estado["saldo"] - 88.0) < 1e-9
+    assert abs(bot.estado["saldo"] - 94.4740) < 1e-9
 
 
 def t_tempo_maximo(pasta):
@@ -294,24 +335,24 @@ def t_limites(pasta):
     bot, cfg = novo_bot(pasta)
     for i in range(7):
         listar(f"T{i}")
-    assert bot.ciclo_scanner() == 4                               # maximo de 4 posicoes
+    assert bot.ciclo_scanner() == 1                               # maximo operacional de 1 posicao
     investido = sum(p["custo"] for p in bot.estado["posicoes"].values())
-    assert investido <= 55.0 + 1e-9 and bot.estado["saldo"] >= 45.0 - 1e-9
-    # exposicao maxima: com posicoes de 20% so cabem 2 inteiras + 1 parcial ate aos 55%
+    assert investido <= 5.5260 + 1e-9 and bot.estado["saldo"] >= 94.4740 - 1e-9
+    # Uma posição e o limite EUR continuam a prevalecer sobre a percentagem da estratégia.
     bot, cfg = novo_bot(pasta)
     bot.cfg["tamanho_posicao_pct"] = 20
     for i in range(7):
         listar(f"U{i}")
     bot.ciclo_scanner()
     investido = sum(p["custo"] for p in bot.estado["posicoes"].values())
-    assert abs(investido - 55.0) < 1e-6, investido
+    assert abs(investido - 5.5260) < 1e-6, investido
 
 
 def t_persistencia(pasta):
     bot, cfg = comprar_um(pasta)
     bot.guardar()
     bot2, _ = novo_bot(pasta, limpar=False)
-    assert mint_de("BOM") in bot2.estado["posicoes"] and abs(bot2.estado["saldo"] - 88.0) < 1e-9
+    assert mint_de("BOM") in bot2.estado["posicoes"] and abs(bot2.estado["saldo"] - 94.4740) < 1e-9
     assert mint_de("BOM") in bot2.estado["vistos"]
     mexer("BOM", preco=0.0013)
     assert bot2.ciclo_risco() == 1                                # continua a gerir depois de reiniciar
@@ -440,8 +481,8 @@ def t_plataforma_web(pasta):
         listar(f"S{i}")
     bot.ciclo_scanner()
     sinais = bot.estado["sinais"]
-    assert len(sinais) == 7 and sum(s["estado"] == "comprado" for s in sinais) == 4
-    assert sum(s["estado"] == "sem_vaga" for s in sinais) == 3
+    assert len(sinais) == 7 and sum(s["estado"] == "comprado" for s in sinais) == 1
+    assert sum(s["estado"] == "sem_vaga" for s in sinais) == 6
     mexer("BOM", preco=0.0013)
     bot.ciclo_risco()
     s = next(x for x in sinais if x["simbolo"] == "BOM")
@@ -454,7 +495,22 @@ def t_plataforma_web(pasta):
         porta = bot.servidor_web.server_address[1]
         base = f"http://127.0.0.1:{porta}"
         assert url.startswith(f"http://localhost:{porta}")
-        pagina = urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8")
+        neural = urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8")
+        # Dashboard Neural: so leitura, so GET /api/estado, sem codigos de confirmacao nem acoes.
+        assert neural.startswith("<!DOCTYPE html>") and "Neural Sphere" in neural and "fetch('/api/estado',{cache:'no-store'})" in neural
+        # Unica escrita autorizada (2026-11-14): POST /api/proposta/decisao, com confirmacao e chave da sessao.
+        assert neural.count("fetch(") == 2 and neural.count("method:'POST'") == 1 and "'/api/proposta/decisao'" in neural
+        assert "confirmation_code" not in neural and "__MEMEBOT_TOKEN__" not in neural
+        assert "XMLHttpRequest" not in neural and "WebSocket" not in neural and "sendBeacon" not in neural
+        assert "function verificarAvisos()" in neural and "Proposta de compra pendente" in neural and "Sim, recusar" in neural and "Sim, aprovar" in neural
+        assert 'href="/classico"' in neural and "@media(max-width:699px)" in neural
+        pagina = urllib.request.urlopen(base + "/classico", timeout=5).read().decode("utf-8")
+        original_neural = B.CAMINHO_PAGINA_NEURAL
+        try:
+            B.CAMINHO_PAGINA_NEURAL = original_neural + ".inexistente"
+            assert urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8") == pagina
+        finally:
+            B.CAMINHO_PAGINA_NEURAL = original_neural
         assert "<!DOCTYPE html>" in pagina and "/api/estado" in pagina and "viewport" in pagina
         assert "typeof d.hora==='string'" in pagina
         assert "function conta(n,ate,fmt)" in pagina and "(t-t0)/700" in pagina
@@ -474,6 +530,12 @@ def t_plataforma_web(pasta):
         assert "c.preco.textContent=disponivel(o.preco)&&Number.isFinite(Number(o.preco))&&Number(o.preco)>=0" in pagina
         assert "c.variacao.textContent=valorCartaoRadar(o.var_h1,v=>pct(v))" in pagina
         assert "c.score.textContent=disponivel(o.pontuacao)?Math.round(Number(o.pontuacao))+'/100':'\\u2014'" in pagina
+        # Etapa 1 do dashboard: tooltip com liquidez, market cap, idade e motivo, so com dados ja publicados.
+        assert "campo('blip-card-liq'" in pagina and "campo('blip-card-mcap'" in pagina and "campo('blip-card-idade'" in pagina
+        assert "function criterioRadar(o,id)" in pagina and "x.status==='passed'||x.status==='rejected'" in pagina
+        assert "criterioRadar(o,'market_cap')" in pagina and "criterioRadar(o,'idade_par')" in pagina
+        assert "c.motivo.textContent=txt" in pagina and "c.motivo.innerHTML" not in pagina
+        assert ".blip-card-mcap,.blip-card-idade,.blip-card-motivo{display:none}" in pagina
         assert "atualizarCartaoRadar(n,o,isMelhor)" in pagina and "n.orbita.classList.toggle('destaque',melhor)" in pagina
         assert "if(!ids.has(m)){n.orbita.remove();blips.delete(m);if(radarHoverMint===m)radarHoverMint=null;if(radarCartaoAbertoMint===m)radarCartaoAbertoMint=null}" in pagina
         assert "n.addEventListener('mouseenter'" in pagina and "n.addEventListener('mouseleave'" in pagina
@@ -490,7 +552,7 @@ def t_plataforma_web(pasta):
         assert 'id="cmode"' in pagina and 'id="estado-bot"' in pagina and 'id="ultima-atualizacao"' in pagina
         assert "Paper Trading · simulação" in pagina and "Demo · mercado inventado" in pagina
         d = json.loads(urllib.request.urlopen(base + "/api/estado", timeout=5).read().decode("utf-8"))
-        assert d["modo"] == "simulacao" and len(d["sinais"]) == 7 and len(d["posicoes"]) == 3
+        assert d["modo"] == "simulacao" and len(d["sinais"]) == 7 and len(d["posicoes"]) == 0
         assert d["em_analise"] == [] and len(d["recentes"]) == 6
         assert all("estado_analise" in o and "preco" in o and "nome" in o for o in d["recentes"])
         assert isinstance(d["hora"], str) and d["hora"]
@@ -512,9 +574,13 @@ def t_plataforma_web(pasta):
 
     # O terminal usa o valor publicado pela API, mesmo que os preços mudem depois do snapshot.
     import contextlib, io
-    pos = next(iter(bot.estado["posicoes"].values()))
-    preco_original = pos["preco_atual"]
-    pos["preco_atual"] *= 1.2
+    pos = next(iter(bot.estado["posicoes"].values()), None)
+    if pos is not None:
+        valor_original = pos["preco_atual"]
+        pos["preco_atual"] *= 1.2
+    else:
+        valor_original = bot.estado["saldo"]
+        bot.estado["saldo"] += 1.0
     try:
         saida = io.StringIO()
         with contextlib.redirect_stdout(saida):
@@ -522,12 +588,15 @@ def t_plataforma_web(pasta):
         assert abs(bot.valor_total() - total_publicado) > 1e-6
         assert f"Valor total: ${total_publicado:.2f}" in saida.getvalue()
     finally:
-        pos["preco_atual"] = preco_original
+        if pos is not None:
+            pos["preco_atual"] = valor_original
+        else:
+            bot.estado["saldo"] = valor_original
     # estado antigo (sem sinais/historico) continua a carregar
     bot.estado.pop("sinais"), bot.estado.pop("historico")
     bot.guardar()
     bot2, _ = novo_bot(pasta, limpar=False)
-    assert bot2.estado["sinais"] == [] and len(bot2.estado["posicoes"]) == 3
+    assert bot2.estado["sinais"] == [] and len(bot2.estado["posicoes"]) == 0
 
 
 def t_scanner_publica_analise_em_curso(pasta):
@@ -566,16 +635,13 @@ def t_scanner_publica_analise_em_curso(pasta):
 def t_valores_historicos_paper_scanner_carteira_operacoes(pasta):
     import json
     bot, cfg = novo_bot(pasta)
-    cfg["max_posicoes_abertas"] = 2
     listar("WRENCHP")
     listar("Sakura")
     listar("SEMCOMPRA")
     bot.ciclo_scanner()
     assert mint_de("WRENCHP") in bot.estado["posicoes"]
-    assert mint_de("Sakura") in bot.estado["posicoes"]
+    assert mint_de("Sakura") not in bot.estado["posicoes"]
     assert mint_de("SEMCOMPRA") not in bot.estado["posicoes"]
-    mexer("Sakura", preco=0.0005)
-    assert bot.ciclo_risco() == 1
     bot.atualizar_snapshot()
     d = json.loads(bot.snapshot)
     assert d["trades_disponiveis"] is True
@@ -583,18 +649,16 @@ def t_valores_historicos_paper_scanner_carteira_operacoes(pasta):
     sakura = mint_de("Sakura")
     semcompra = mint_de("SEMCOMPRA")
     compra_w = next(t for t in d["trades"] if t["mint"] == wrench and t["tipo"] == "COMPRA")
-    compra_s = next(t for t in d["trades"] if t["mint"] == sakura and t["tipo"] == "COMPRA")
-    venda_s = next(t for t in d["trades"] if t["mint"] == sakura and t["tipo"] == "VENDA")
-    assert compra_w["valor_usd"] == compra_s["valor_usd"] == 12.0
+    assert compra_w["valor_usd"] == 5.526
+    assert not any(t["mint"] == sakura for t in d["trades"])
     aberta = next(p for p in d["posicoes"] if p["mint"] == wrench)
     assert aberta["custo"] == compra_w["valor_usd"] and aberta["estado"] == "aberta"
     assert aberta["tokens"] > 0 and aberta["preco_efetivo"] == compra_w["preco_efetivo"]
     assert aberta["aberta_em"] > 0 and aberta["preco_atual"] > 0
-    assert venda_s["pnl_usd"] < 0 and venda_s["preco_efetivo"] > 0
     assert not any(t["mint"] == semcompra for t in d["trades"])
     assert not any(p["mint"] == semcompra for p in d["posicoes"])
     sinais = {s["mint"]: s for s in d["sinais"]}
-    assert sinais[wrench]["estado"] == "comprado" and sinais[sakura]["estado"] == "fechado"
+    assert sinais[wrench]["estado"] == "comprado" and sinais[sakura]["estado"] == "sem_vaga"
     assert sinais[semcompra]["estado"] == "sem_vaga"
     pagina = B.PAGINA_HTML
     assert "function blocoOperacao(mint)" in pagina and "function historicoOperacoes()" in pagina
@@ -657,9 +721,10 @@ def t_nomes_hostis(pasta):
     MERCADO["pares"][mint_de("VAZIO")][0]["baseToken"]["symbol"] = None
     listar("IMG")
     MERCADO["pares"][mint_de("IMG")][0]["info"] = {"imageUrl": "javascript:alert(1)"}
-    assert bot.ciclo_scanner() == 4
-    nomes = sorted(p["simbolo"] for p in bot.estado["posicoes"].values())
-    assert nomes == sorted(["=HYPERLINK(\"", "[2JABC", "?", "IMG"]), nomes
+    assert bot.ciclo_scanner() == 1
+    nomes = sorted(s["simbolo"] for s in bot.estado["sinais"])
+    assert sorted(["=HYPERLINK(\"", "[2JABC", "?", "IMG"]) == nomes
+    assert len(bot.estado["posicoes"]) == 1
     linhas = trades(cfg)
     assert any(l["simbolo"].startswith("'=") for l in linhas) and not any(l["simbolo"].startswith("=") for l in linhas)
     assert all(s["img"] == "" for s in bot.estado["sinais"])
@@ -747,7 +812,7 @@ def t_laboratorio(pasta):
     for i in range(3):
         listar(f"X{i}")                                           # sem vaga: tambem sao gravados
     bot.ciclo_scanner()
-    assert len(bot.estado["percursos"]) == 8 and len(bot.estado["posicoes"]) == 4
+    assert len(bot.estado["percursos"]) == 8 and len(bot.estado["posicoes"]) == 1
     cfg["tempo_maximo_min"] = 10 ** 6                             # as posicoes nao interessam aqui
     cfg["take_profit_pct"] = cfg["trailing_ativar_pct"] = 0       # alvo e trailing desligados
     for minuto in range(1, 95):
@@ -797,25 +862,26 @@ def t_retomar_depois_de_pausa(pasta):
     listar("B")
     bot.ciclo_scanner()
     bot.ciclo_risco()
-    assert len(bot.estado["posicoes"]) == 2 and len(bot.estado["percursos"]) == 2
+    assert len(bot.estado["posicoes"]) == 1 and len(bot.estado["percursos"]) == 2
     saldo_antes = bot.estado["saldo"]
     bot.guardar()
     # pausa curta (2 min): nada muda
     avancar(2)
     b2, _ = novo_bot(pasta, limpar=False)
-    assert b2.retomar() == 0 and len(b2.estado["posicoes"]) == 2
+    assert b2.retomar() == 0 and len(b2.estado["posicoes"]) == 1
     # PC desligado 3 horas, com o preco a cair a pique entretanto
     avancar(180)
     mexer("A", preco=0.0001)
     b3, _ = novo_bot(pasta, limpar=False)
-    assert b3.retomar() == 2
+    assert b3.retomar() == 1
     e = b3.estado
     assert e["posicoes"] == {} and e["percursos"] == {} and abs(e["saldo"] - 100.0) < 1e-9
     assert saldo_antes < 100.0
     assert e["stats"]["fechados"] == 0 and e["stats"]["pnl_total"] == 0     # nao conta como trade
-    assert all(s["estado"] == "anulado" for s in e["sinais"])
+    assert sum(s["estado"] == "anulado" for s in e["sinais"]) == 1
+    assert sum(s["estado"] == "sem_vaga" for s in e["sinais"]) == 1
     linhas = trades(cfg)
-    assert [l["tipo"] for l in linhas].count("ANULADA") == 2
+    assert [l["tipo"] for l in linhas].count("ANULADA") == 1
     assert not os.path.exists(cfg["ficheiro_percursos"])                 # percursos interrompidos nao sao gravados
     assert any("parado" in a for a in e["acoes"])
     b3.atualizar_snapshot()

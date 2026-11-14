@@ -16,6 +16,10 @@ class PaperOperationError(RuntimeError):
     """An operation is pending or storage state cannot be reconciled safely."""
 
 
+class PaperOperationAuthorizationError(PaperOperationError):
+    """BUY authorization was refused before any journal mutation."""
+
+
 def _canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -122,6 +126,8 @@ class PaperOperationStore:
         self.trade_fields = list(dict.fromkeys([*trade_fields, self.ID_FIELD]))
         self.directory = self.state_path + ".paper_operations"
         self.error = None
+        self._buy_guard = None
+        self._buy_capability = None
         with state_access_lock(self.state_path):
             os.makedirs(self.directory, exist_ok=True)
 
@@ -134,7 +140,17 @@ class PaperOperationStore:
         instance.trade_fields = list(dict.fromkeys([*trade_fields, cls.ID_FIELD]))
         instance.directory = instance.state_path + ".paper_operations"
         instance.error = None
+        instance._buy_guard = None
+        instance._buy_capability = None
         return instance
+
+    def bind_buy_guard(self, validator, capability):
+        """Bind the live Executor as the sole authorized BUY commit path."""
+        if not callable(validator) or capability is None:
+            raise PaperOperationError("guard de compra inválido")
+        if self._buy_guard is not None:
+            raise PaperOperationError("guard de compra já associado")
+        self._buy_guard, self._buy_capability = validator, capability
 
     @property
     def blocked(self):
@@ -429,6 +445,9 @@ class PaperOperationStore:
             expected_row = payload.get("trade_row")
             if not isinstance(state_after, dict) or not isinstance(expected_row, dict):
                 raise PaperOperationError(f"snapshot/linha ausente no intent {operation_id}")
+            metadata = payload.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise PaperOperationError(f"metadata inválida no intent {operation_id}")
             if (state_after.get("paper_state_revision") != target_revision
                     or not isinstance(state_after.get("paper_ops_applied"), list)
                     or state_after["paper_ops_applied"].count(operation_id) != 1):
@@ -443,6 +462,9 @@ class PaperOperationStore:
                 "id": operation_id, "payload": payload, "digest": digest,
                 "base": base, "target": target_revision,
                 "done": f"{operation_id}.done.json" in done_names,
+                "operation_type": payload.get("operation_type"),
+                "metadata": payload.get("metadata", {}),
+                "trade_row": expected_row,
             })
 
         records.sort(key=lambda record: record["base"])
@@ -556,7 +578,12 @@ class PaperOperationStore:
             self.error = None
             return {"operation_count": len(result["records"]),
                     "pending_ids": [record["id"] for record in result["pending"]],
-                    "state_revision": (result["state"] or {}).get("paper_state_revision", 0)}
+                    "state_revision": (result["state"] or {}).get("paper_state_revision", 0),
+                    "operations": [{"operation_id": record["id"],
+                                    "operation_type": record["operation_type"],
+                                    "metadata": record["metadata"],
+                                    "trade_row": record["trade_row"]}
+                                   for record in result["records"] if record["done"]]}
         except Exception as exc:
             self.error = str(exc)
             if isinstance(exc, PaperOperationError):
@@ -645,21 +672,32 @@ class PaperOperationStore:
             self.error = str(exc)
             raise PaperOperationError(self.error) from exc
 
-    def commit(self, current_state, candidate_state, trade_row, operation_type):
+    def commit(self, current_state, candidate_state, trade_row, operation_type, *,
+               authorization=None, metadata=None):
         try:
             with state_access_lock(self.state_path):
-                return self._commit_locked(current_state, candidate_state, trade_row, operation_type)
+                return self._commit_locked(current_state, candidate_state, trade_row, operation_type,
+                                           authorization, metadata)
         except Exception as exc:
-            self.error = str(exc)
+            if not isinstance(exc, PaperOperationAuthorizationError):
+                self.error = str(exc)
             if isinstance(exc, PaperOperationError):
                 raise
             raise PaperOperationError(self.error) from exc
 
-    def _commit_locked(self, current_state, candidate_state, trade_row, operation_type):
+    def _commit_locked(self, current_state, candidate_state, trade_row, operation_type,
+                       authorization=None, metadata=None):
         """Persist one absolute state snapshot and its CSV row under the instance lock."""
         self.recover(current_state)
         if self.blocked:
             raise PaperOperationError(self.error or "existem operacoes Paper pendentes")
+        if operation_type not in ("BUY", "SELL", "CANCEL"):
+            raise PaperOperationError("tipo de operacao Paper desconhecido")
+        if operation_type == "BUY":
+            if (self._buy_guard is None or not isinstance(authorization, dict)
+                    or authorization.get("capability") is not self._buy_capability
+                    or not self._buy_guard(authorization, current_state, candidate_state, trade_row)):
+                raise PaperOperationAuthorizationError("BUY recusado: autorização do Executor ausente ou inválida")
 
         operation_id = uuid.uuid4().hex
         _fields, _rows, _header, raw_rows, _row_lengths = self._read_csv_document()
@@ -682,6 +720,7 @@ class PaperOperationStore:
             "target_revision": base_revision + 1,
             "state_after": candidate,
             "trade_row": normalized_row,
+            "metadata": dict(metadata or {}),
         }
         digest = self._digest(payload)
         atomic_write_json(self._intent_path(operation_id), {"operation_id": operation_id,

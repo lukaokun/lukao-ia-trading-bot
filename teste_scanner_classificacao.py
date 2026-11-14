@@ -23,10 +23,12 @@ def mercado_valido():
 
 def analista(cfg=None):
     c = copy.deepcopy(bot.CONFIG)
-    c["usar_rugcheck"] = False
+    c["usar_rugcheck"] = True
     if cfg:
         c.update(cfg)
-    return bot.Analista(c, None)
+    instance = bot.Analista(c, None)
+    instance.rugcheck = lambda _mint: {"score": 5.0, "perigos": [], "n_riscos": 0}
+    return instance
 
 
 class TestScannerClassificacao(unittest.TestCase):
@@ -101,6 +103,44 @@ class TestScannerClassificacao(unittest.TestCase):
             erro = analista().analisar(MINT, mercado_valido())
         self.assertIsNone(erro["pontuacao"])
         self.assertFalse(erro["score_calculated"])
+
+    def test_rugcheck_disabled_or_unavailable_never_approves_candidate(self):
+        for config, rug_result in (({"usar_rugcheck": False}, None), ({}, None)):
+            with self.subTest(config=config):
+                a = analista(config)
+                a.rugcheck = lambda _mint, result=rug_result: result
+                result = a.analisar(MINT, mercado_valido())
+                self.assertEqual(result["status"], "pending_data")
+                self.assertFalse(result["aprovado"])
+                self.assertIn("rugcheck", result["missing_fields"])
+
+    def test_rugcheck_exception_is_pending_not_technical_approval(self):
+        class TimeoutFixture:
+            def get_json(self, *_args, **_kwargs):
+                raise TimeoutError("fixture timeout")
+
+        a = bot.Analista({**bot.CONFIG, "usar_rugcheck": True}, TimeoutFixture())
+        result = a.analisar(MINT, mercado_valido())
+        self.assertEqual(result["status"], "pending_data")
+        self.assertIsNone(result["aprovado"])
+        self.assertIn("rugcheck", result["missing_fields"])
+
+    def test_invalid_rugcheck_scores_are_treated_as_unavailable(self):
+        class HttpFixture:
+            def __init__(self, payload):
+                self.payload = payload
+            def get_json(self, *_args, **_kwargs):
+                return self.payload
+
+        for payload in (
+            None, [], {"risks": "bad", "score": 0},
+            {"risks": [None], "score": 0},
+            {"risks": [], "score_normalised": float("nan")},
+            {"risks": [], "score_normalised": 101},
+        ):
+            with self.subTest(payload=payload):
+                a = bot.Analista({**bot.CONFIG, "usar_rugcheck": True}, HttpFixture(payload))
+                self.assertIsNone(a.rugcheck(MINT))
 
     def test_historico_nao_promove_sinal_a_aprovacao_atual(self):
         pagina = bot.PAGINA_HTML

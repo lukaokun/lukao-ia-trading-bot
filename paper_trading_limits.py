@@ -23,6 +23,9 @@ ECB_SOURCE = "European Central Bank (ECB) daily reference rate"
 MAX_RATE_AGE_DAYS = 4
 MAX_OPERATION_EUR = Decimal("5")
 MAX_OPEN_POSITIONS = 1
+# Maximum approved by the operator on 2026-11-14 (Paper only): 3% total simulated
+# slippage per entry (2% base + market impact). A missing config cap still blocks proposals.
+APPROVED_MAX_SLIPPAGE_PCT = Decimal("3")
 USD_PRECISION = Decimal("0.0001")
 
 _LOCK_REGISTRY_GUARD = threading.Lock()
@@ -203,6 +206,16 @@ def load_operational_config(path):
         raise OperationalConfigError("private_keys_in_application tem de ser false")
     if data.get("manual_confirmation_required") is not True:
         raise OperationalConfigError("manual_confirmation_required tem de ser true")
+    required_true = (
+        "reject_duplicate_orders",
+        "require_cost_estimate_before_approval",
+        "require_slippage_estimate_before_approval",
+        "block_if_costs_or_minimum_order_cannot_be_verified",
+        "emergency_stop_enabled",
+    )
+    for key in required_true:
+        if data.get(key) is not True:
+            raise OperationalConfigError(f"{key} tem de ser true")
 
     try:
         eur_limit = Decimal(str(data["max_eur_per_operation"]))
@@ -210,6 +223,22 @@ def load_operational_config(path):
         raise OperationalConfigError("max_eur_per_operation invalido") from exc
     if not eur_limit.is_finite() or eur_limit <= 0 or eur_limit > MAX_OPERATION_EUR:
         raise OperationalConfigError("max_eur_per_operation tem de ser > 0 e <= 5 EUR")
+
+    raw_slippage_cap = data.get("max_slippage_pct")
+    slippage_cap = None
+    if APPROVED_MAX_SLIPPAGE_PCT is None:
+        if raw_slippage_cap is not None:
+            raise OperationalConfigError(
+                "max_slippage_pct foi indicado, mas ainda não existe limite máximo aprovado"
+            )
+    else:
+        try:
+            slippage_cap = Decimal(str(raw_slippage_cap))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise OperationalConfigError("max_slippage_pct inválido ou não aprovado") from exc
+        if (not slippage_cap.is_finite() or slippage_cap <= 0
+                or slippage_cap > APPROVED_MAX_SLIPPAGE_PCT):
+            raise OperationalConfigError("max_slippage_pct excede ou viola o limite aprovado")
 
     count = data.get("max_open_positions")
     if isinstance(count, bool) or not isinstance(count, int) or count != MAX_OPEN_POSITIONS:
@@ -222,6 +251,12 @@ def load_operational_config(path):
         "manual_confirmation_required": True,
         "max_eur_per_operation": eur_limit,
         "max_open_positions": count,
+        "reject_duplicate_orders": True,
+        "require_cost_estimate_before_approval": True,
+        "require_slippage_estimate_before_approval": True,
+        "block_if_costs_or_minimum_order_cannot_be_verified": True,
+        "emergency_stop_enabled": True,
+        "max_slippage_pct": slippage_cap,
         "source_path": os.path.abspath(path),
     }
 

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -18,6 +19,8 @@ from unittest.mock import patch
 import requests
 
 import bot
+import paper_trading_limits as limits_module
+from paper_audit_log import PaperAuditJournal
 from paper_trading_limits import (
     EcbRateError, ECB_SOURCE, OperationalConfigError, ProcessInstanceLock, ResetPathError,
     canonical_reset_paths, canonical_state_path,
@@ -42,6 +45,8 @@ class DummyBot:
         self.acoes = []
         self.telegram = DummyTelegram()
         self._fx_rate_persisted = True
+        self.emergency_stop = {"active": False}
+        self.paper_audit = PaperAuditJournal(os.path.join(folder, "paper_audit.jsonl"))
         self.manual_approvals = _FixtureApprovals()
         self.paper_operations = PaperOperationStore(
             os.path.join(folder, "executor_state.json"), os.path.join(folder, "trades.csv"),
@@ -51,10 +56,19 @@ class DummyBot:
     def acao(self, message):
         self.acoes.append(message)
 
+    def _emergency_stop_is_active(self):
+        return self.emergency_stop.get("active") is True or self.paper_audit.blocked
+
 
 class _FixtureApprovals:
     """Explicit auto-approval test double; never used by production Bot."""
     def consume(self, token, mint, par, amount=None):
+        return token is not None
+
+    def proposal_id_for_token(self, token):
+        return "fixture-proposal" if token is not None else None
+
+    def discard(self, _token):
         return True
 
 
@@ -92,6 +106,19 @@ def executor_fixture(folder, capital=1000.0, cash=None, operational=True, positi
         "erro_config_operacional": None,
         "max_eur_per_operation": Decimal("5"),
     }
+    operational_config_path = os.path.join(folder, "config_operacoes.json")
+    Path(operational_config_path).write_text(json.dumps({
+        "mode": "paper", "live_trading_enabled": False,
+        "private_keys_in_application": False, "manual_confirmation_required": True,
+        "max_eur_per_operation": 5, "max_open_positions": 1,
+        "reject_duplicate_orders": True,
+        "require_cost_estimate_before_approval": True,
+        "require_slippage_estimate_before_approval": True,
+        "block_if_costs_or_minimum_order_cannot_be_verified": True,
+        "emergency_stop_enabled": True,
+        "max_slippage_pct": "95",  # limite apenas de fixture, nunca usado pela configuração operacional
+    }), encoding="utf-8")
+    cfg["_operational_config_path"] = operational_config_path
     dummy = DummyBot(folder)
     # Mirror the production startup invariant: the initial durable state exists
     # before an operational transaction can be attempted.
@@ -107,10 +134,33 @@ def sample_pair(symbol="COIN", price="0.01", liquidity=50000):
     }
 
 
+def commit_authorized_fixture_buy(store, state, candidate, row):
+    """Supply explicit test-only Executor capability for journal BUY scenarios."""
+    capability = object()
+    store.bind_buy_guard(
+        lambda auth, _state, _candidate, _row: (
+            auth.get("capability") is capability
+            and auth.get("manual_confirmation_consumed") is True
+            and bool(auth.get("proposal_id"))
+            and bool(auth.get("execution_plan"))
+        ),
+        capability,
+    )
+    authorization = {
+        "capability": capability, "manual_confirmation_consumed": True,
+        "proposal_id": "isolated-reset-fixture", "execution_plan": "{}", "plan_fields": {},
+    }
+    return store.commit(state, candidate, row, "BUY", authorization=authorization,
+                        metadata={"proposal_id": authorization["proposal_id"]})
+
+
 class PaperTradingLimitsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self._slippage_policy = patch.object(limits_module, "APPROVED_MAX_SLIPPAGE_PCT", Decimal("95"))
+        self._slippage_policy.start()
+        self.addCleanup(self._slippage_policy.stop)
 
     def write_config(self, **overrides):
         data = {
@@ -118,6 +168,12 @@ class PaperTradingLimitsTests(unittest.TestCase):
             "private_keys_in_application": False,
             "manual_confirmation_required": True,
             "max_eur_per_operation": 5.0, "max_open_positions": 1,
+            "reject_duplicate_orders": True,
+            "require_cost_estimate_before_approval": True,
+            "require_slippage_estimate_before_approval": True,
+            "block_if_costs_or_minimum_order_cannot_be_verified": True,
+            "emergency_stop_enabled": True,
+            "max_slippage_pct": "95",  # política de teste isolada
         }
         data.update(overrides)
         path = Path(self.temp.name) / "config_operacoes.json"
@@ -144,6 +200,12 @@ class PaperTradingLimitsTests(unittest.TestCase):
             {"mode": "live"}, {"live_trading_enabled": True},
             {"private_keys_in_application": True}, {"max_open_positions": 2},
             {"manual_confirmation_required": False},
+            {"reject_duplicate_orders": False},
+            {"require_cost_estimate_before_approval": False},
+            {"require_slippage_estimate_before_approval": False},
+            {"block_if_costs_or_minimum_order_cannot_be_verified": False},
+            {"emergency_stop_enabled": False},
+            {"max_slippage_pct": "95.01"},
             {"max_eur_per_operation": 5.01}, {"max_eur_per_operation": "NaN"},
         ):
             with self.subTest(override=override), self.assertRaises(OperationalConfigError):
@@ -156,6 +218,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
         self.assertIs(limits["live_trading_enabled"], False)
         self.assertEqual(limits["max_eur_per_operation"], Decimal("5.0"))
         self.assertEqual(limits["max_open_positions"], 1)
+        self.assertTrue(limits["reject_duplicate_orders"])
 
     def test_ecb_csv_parses_usd_per_eur_and_accepts_fresh_reference_day(self):
         data = parse_ecb_rate_csv(FIXTURE_CSV, today=date(2026, 11, 13))
@@ -210,13 +273,13 @@ class PaperTradingLimitsTests(unittest.TestCase):
     def test_position_size_is_capped_but_smaller_strategy_size_is_preserved(self):
         with self.subTest(capital=1000):
             executor, state, _ = executor_fixture(self.temp.name, capital=1000)
-            position = executor.comprar("mint-high", sample_pair("HIGH"), {"pontuacao": 90})
+            position = executor.comprar("mint-high", sample_pair("HIGH"), {"pontuacao": 90}, "fixture-high")
             self.assertAlmostEqual(position["custo"], 6.0)
             self.assertLessEqual(Decimal(str(position["custo"])) / Decimal("1.2"), Decimal("5"))
         with self.subTest(capital=20):
             folder = tempfile.mkdtemp(dir=self.temp.name)
             executor, _state, _ = executor_fixture(folder, capital=20)
-            position = executor.comprar("mint-low", sample_pair("LOW"), {"pontuacao": 90})
+            position = executor.comprar("mint-low", sample_pair("LOW"), {"pontuacao": 90}, "fixture-low")
             self.assertAlmostEqual(position["custo"], 2.4)
 
     def test_insufficient_cash_blocks_without_partial_purchase(self):
@@ -293,6 +356,103 @@ class PaperTradingLimitsTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(state["saldo"], 1000)
         self.assertEqual(state["posicoes"], {})
+
+    def test_missing_or_disabled_operational_policy_fails_closed(self):
+        executor, state, cfg = executor_fixture(self.temp.name, capital=1000)
+        cfg["limites_operacionais_ativos"] = False
+        self.assertEqual(executor.pode_comprar()[0], 0.0)
+        cfg["limites_operacionais_ativos"] = True
+        cfg.pop("_operational_config_path")
+        self.assertEqual(executor.pode_comprar()[0], 0.0)
+        self.assertEqual(state["saldo"], 1000)
+        self.assertEqual(state["posicoes"], {})
+
+    def test_unapproved_missing_slippage_ceiling_blocks_proposals(self):
+        executor, state, cfg = executor_fixture(self.temp.name, capital=1000)
+        path = Path(cfg["_operational_config_path"])
+        policy = json.loads(path.read_text(encoding="utf-8"))
+        policy.pop("max_slippage_pct", None)
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        with patch.object(limits_module, "APPROVED_MAX_SLIPPAGE_PCT", None):
+            amount, reason = executor.pode_comprar()
+        self.assertEqual(amount, 0.0)
+        self.assertIn("ainda não foi aprovado", reason)
+        self.assertEqual(state["saldo"], 1000)
+        self.assertEqual(state["posicoes"], {})
+
+    def test_emergency_stop_terminal_commands_persist_and_rearm_by_matching_id(self):
+        state_path = os.path.join(self.temp.name, "emergency-state.json")
+        instance = bot.Bot.__new__(bot.Bot)
+        instance.cfg = {"ficheiro_estado": state_path, "emergency_stop_enabled": True}
+        instance.estado = {"emergency_stop": {"active": False, "stop_id": None,
+                                              "changed_at_utc": None, "reason": None}}
+        instance._emergency_lock = threading.RLock()
+        instance._emergency_active = False
+        instance.paper_audit = PaperAuditJournal(os.path.join(self.temp.name, "paper_audit.jsonl"))
+        instance.executor = SimpleNamespace(_purchase_lock=threading.Lock())
+        ok, message = instance._comando_emergencia_terminal("activate", "operador pediu paragem")
+        self.assertTrue(ok, message)
+        self.assertTrue(instance._emergency_stop_is_active())
+        persisted = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        stop_id = persisted["emergency_stop"]["stop_id"]
+        self.assertEqual(persisted["emergency_stop"]["reason"], "operador pediu paragem")
+        events = instance.paper_audit.verify()["events"]
+        self.assertEqual(events[0]["event"], "emergency_stop_activated")
+        self.assertTrue(events[0]["fields"]["active"])
+        self.assertFalse(instance._comando_emergencia_terminal(
+            "rearm", "wrong-id operador autorizou")[0])
+        ok, message = instance._comando_emergencia_terminal(
+            "rearm", f"{stop_id} operador reviu as condições")
+        self.assertTrue(ok, message)
+        self.assertFalse(instance._emergency_stop_is_active())
+        persisted = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        self.assertFalse(persisted["emergency_stop"]["active"])
+        self.assertEqual([event["event"] for event in instance.paper_audit.verify()["events"]],
+                         ["emergency_stop_activated", "emergency_stop_rearmed"])
+
+    def test_executor_reloads_and_rejects_external_policy_escalation(self):
+        executor, state, cfg = executor_fixture(self.temp.name, capital=1000)
+        path = Path(cfg["_operational_config_path"])
+        safe = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in (("live_trading_enabled", True), ("max_open_positions", 2),
+                           ("max_eur_per_operation", 5.01)):
+            with self.subTest(key=key):
+                changed = dict(safe, **{key: value})
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                amount, _reason = executor.pode_comprar()
+                self.assertEqual(amount, 0.0)
+                self.assertEqual(state["saldo"], 1000)
+                self.assertEqual(state["posicoes"], {})
+        path.write_text(json.dumps(safe), encoding="utf-8")
+
+    def test_dashboard_exposes_purchase_block_reason_without_action_endpoint(self):
+        state_path = os.path.join(self.temp.name, "readiness-state.json")
+        cfg = dict(bot.CONFIG)
+        cfg.update({
+            "ficheiro_estado": state_path,
+            "ficheiro_trades": os.path.join(self.temp.name, "readiness-trades.csv"),
+            "ficheiro_log": os.path.join(self.temp.name, "readiness-bot.log"),
+            "ficheiro_percursos": os.path.join(self.temp.name, "readiness-percursos.jsonl"),
+            "painel_web": False,
+        })
+        bot.guardar_estado(cfg, bot.estado_novo(cfg))
+        instance = bot.Bot(cfg)
+        try:
+            data = json.loads(instance.snapshot)
+            readiness = data["paper_purchase_readiness"]
+            self.assertFalse(readiness["eligible_for_proposal"])
+            self.assertIn("taxa BCE", readiness["status"])
+            self.assertTrue(readiness["manual_confirmation_required"])
+            self.assertIn("Estado das pré-condições de compra", [row[0] for row in data["config"]])
+            handler = bot._PedidoWeb
+            # Autorizado pelo operador em 2026-11-14: unico POST = decidir proposta Paper ja criada.
+            import inspect
+            fonte_post = inspect.getsource(handler.do_POST)
+            self.assertIn('"/api/proposta/decisao"', fonte_post)
+            self.assertNotIn("comprar", fonte_post)
+            self.assertNotIn("vender", fonte_post)
+        finally:
+            instance.close()
 
     def test_session_rate_survives_state_save_and_reload(self):
         state_path = os.path.join(self.temp.name, "estado.json")
@@ -487,7 +647,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
 
         def buy(mint):
             barrier.wait()
-            results.append(executor.comprar(mint, sample_pair(mint), {"pontuacao": 90}))
+            results.append(executor.comprar(mint, sample_pair(mint), {"pontuacao": 90}, f"fixture-{mint}"))
 
         threads = [threading.Thread(target=buy, args=(f"mint-{n}",)) for n in range(2)]
         for thread in threads:
@@ -501,12 +661,12 @@ class PaperTradingLimitsTests(unittest.TestCase):
 
     def test_buy_sell_and_cancel_each_have_one_durable_trade_id(self):
         executor, state, cfg = executor_fixture(self.temp.name, capital=100)
-        bought = executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90})
+        bought = executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90}, "fixture-a")
         self.assertIsNotNone(bought)
         self.assertIsNotNone(executor.vender("mint-a", 0.012, 50000, "TEST_EXIT"))
         self.assertEqual(state["posicoes"], {})
 
-        self.assertIsNotNone(executor.comprar("mint-b", sample_pair("BBB"), {"pontuacao": 90}))
+        self.assertIsNotNone(executor.comprar("mint-b", sample_pair("BBB"), {"pontuacao": 90}, "fixture-b"))
         self.assertTrue(executor.anular("mint-b", "TEST_CANCEL"))
         self.assertEqual(state["posicoes"], {})
         self.assertEqual(state["paper_state_revision"], 4)
@@ -548,7 +708,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
                     with patch("paper_operations.atomic_write_bytes", side_effect=fail_selected):
                         with self.assertRaises(Exception):
                             if operation == "BUY":
-                                executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90})
+                                executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90}, "fixture-failure")
                             elif operation == "SELL":
                                 executor.vender("mint-a", 0.012, 50000, "TEST_EXIT")
                             else:
@@ -611,7 +771,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
                     with patch("paper_operations.atomic_write_bytes", side_effect=interrupt_selected):
                         with self.assertRaises(KeyboardInterrupt):
                             if operation == "BUY":
-                                executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90})
+                                executor.comprar("mint-a", sample_pair("AAA"), {"pontuacao": 90}, "fixture-interrupt")
                             elif operation == "SELL":
                                 executor.vender("mint-a", 0.012, 50000, "TEST_EXIT")
                             else:
@@ -1174,7 +1334,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
 
         with patch("paper_operations.atomic_write_bytes", side_effect=fail_state_write):
             with self.assertRaises(PaperOperationError):
-                store.commit(state, candidate, row, "BUY")
+                commit_authorized_fixture_buy(store, state, candidate, row)
         before_state = Path(cfg["ficheiro_estado"]).read_bytes()
         before_csv = Path(cfg["ficheiro_trades"]).read_bytes()
         journal = store.directory
@@ -1217,7 +1377,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
         row = {"data_hora": "fixture", "tipo": "COMPRA", "simbolo": "AAA",
                "mint": "mint-a", "valor_usd": "5.0000", "saldo_depois": "95.0000"}
         store = PaperOperationStore(cfg["ficheiro_estado"], cfg["ficheiro_trades"], bot.CABECALHO_CSV)
-        store.commit(base, candidate, row, "BUY")
+        commit_authorized_fixture_buy(store, base, candidate, row)
         old_state = Path(cfg["ficheiro_estado"]).read_bytes()
         old_csv = Path(cfg["ficheiro_trades"]).read_bytes()
         old_journal = {name: Path(store.directory, name).read_bytes() for name in os.listdir(store.directory)}

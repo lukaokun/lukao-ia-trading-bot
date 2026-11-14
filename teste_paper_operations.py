@@ -32,6 +32,25 @@ def buy_candidate(state):
            "mint": "mint-a", "valor_usd": "5.0000", "saldo_depois": "95.0000"}
     return candidate, row
 
+def _test_commit(store, current, candidate, row, operation_type):
+    if operation_type == "BUY":
+        capability = getattr(store, "_test_buy_capability", None)
+        if capability is None:
+            capability = object()
+            store._test_buy_capability = capability
+            store.bind_buy_guard(
+                lambda auth, _current, _candidate, _row: auth.get("capability") is capability
+                and auth.get("manual_confirmation_consumed") is True,
+                capability,
+            )
+        authorization = {"capability": capability, "manual_confirmation_consumed": True,
+                         "proposal_id": "isolated-test-proposal", "execution_plan": "{}",
+                         "plan_fields": {}}
+        return store.commit(current, candidate, row, operation_type, authorization=authorization,
+                            metadata={"proposal_id": "isolated-test-proposal"})
+    return store.commit(current, candidate, row, operation_type)
+
+
 
 class PaperOperationStoreTests(unittest.TestCase):
     def setUp(self):
@@ -51,9 +70,20 @@ class PaperOperationStoreTests(unittest.TestCase):
             reader = csv.DictReader(source)
             return reader.fieldnames, list(reader)
 
+    def test_generic_buy_commit_without_executor_authorization_is_rejected(self):
+        candidate, row = buy_candidate(self.state)
+        before = Path(self.state_path).read_bytes()
+        with self.assertRaisesRegex(PaperOperationError, "autorização do Executor"):
+            self.store.commit(self.state, candidate, row, "BUY")
+        self.assertFalse(self.store.blocked)
+        self.assertEqual(Path(self.state_path).read_bytes(), before)
+        self.assertFalse(Path(self.csv_path).exists())
+        self.assertFalse(any(name.endswith(".intent.json")
+                             for name in os.listdir(self.store.directory)))
+
     def test_buy_transaction_and_recovery_are_idempotent_across_restarts(self):
         candidate, row = buy_candidate(self.state)
-        operation_id = self.store.commit(self.state, candidate, row, "BUY")
+        operation_id = _test_commit(self.store, self.state, candidate, row, "BUY")
         self.assertEqual(self.state["saldo"], 95.0)
         self.assertEqual(self.state["posicoes"]["mint-a"]["custo"], 5.0)
         fields, rows = self.csv_rows()
@@ -78,7 +108,7 @@ class PaperOperationStoreTests(unittest.TestCase):
         before = Path(self.csv_path).read_bytes().splitlines(keepends=True)
         old_data_lines = before[1:]
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         after = Path(self.csv_path).read_bytes().splitlines(keepends=True)
         self.assertEqual(after[1:1 + len(old_data_lines)], old_data_lines)
         fields, rows = self.csv_rows()
@@ -97,7 +127,7 @@ class PaperOperationStoreTests(unittest.TestCase):
         before = Path(self.csv_path).read_bytes().splitlines(keepends=True)
         legacy_lines = before[1:]
         candidate, row = buy_candidate(self.state)
-        operation_id = self.store.commit(self.state, candidate, row, "BUY")
+        operation_id = _test_commit(self.store, self.state, candidate, row, "BUY")
         current = Path(self.csv_path).read_bytes().splitlines(keepends=True)
         self.assertEqual(current[1:1 + len(legacy_lines)], legacy_lines)
         with open(self.csv_path, newline="", encoding="utf-8-sig") as source:
@@ -117,7 +147,7 @@ class PaperOperationStoreTests(unittest.TestCase):
             writer.writeheader()
             writer.writerow({"tipo": "COMPRA", "simbolo": "OLD", "mint": "mint-old", "valor_usd": "12.00"})
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         complete_bytes = Path(self.csv_path).read_bytes()
         complete = complete_bytes.splitlines(keepends=True)
 
@@ -163,7 +193,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
                 with patch.object(operations, "atomic_write_bytes", side_effect=fail_stage):
                     with self.assertRaises(PaperOperationError):
-                        store.commit(base, candidate, row, "BUY")
+                        _test_commit(store, base, candidate, row, "BUY")
                 recovered = PaperOperationStore(state_path, csv_path, FIELDS)
                 loaded = json.loads(Path(state_path).read_text(encoding="utf-8"))
                 recovered.recover(loaded)
@@ -202,7 +232,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
                 with patch.object(operations, "atomic_write_bytes", side_effect=fail_before_write):
                     with self.assertRaises(Exception):
-                        store.commit(base, candidate, row, "BUY")
+                        _test_commit(store, base, candidate, row, "BUY")
                 if fail_at == 1:
                     # No durable intent means no operation was applied.
                     self.assertEqual(json.loads(Path(state_path).read_text())["saldo"], 100.0)
@@ -243,7 +273,7 @@ class PaperOperationStoreTests(unittest.TestCase):
         candidate, row = buy_candidate(self.state)
         with patch.object(operations, "atomic_write_bytes", side_effect=fail_after_replace):
             with self.assertRaises(PaperOperationError):
-                self.store.commit(self.state, candidate, row, "BUY")
+                _test_commit(self.store, self.state, candidate, row, "BUY")
         recovered = PaperOperationStore(self.state_path, self.csv_path, FIELDS)
         loaded = self.read_state()
         recovered.recover(loaded)
@@ -254,7 +284,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
     def test_completed_marker_with_restored_state_blocks_without_replay(self):
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         completed_csv = Path(self.csv_path).read_bytes()
         legacy_state_bytes = json.dumps(state_fixture(), sort_keys=True, separators=(",", ":"), allow_nan=False)
         Path(self.state_path).write_text(legacy_state_bytes + "\n", encoding="utf-8")
@@ -270,7 +300,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
     def test_completed_marker_with_restored_csv_blocks_without_rewrite(self):
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         completed_state = Path(self.state_path).read_bytes()
         restored_csv = (",".join(FIELDS) + "\n").encode("utf-8")
         Path(self.csv_path).write_bytes(restored_csv)
@@ -283,7 +313,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
     def test_same_operation_id_with_different_csv_values_blocks(self):
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         state_bytes = Path(self.state_path).read_bytes()
         fields, rows = self.csv_rows()
         rows[0]["valor_usd"] = "4.9999"
@@ -337,7 +367,7 @@ class PaperOperationStoreTests(unittest.TestCase):
                        "simbolo": "AAA", "mint": "mint-a", "valor_usd": "5.0000",
                        "custos_usd": "0.0000", "pnl_usd": "0.0000", "saldo_depois": "100.0000"}
                 store = PaperOperationStore(state_path, csv_path, FIELDS)
-                operation_id = store.commit(base, candidate, row, operation)
+                operation_id = _test_commit(store, base, candidate, row, operation)
 
                 for _ in range(5):
                     loaded = json.loads(Path(state_path).read_text(encoding="utf-8"))
@@ -397,7 +427,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
                 with patch.object(operations, "atomic_write_bytes", side_effect=fail_csv_write):
                     with self.assertRaises(PaperOperationError):
-                        store.commit(base, candidate, row, operation)
+                        _test_commit(store, base, candidate, row, operation)
 
                 for _ in range(3):
                     result = subprocess.run(
@@ -430,7 +460,7 @@ class PaperOperationStoreTests(unittest.TestCase):
         candidate, row = buy_candidate(self.state)
         with patch.object(operations, "atomic_write_bytes", side_effect=fail_state):
             with self.assertRaises(Exception):
-                self.store.commit(self.state, candidate, row, "BUY")
+                _test_commit(self.store, self.state, candidate, row, "BUY")
         state = self.read_state()
         state["paper_state_revision"] = 99
         atomic_write_json(self.state_path, state)
@@ -440,7 +470,7 @@ class PaperOperationStoreTests(unittest.TestCase):
 
     def test_completed_marker_with_state_projection_tamper_blocks_read_only(self):
         candidate, row = buy_candidate(self.state)
-        self.store.commit(self.state, candidate, row, "BUY")
+        _test_commit(self.store, self.state, candidate, row, "BUY")
         state = self.read_state()
         state["saldo"] = 96.0
         atomic_write_json(self.state_path, state)
