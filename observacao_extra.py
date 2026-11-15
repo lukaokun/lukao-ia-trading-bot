@@ -134,7 +134,44 @@ def concentracao_holders(mint, timeout=6.0, opener=None, rpc_url=PUBLIC_RPC_URL)
     out.update(estado="ok", n_contas=len(contas),
                top1_pct=round(contas[0] / supply * 100, 2),
                top10_pct=round(sum(contas[:10]) / supply * 100, 2))
+    out["top"] = _donos_das_maiores_contas(contas_resp, supply, rpc_url, timeout, opener)
     return out
+
+
+def _donos_das_maiores_contas(contas_resp, supply, rpc_url, timeout, opener, maximo=12):
+    """Dono (carteira ou pool) de cada uma das maiores contas: [[dono, pct], ...], ou None se nao der.
+
+    So leitura e opcional: se falhar, top1_pct e top10_pct continuam validos. Serve para o laboratorio poder
+    descontar a pool de liquidez, que e muitas vezes o maior "holder". Sao enderecos publicos."""
+    try:
+        linhas = [(c["address"], int(c["amount"])) for c in contas_resp["result"]["value"]
+                  if isinstance(c, dict) and isinstance(c.get("address"), str) and MINT_RE.fullmatch(c["address"])]
+    except (KeyError, TypeError, ValueError):
+        return None
+    linhas = sorted(linhas, key=lambda x: -x[1])[:maximo]
+    if not linhas:
+        return None
+    resp, erro = _http_json(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": "getMultipleAccounts",
+                                      "params": [[endereco for endereco, _ in linhas],
+                                                 {"encoding": "jsonParsed", "commitment": "confirmed"}]},
+                            timeout=timeout, opener=opener)
+    if erro or not isinstance(resp, dict) or "error" in resp:
+        return None
+    try:
+        valores = resp["result"]["value"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(valores, list) or len(valores) != len(linhas):
+        return None
+    top = []
+    for (_, quantidade), conta in zip(linhas, valores):
+        try:
+            dono = conta["data"]["parsed"]["info"]["owner"]
+        except (KeyError, TypeError):
+            dono = None
+        top.append([dono if isinstance(dono, str) and MINT_RE.fullmatch(dono) else None,
+                    round(quantidade / supply * 100, 2)])
+    return top
 
 
 def cotacao_jupiter(mint, valor_usd, preco_ref_usd, decimais, timeout=6.0, opener=None):

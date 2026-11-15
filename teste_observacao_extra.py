@@ -57,6 +57,39 @@ class ObservacaoExtraTests(unittest.TestCase):
         self.assertEqual(r["top1_pct"], 30.0)
         self.assertEqual(r["top10_pct"], 57.0)
 
+    def test_donos_das_maiores_contas(self):
+        quantidades = (300, 100, 50, 50, 20, 10, 10, 10, 10, 10, 5, 4, 3)
+        contas = ["1" * 31 + letra for letra in "ABCDEFGHJKLMN"]
+        donos = {conta: "2" * 31 + conta[-1] for conta in contas}
+        pedidos = []
+
+        def respostas(pedido, falhar=False):
+            corpo = json.loads(pedido.data.decode("utf-8"))
+            pedidos.append(corpo["method"])
+            if corpo["method"] == "getTokenSupply":
+                return {"result": {"value": {"amount": "1000", "decimals": 6}}}
+            if corpo["method"] == "getTokenLargestAccounts":
+                return {"result": {"value": [{"address": c, "amount": str(q)} for c, q in zip(contas, quantidades)]}}
+            if corpo["method"] == "getMultipleAccounts":
+                if falhar:
+                    return {"error": {"code": -32005, "message": "limite"}}
+                pedidas, opcoes = corpo["params"]
+                assert opcoes["encoding"] == "jsonParsed" and pedidas == contas[:12]
+                return {"result": {"value": [None if c == contas[2] else
+                                             {"data": {"parsed": {"info": {"owner": donos[c]}}}} for c in pedidas]}}
+            raise AssertionError(corpo["method"])
+
+        r = OE.concentracao_holders(MINT, opener=opener_falso(respostas))
+        self.assertEqual((r["estado"], r["top1_pct"], r["top10_pct"]), ("ok", 30.0, 57.0))
+        self.assertEqual(len(r["top"]), 12)
+        self.assertEqual(r["top"][0], [donos[contas[0]], 30.0])
+        self.assertEqual(r["top"][2], [None, 5.0])               # conta sem dados: dono desconhecido
+        self.assertEqual(pedidos.count("getMultipleAccounts"), 1)
+        falha = OE.concentracao_holders(MINT, opener=opener_falso(lambda p: respostas(p, falhar=True)))
+        self.assertEqual((falha["estado"], falha["top10_pct"], falha["top"]), ("ok", 57.0, None))
+        antigo = OE.concentracao_holders(MINT, opener=opener_falso(respostas_ok))  # sem enderecos: nem pede
+        self.assertEqual((antigo["estado"], antigo["top"]), ("ok", None))
+
     def test_cotacao_jupiter_impacto_e_slippage_real(self):
         r = OE.cotacao_jupiter(MINT, 5.42, 0.005, 6, opener=opener_falso(respostas_ok))
         self.assertEqual(r["estado"], "ok")

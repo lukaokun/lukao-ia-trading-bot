@@ -55,6 +55,9 @@ Nenhuma destas alterações muda a estratégia (filtros, stop, alvo, trailing, t
 - **Pontos finos no laboratório (só gravação).** `percursos_finos` grava em `ptsj` o preço de venda Jupiter dos sinais nos primeiros `percurso_fino_minutos` (30), 1 cotação de `percurso_fino_intervalo_seg` em `percurso_fino_intervalo_seg` (5 s) no total, e fica parado enquanto houver posição aberta. O laboratório (`--analisar`) continua a usar apenas `pts`; os pontos finos ficam guardados para uma decisão posterior.
 - **Fonte do preço na observabilidade.** As avaliações de risco feitas com preço Jupiter ficam registadas como `Jupiter+DexScreener` (antes diziam sempre `DexScreener`).
 - **Página pública.** Ligações paradas são largadas ao fim de 15 s e há um teto de 48 ligações em simultâneo.
+- **Laboratório: pontos finos e custos reais.** O relatório (`--analisar`) tem a secção `PONTOS FINOS`, que repete as mesmas regras nos mesmos percursos de três maneiras: pontos normais com custos simulados, pontos finos com custos simulados (o mais parecido com o que o bot Paper regista) e pontos finos com custos reais (cotação Jupiter de entrada, preço de venda Jupiter na saída e `lab_taxa_rede_usd` por transação, que é uma hipótese por medir). O resto do relatório continua igual e nada disto entra em decisões.
+- **Laboratório: operações por dia.** A secção `OPERACOES PAPER FECHADAS, POR DIA` mostra o resultado real do bot dia a dia, para comparar períodos com as mesmas regras.
+- **Holders sem a pool.** A observação extra guarda o dono das 12 maiores contas (`holders.top`) e cada percurso guarda o endereço do par (`par`). Quando a pool do par está entre as maiores contas, o laboratório mostra também o top 10 sem ela.
 
 ## Componentes
 

@@ -1232,6 +1232,73 @@ def t_fonte_do_preco_na_observacao(pasta):
         bot.risco.observability = original
 
 
+def t_laboratorio_pontos_finos_e_custos_reais(pasta):
+    bot, cfg = novo_bot(pasta)
+    pc = {"mint": mint_de("LABA"), "simbolo": "LABA", "pontuacao": 80, "ts": 1_799_000_000, "preco0": 0.001,
+          "liq0": 50000, "fim": "tempo", "liq_fim": 50000,
+          "pts": [[0, 1.0], [33, 1.02], [66, 0.99], [99, 1.3], [132, 1.1], [5400, 1.05]]}
+    rug = dict(pc, mint=mint_de("LABB"), ts=1_799_000_100, fim="rug", liq_fim=1000, pts=[[0, 1.0], [30, 1.1], [60, 0.2]])
+    regras = ((-6, 25, 10, 8, 60), (-12, 100, 20, 15, 120), (-30, 0, 0, 0, 30), (-6, 50, 0, 0, 180))
+    for regra in regras:                                          # sem pontos finos: igual ao laboratorio antigo
+        for x in (pc, rug):
+            antigo = B.repetir_percurso(x, regra, cfg)
+            novo = B.repetir_serie(x, B._serie_fina(x), regra, cfg)
+            assert abs(antigo[0] - novo[0]) < 1e-9 and antigo[1] == novo[1] and novo[2] is False
+    assert B._serie_fina(pc) == [(p[0], p[1], False) for p in pc["pts"]]
+    fino = dict(pc, mint=mint_de("LABC"), ts=1_799_000_200, par="PARLABC",
+                ptsj=[[10, 0.99], [20, 0.93], [30, 1.0], [40, 1.01], [9999, 5.0], [0, 1.0]],
+                obs={"jupiter": {"slippage_real_pct": 1.0},
+                     "holders": {"top10_pct": 60.0, "top": [["PARLABC", 30.0], ["DonoA", 5.0], ["DonoB", 4.0]]}})
+    serie = B._serie_fina(fino)
+    assert serie[0] == (0, 1.0, False) and serie[-1] == (5400, 1.05, False)        # inicio e fim sao os normais
+    assert (20, 0.93, True) in serie and (9999, 5.0, True) not in serie            # fora do percurso: ignorado
+    assert (33, 1.02, False) not in serie and (66, 0.99, False) not in serie       # cobertos por pontos finos
+    assert (99, 1.3, False) in serie and (132, 1.1, False) in serie                # longe dos finos: mantem-se
+    assert [p[0] for p in serie] == sorted(p[0] for p in serie)
+    regra = (-6, 25, 10, 8, 60)
+    normal = B.repetir_percurso(fino, regra, cfg)
+    assert normal[1] == "alvo"                                    # os pontos normais nao veem a queda de -7%
+    simulado = B.repetir_serie(fino, serie, regra, cfg)
+    assert simulado[1] == "stop" and simulado[0] < 0 < normal[0]  # com pontos finos o stop dispara antes do alvo
+    real = B.repetir_serie(fino, serie, regra, cfg, valor_usd=5.5, custos="reais")
+    assert real[1] == "stop" and real[2] is True
+    assert abs(real[0] - (0.93 / 1.01 - 2 * 0.05 / 5.5 - 1) * 100) < 1e-9          # entrada real, saida real, rede
+    sem_cotacao = dict(fino, obs={})
+    r2 = B.repetir_serie(sem_cotacao, serie, regra, cfg, valor_usd=5.5, custos="reais")
+    assert r2[2] is False and r2[0] < real[0]                     # sem cotacao de entrada usa a simulada (mais cara)
+    rug_real = B.repetir_serie(rug, B._serie_fina(rug), (-99, 0, 0, 0, 180), cfg, valor_usd=5.5, custos="reais")
+    assert rug_real[1] == "rug" and rug_real[0] < -80             # rug: nunca usa a saida "sem custos"
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for x in (pc, rug):
+            f.write(json.dumps(x) + "\n")
+    txt = B.analisar(cfg)
+    assert "PONTOS FINOS (preco de venda real no Jupiter) - 0 de 2" in txt and "Ainda sem dados" in txt
+    assert "OPERACOES PAPER FECHADAS, POR DIA" in txt and "Ainda sem operacoes fechadas" in txt
+    with open(cfg["ficheiro_percursos"], "a", encoding="utf-8") as f:
+        f.write(json.dumps(fino) + "\n")
+    txt = B.analisar(cfg)
+    assert "PONTOS FINOS (preco de venda real no Jupiter) - 1 de 3" in txt
+    assert "pontos finos,   custos reais" in txt and "1 de 1 com cotacao real de entrada" in txt
+    assert "finos+reais" in txt and "ATENCAO: 1 percursos com pontos finos" in txt
+    assert "pool do par identificada em 1" in txt and "top10 SEM a pool <= 25%" in txt   # 5% + 4% sem a pool
+
+
+def t_percurso_grava_par_e_operacoes_por_dia(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    mexer("BOM", preco=0.0009)                                    # -10%: stop de teste (-6%)
+    assert bot.ciclo_risco() == 1
+    avancar(91)
+    bot.ciclo_risco()                                             # fecha o percurso
+    with open(cfg["ficheiro_percursos"], encoding="utf-8") as f:
+        linha = json.loads(f.read().splitlines()[-1])
+    assert linha["mint"] == m and linha["par"] == "PARBOM"
+    txt = B.analisar(cfg)
+    dia = B.data_txt()[:10]
+    assert "OPERACOES PAPER FECHADAS, POR DIA" in txt
+    assert any(l.strip().startswith(dia) and "1 fechadas" in l and " 0 ganhas" in l for l in txt.splitlines())
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

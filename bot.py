@@ -22,6 +22,7 @@ Plataforma de sinais: com o bot a correr, abre http://localhost:8000 no browser.
 """
 
 import argparse
+import bisect
 import copy
 import csv
 import hashlib
@@ -149,6 +150,9 @@ CONFIG = {
     "percurso_fino_minutos": 30,       # so nos primeiros X minutos de cada sinal
     "percurso_fino_intervalo_seg": 5,  # 1 cotacao de X em X s no total (12/min; plano Free do Jupiter: 60/min)
     "percurso_fino_valor_usd": 5.5,    # tamanho da venda cotada (igual ao de uma operacao Paper)
+    # So para o relatorio do laboratorio ("custos reais"): taxa de rede estimada por transacao. E uma HIPOTESE
+    # conservadora, ainda por medir; nao entra em nenhuma decisao nem na contabilidade Paper.
+    "lab_taxa_rede_usd": 0.05,
 
     # ---------------- Rede ----------------
     "timeout_seg": 10,               # tempo maximo de espera por cada pedido
@@ -4746,6 +4750,8 @@ class Bot:
             linha["grupo"] = pc["grupo"]
         if isinstance(pc.get("feat"), dict):
             linha["feat"] = pc["feat"]
+        if pc.get("par"):
+            linha["par"] = pc["par"]  # endereco publico da pool: o laboratorio usa-o para descontar a pool nos holders
         if isinstance(pc.get("ptsj"), list) and pc["ptsj"]:
             linha["ptsj"] = pc["ptsj"]  # pontos finos (preco de venda Jupiter); o laboratorio ainda usa so 'pts'
         try:
@@ -5048,6 +5054,152 @@ def repetir_percurso(pc, regra, cfg, valor_usd=12.0):
     return (liquido - 1) * 100.0, motivo
 
 
+def _serie_fina(pc):
+    """Serie de precos tal como o bot a ve: pontos finos (preco de venda Jupiter) onde existem e pontos
+    normais (DexScreener) no resto. Devolve [(seg, rel, e_fino), ...]. O ultimo ponto e sempre o ultimo
+    ponto normal, que e o que marca o fim do percurso (tempo, rug ou desaparecimento)."""
+    pts = [(num(p[0]), num(p[1]), False) for p in pc["pts"]]
+    fim = pts[-1][0]
+    finos = sorted((num(p[0]), num(p[1])) for p in (pc.get("ptsj") or [])
+                   if isinstance(p, (list, tuple)) and len(p) == 2 and num(p[1]) > 0 and 0 < num(p[0]) < fim)
+    if not finos:
+        return pts
+    tempos = [f[0] for f in finos]
+
+    def coberto(seg):  # ha um ponto fino a menos de 45 s: o ponto normal e redundante (e mais atrasado)
+        i = bisect.bisect_left(tempos, seg)
+        return any(0 <= j < len(tempos) and abs(tempos[j] - seg) <= 45 for j in (i - 1, i))
+
+    meio = [p for p in pts[1:-1] if not coberto(p[0])] + [(s, r, True) for s, r in finos]
+    return [pts[0]] + sorted(meio, key=lambda p: p[0]) + [pts[-1]]
+
+
+def repetir_serie(pc, serie, regra, cfg, valor_usd=12.0, custos="simulados"):
+    """Como repetir_percurso, mas sobre uma serie [(seg, rel, e_fino)] e com dois modelos de custos:
+      "simulados" - os do bot: slippage + taxa, a entrada e a saida (igual a repetir_percurso);
+      "reais"     - entrada pela cotacao real do Jupiter gravada no sinal (se existir); saida pelo preco de
+                    venda Jupiter quando o ponto de saida e fino (ja inclui impacto e comissao da pool);
+                    mais a taxa de rede estimada, uma vez por transacao.
+    Devolve (resultado liquido em %, motivo, usou_cotacao_real_na_entrada)."""
+    stop, alvo, ativar, dist, minutos = regra
+    pico, preco, motivo, trailing, fino = 1.0, 1.0, "fim", False, False
+    for i, (seg, preco, fino) in enumerate(serie[1:], 1):
+        pico = max(pico, preco)
+        v = (preco - 1) * 100
+        if preco <= 0:
+            return -100.0, "desapareceu", False
+        if i == len(serie) - 1 and pc.get("fim") == "rug":
+            motivo = "rug"
+            break
+        if v <= stop:
+            motivo = "stop"
+            break
+        if alvo and v >= alvo:
+            motivo = "alvo"
+            break
+        if ativar and (pico - 1) * 100 >= ativar:
+            trailing = True
+        if trailing and preco <= pico * (1 - dist / 100.0):
+            motivo = "trailing"
+            break
+        if seg >= minutos * 60:
+            motivo = "tempo"
+            break
+    s_ent = cfg["slippage_pct"] / 100.0
+    s_sai = s_ent
+    if motivo == "rug":  # com a liquidez a desaparecer, a venda sai muito pior
+        liq = num(pc.get("liq_fim"))
+        s_sai = min(0.95, s_ent + (valor_usd / (liq / 2.0) if liq > 0 else 1.0))
+    taxa = cfg["taxa_pct"] / 100.0
+    if custos != "reais":
+        liquido = (1 - taxa) / (1 + s_ent) * preco * (1 - s_sai) * (1 - taxa)
+        return (liquido - 1) * 100.0, motivo, False
+    real = num(obter(pc, "obs", "jupiter", "slippage_real_pct"), None)
+    tem_real = real is not None and -10.0 <= real <= 50.0
+    entrada = (1 + real / 100.0) if tem_real else (1 + s_ent) / (1 - taxa)
+    # ponto fino = preco a que a posicao se vendia mesmo; ponto normal (ou rug) = preco medio, leva os custos simulados
+    saida = preco if (fino and motivo != "rug") else preco * (1 - s_sai) * (1 - taxa)
+    rede = 2 * max(0.0, num(cfg.get("lab_taxa_rede_usd"), 0.05)) / valor_usd if valor_usd > 0 else 0.0
+    return (saida / entrada - rede - 1) * 100.0, motivo, tem_real
+
+
+def _mediana(valores):
+    v = sorted(valores)
+    return v[len(v) // 2] if v else None
+
+
+def _secao_pontos_finos(percursos, melhores, atual, cfg):
+    """As mesmas regras, nos mesmos percursos, com pontos normais e com pontos finos, e com os dois custos."""
+    com = [pc for pc in percursos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    L = ["", f"  PONTOS FINOS (preco de venda real no Jupiter) - {len(com)} de {len(percursos)} percursos com pontos finos"]
+    if not com:
+        return L + [f"    Ainda sem dados: o bot grava-os nos primeiros {num(cfg.get('percurso_fino_minutos'), 30):.0f} min "
+                    "de cada sinal desde 15/11/2026; aparecem aqui quando esses percursos fecharem."]
+    valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
+    series = [(pc, _serie_fina(pc)) for pc in com]
+
+    def medir(regra, modo):
+        if modo == "normais":
+            r = [repetir_percurso(pc, regra, cfg)[0] for pc, _ in series]
+        elif modo == "finos":
+            r = [repetir_serie(pc, s, regra, cfg)[0] for pc, s in series]
+        else:
+            r = [repetir_serie(pc, s, regra, cfg, valor_usd=valor, custos="reais")[0] for pc, s in series]
+        return sum(r) / len(r), sum(1 for x in r if x > 0) / len(r) * 100.0
+
+    def intervalos(chave):
+        saltos = []
+        for pc in com:
+            tempos = sorted(num(p[0]) for p in pc.get(chave) or [] if isinstance(p, (list, tuple)) and len(p) == 2)
+            saltos += [b - a for a, b in zip(tempos, tempos[1:]) if b > a]
+        return _mediana(saltos)
+
+    i_fino, i_normal = intervalos("ptsj"), intervalos("pts")
+    if i_fino is not None and i_normal is not None:
+        L.append(f"    Intervalo mediano entre pontos: finos {i_fino:.0f} s, normais {i_normal:.0f} s")
+    com_real = sum(1 for pc, s in series if repetir_serie(pc, s, atual, cfg, valor_usd=valor, custos="reais")[2])
+    L.append("    REGRAS ATUAIS, nos mesmos percursos:")
+    for nome, modo in (("pontos normais, custos simulados", "normais"), ("pontos finos,   custos simulados", "finos"),
+                       ("pontos finos,   custos reais", "reais")):
+        media, acerto = medir(atual, modo)
+        L.append(f"      {nome:<34} acerto {acerto:5.1f}%   media {media:+6.2f}% por trade")
+    L.append(f"      (custos reais: {com_real} de {len(com)} com cotacao real de entrada; taxa de rede "
+             f"${num(cfg.get('lab_taxa_rede_usd'), 0.05):.2f} por transacao, HIPOTESE por medir; operacao de ${valor:.2f})")
+    if melhores:
+        L.append("    AS MELHORES COMBINACOES (escolhidas com pontos normais em todos os sinais), nestes percursos:")
+        for regra in melhores[:5]:
+            a, b, c = medir(regra, "normais")[0], medir(regra, "finos")[0], medir(regra, "reais")[0]
+            L.append(f"      {_regra_txt(regra)}   normais {a:+6.2f}%   finos {b:+6.2f}%   finos+reais {c:+6.2f}%")
+    L += ["    - 'pontos finos, custos simulados' e o mais parecido com o que o bot Paper regista hoje.",
+          "    - Se uma regra so ganha com pontos normais, o ganho vem da lentidao dos dados, nao da regra."]
+    if len(com) < 40:
+        L.append(f"    - ATENCAO: {len(com)} percursos com pontos finos e pouco; abaixo de 40 isto e sobretudo sorte.")
+    return L
+
+
+def _secao_por_dia(cfg):
+    """Operacoes Paper fechadas, por dia (resultado real registado pelo bot, nao o do laboratorio)."""
+    L = ["", "  OPERACOES PAPER FECHADAS, POR DIA (o que o bot registou mesmo, nao o laboratorio)"]
+    try:
+        vendas = [t for t in (ler_trades_paper(cfg) or []) if t.get("tipo") == "VENDA" and t.get("pnl_usd") is not None]
+    except Exception:
+        vendas = []
+    if not vendas:
+        return L + ["    Ainda sem operacoes fechadas (ou trades.csv indisponivel)."]
+    dias = {}
+    for t in vendas:
+        dias.setdefault(str(t.get("data_hora") or "")[:10], []).append(t)
+    for dia in sorted(dias):
+        g = dias[dia]
+        pnl = sum(num(t["pnl_usd"]) for t in g)
+        ganhas = sum(1 for t in g if num(t["pnl_usd"]) > 0)
+        media = sum(num(t.get("pnl_pct")) for t in g) / len(g)
+        L.append(f"    {dia}   {len(g):>3} fechadas   {ganhas:>2} ganhas   resultado ${pnl:+7.2f}   media {media:+6.2f}% por operacao")
+    L += ["    As regras do bot mudaram pelo caminho (confirmacao manual e limite de 5 EUR desde 14/11, preco rapido",
+          "    desde 15/11): compara dias com as mesmas regras, nao o total."]
+    return L
+
+
 def repetir_avancado(pc, cfg, queda=None, stop=-25.0, parcial_2x=True, trail_dist=20.0, trail_ativar=None,
                      alvo=None, minutos=180, valor_usd=12.0):
     """Laboratorio: estrategia com entrada na queda e/ou venda de metade a 2x (so simulacao).
@@ -5240,6 +5392,7 @@ def analisar(cfg):
               f"    1.a metade: {m_a:+6.2f}% por trade     2.a metade: {m_b:+6.2f}% por trade (acerto {ac_b:.1f}%)",
               "    Se a 2.a metade for muito pior, a regra so 'acertou' por acaso - nao confies nela."]
 
+    L += _secao_pontos_finos(percursos, [r for _, r in resultados[:5]], atual, cfg)
     L += _secao_observacao_extra(percursos, atual, cfg)
     L += ["", "  POR FONTE DE DESCOBERTA (com as regras atuais)"]
     for fonte in ("dexscreener", "geckoterminal"):
@@ -5256,7 +5409,9 @@ def analisar(cfg):
     L += _secao_controlo(percursos, controlo, atual, cfg)
     L += _secao_caracteristicas(todos, atual, cfg)
     L += _secao_estrategia_post(percursos, todos, cfg)
+    L += _secao_por_dia(cfg)
     L += ["", "  COMO LER", "    - 'media' ja inclui os custos simulados (slippage e taxas, a entrada e a saida).",
+          "    - Fora da seccao PONTOS FINOS, tudo usa os pontos normais (DexScreener, ~30 em 30 s).",
           "    - Conta cada sinal como um trade, sem o limite de posicoes abertas.",
           "    - Se NENHUMA combinacao tiver media positiva, o problema esta nas entradas (o Analista),",
           "      nao nas saidas: nenhuma regra de venda salva compras sem vantagem.",
@@ -5335,6 +5490,21 @@ def _secao_observacao_extra(percursos, regra, cfg):
     grupo("top10 holders <= 40%", lambda pc: 0 <= top10(pc) <= 40)
     grupo("top10 holders 40-70%", lambda pc: 40 < top10(pc) <= 70)
     grupo("top10 holders > 70%", lambda pc: top10(pc) > 70)
+
+    def sem_pool(pc):  # top 10 sem a conta da pool (que costuma ser o maior "holder"); None se nao der para saber
+        top, pool = obter(pc, "obs", "holders", "top"), pc.get("par")
+        validos = [x for x in top if isinstance(x, list) and len(x) == 2] if isinstance(top, list) else []
+        if not pool or not any(x[0] == pool for x in validos):
+            return None
+        return sum(num(x[1]) for x in [x for x in validos if x[0] != pool][:10])
+
+    com_donos = [pc for pc in com if isinstance(obter(pc, "obs", "holders", "top"), list)]
+    if com_donos:
+        L.append(f"    Donos das maiores contas: {len(com_donos)} percursos com dados; pool do par identificada em "
+                 f"{sum(1 for pc in com_donos if sem_pool(pc) is not None)}")
+        grupo("top10 SEM a pool <= 25%", lambda pc: sem_pool(pc) is not None and sem_pool(pc) <= 25)
+        grupo("top10 SEM a pool 25-50%", lambda pc: sem_pool(pc) is not None and 25 < sem_pool(pc) <= 50)
+        grupo("top10 SEM a pool > 50%", lambda pc: sem_pool(pc) is not None and sem_pool(pc) > 50)
     estado_auth = lambda pc, k: obter(pc, "obs", "mint", k)
     grupo("mint ou freeze authority ATIVA", lambda pc: "active" in (estado_auth(pc, "mint_authority"), estado_auth(pc, "freeze_authority")))
     grupo("mint e freeze authority revogadas", lambda pc: estado_auth(pc, "mint_authority") == "revoked" and estado_auth(pc, "freeze_authority") == "revoked")
