@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import rede
 from datetime import datetime, timezone
 
 from smart_filters_security import PUBLIC_RPC_URL, parse_mint_account
@@ -67,7 +69,9 @@ def _agora_utc():
 
 def _http_json(url, body=None, timeout=6.0, opener=None):
     """GET (body None) ou POST JSON. Devolve (dict|None, erro|None)."""
-    opener = opener or urllib.request.urlopen
+    if opener is None:  # uso real: requests (certificados certifi); o urllib falhava no Windows
+        dados, erro, _corpo = rede.pedir_json(url, body=body, timeout=timeout)
+        return dados, erro
     headers = {"Accept": "application/json", "User-Agent": "paper-bot-observacao/1.0"}
     data = None
     if body is not None:

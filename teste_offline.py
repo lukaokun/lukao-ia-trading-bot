@@ -257,7 +257,7 @@ def t_fluxo_completo(pasta):
     assert len(bot.estado["posicoes"]) == 1
     bot.atualizar_snapshot()
     snap_pos = json.loads(bot.snapshot)["posicoes"][0]                # grafico "Posicao ao vivo"
-    assert snap_pos["regras_saida"]["stop_loss_pct"] == cfg["stop_loss_pct"] and snap_pos["intervalo_seg"] == cfg["intervalo_risco_seg"]
+    assert snap_pos["regras_saida"]["stop_loss_pct"] == cfg["stop_loss_pct"] and snap_pos["intervalo_seg"] == cfg["intervalo_risco_com_posicao_seg"] and snap_pos["fonte_preco"] == "dexscreener"
     assert snap_pos["par"] and snap_pos["pico"] > 0 and abs(snap_pos["pnl_usd"] - (snap_pos["valor_atual_usd"] - pos["custo"])) < 1e-9
 
 
@@ -901,6 +901,176 @@ def t_paragem_por_perdas(pasta):
     listar("BOM")
     assert bot.ciclo_scanner() == 0 and not bot.estado["posicoes"]
     assert any("suspensas" in a for a in bot.estado["acoes"])
+
+
+class _JupFalso:
+    """Substituto offline do PrecoRapido (cotacao de venda Jupiter)."""
+    origem = "jupiter_publico"
+
+    def __init__(self, precos):
+        self.precos = list(precos)
+        self.pedidos = 0
+
+    def cotar(self, mint, tokens, preco_ref=None):
+        self.pedidos += 1
+        p = self.precos.pop(0) if self.precos else None
+        if p is None:
+            return {"estado": "erro", "erro": "timeout", "sem_rota_seguidas": 0}
+        return {"estado": "ok", "preco": p, "impacto_pct": 0.01, "rota": "Pump.fun Amm"}
+
+    def esquecer(self, mint):
+        pass
+
+    compra = {"estado": "ok", "impacto_pct": 0.05, "rota": "Pump.fun Amm"}
+
+    def cotar_compra(self, mint, valor_usd):
+        self.pedidos += 1
+        return dict(self.compra)
+
+
+def t_preco_rapido_stop_com_dexscreener_atrasada(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    assert bot.ciclo_risco() == 0                                 # DexScreener: 0.001 (sem mexer)
+    bot.preco_rapido = _JupFalso([0.00098, 0.00093])
+    assert bot.ciclo_rapido() == 0                                # Jupiter -2%: mantem
+    pos = bot.estado["posicoes"][m]
+    assert pos["fonte_preco"] == "jupiter" and abs(pos["preco_atual"] - 0.00098) < 1e-12
+    assert len(pos["hist"]) == len(pos["hist_t"])
+    assert bot.ciclo_rapido() == 1 and not bot.estado["posicoes"]  # Jupiter -7% com a DexScreener ainda a 0.001
+    v = trades(cfg)[-1]
+    assert v["motivo"].startswith("STOP_LOSS") and abs(float(v["preco_mercado"]) - 0.00093) < 1e-12
+    assert bot.ciclo_rapido() == 0 and not bot.risco.precos_rapidos  # limpa o preco da posicao fechada
+
+
+def t_preco_rapido_seguranca(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    assert bot.ciclo_risco() == 0
+    bot.preco_rapido = _JupFalso([0.0005])                        # 1.o preco -50% face a DexScreener: ignorado
+    assert bot.ciclo_rapido() == 0 and m in bot.estado["posicoes"] and not bot.risco.precos_rapidos
+    bot.preco_rapido = _JupFalso([None])                          # Jupiter falha: nada muda
+    assert bot.ciclo_rapido() == 0 and bot.estado["posicoes"][m]["sem_dados"] == 0
+    bot.preco_rapido = _JupFalso([0.00099] * 12)
+    bot._pares_risco = {m: []}                                    # ciclo rapido nunca conta falhas de dados
+    for _ in range(12):
+        bot.ciclo_rapido()
+    assert m in bot.estado["posicoes"] and bot.estado["posicoes"][m]["sem_dados"] == 0
+    bot.risco.precos_rapidos[m] = {"preco": 0.0001, "ts": B.agora() - 60}  # preco antigo deixa de ser usado
+    assert bot.ciclo_risco() == 0 and bot.estado["posicoes"][m]["fonte_preco"] == "dexscreener"
+    bot.atualizar_snapshot()
+    snap_pos = json.loads(bot.snapshot)["posicoes"][0]
+    assert snap_pos["fonte_preco"] == "dexscreener" and len(snap_pos["hist_t"]) == len(snap_pos["hist"])
+
+
+def t_percurso_controlo_e_laboratorio(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg["percursos_controlo_max"] = 1
+    a, b, c = mint_de("CTRLA"), mint_de("CTRLB"), mint_de("SINAL")
+    bot.iniciar_percurso(a, par("CTRLA", var_m5=12), {"pontuacao": 60}, grupo="controlo")
+    bot.iniciar_percurso(b, par("CTRLB"), {"pontuacao": 60}, grupo="controlo")   # limite do controlo
+    bot.iniciar_percurso(c, par("SINAL"), {"pontuacao": 80})
+    pc = bot.estado["percursos"]
+    assert pc[a]["grupo"] == "controlo" and b not in pc and pc[c]["grupo"] == "sinal"
+    assert pc[a]["feat"]["m5"] == 12 and pc[a]["feat"]["compras_m5"] == 30 and pc[a]["feat"]["idade_min"] == 60
+    bot.iniciar_percurso(mint_de("SEMNOTA"), par("SEMNOTA"), {"pontuacao": None}, grupo="controlo")
+    assert mint_de("SEMNOTA") not in pc
+    pc[a]["pts"].append([600, 1.2])
+    pc[c]["pts"].append([600, 0.9])
+    bot._fechar_percurso(a, "tempo", 50000)
+    bot._fechar_percurso(c, "tempo", 50000)
+    with open(cfg["ficheiro_percursos"], encoding="utf-8") as f:
+        linhas = [json.loads(l) for l in f]
+    assert [l["grupo"] for l in linhas] == ["controlo", "sinal"] and "feat" in linhas[0]
+    texto = B.analisar(cfg)
+    assert "Sinais analisados: 1" in texto and "recusados (controlo)" in texto, texto
+    assert "POR CARACTERISTICA DE ENTRADA - 2 percursos" in texto and "10 a 30%" in texto, texto
+    os.remove(cfg["ficheiro_percursos"])
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        f.write(json.dumps(linhas[0]) + "\n")
+    texto = B.analisar(cfg)                                       # so controlo: nao rebenta
+    assert "Ainda nao ha percursos completos de sinais aprovados" in texto and "recusados (controlo)" in texto
+    os.remove(cfg["ficheiro_percursos"])
+
+
+def t_rota_compra_jupiter_antes_da_proposta(pasta):
+    for resposta, compra in (({"estado": "erro", "erro": "sem_rota"}, False),
+                             ({"estado": "ok", "impacto_pct": 4.0}, False),
+                             ({"estado": "erro", "erro": "timeout"}, True),     # Jupiter em baixo: nao bloqueia
+                             ({"estado": "ok", "impacto_pct": 0.2}, True)):
+        bot, cfg = novo_bot(pasta)
+        bot.preco_rapido = _JupFalso([])
+        bot.preco_rapido.compra = resposta
+        listar("ROTA")
+        assert bot.ciclo_scanner() == (1 if compra else 0), resposta
+        if not compra:
+            assert any("sem proposta" in a for a in bot.estado["acoes"]), bot.estado["acoes"]
+            assert mint_de("ROTA") in bot.estado["percursos"]           # o laboratorio continua a seguir o sinal
+        MERCADO["perfis"].clear()
+        MERCADO["pares"].clear()
+
+def t_laboratorio_estrategia_post(pasta):
+    bot, cfg = novo_bot(pasta)
+    s, tx = cfg["slippage_pct"] / 100.0, cfg["taxa_pct"] / 100.0
+    # sobe, recua 20% (entra a 1.2), dobra (vende metade), sobe mais e recua 23% do pico (trailing no resto)
+    pc = {"pts": [[0, 1.0], [60, 1.5], [120, 1.2], [180, 2.5], [240, 3.0], [300, 2.3], [360, 2.2]], "fim": "tempo"}
+    r, motivo = B.repetir_avancado(pc, cfg, queda=(15, 35), stop=-25, parcial_2x=True, trail_dist=20, minutos=180)
+    esperado = ((1 - tx) / (1 + s) * (0.5 * (2.5 / 1.2) * (1 - s) * (1 - tx) + 0.5 * (2.3 / 1.2) * (1 - s) * (1 - tx)) - 1) * 100
+    assert motivo == "trailing" and abs(r - esperado) < 1e-9, (r, esperado, motivo)
+    # faca a cair: recua mais de 35% de uma vez, nunca compra
+    assert B.repetir_avancado({"pts": [[0, 1.0], [60, 0.5], [120, 0.3], [180, 0.2]], "fim": "tempo"}, cfg,
+                              queda=(15, 35)) is None
+    # entra na queda e continua a cair: stop a -25% desde a entrada
+    r, motivo = B.repetir_avancado({"pts": [[0, 1.0], [60, 0.8], [120, 0.7], [180, 0.59], [240, 0.5]], "fim": "tempo"},
+                                   cfg, queda=(15, 35), stop=-25)
+    assert motivo == "stop" and r < -25, (r, motivo)
+    # rug no fim: sai com o slippage de rug
+    r, motivo = B.repetir_avancado({"pts": [[0, 1.0], [60, 1.1], [120, 0.05]], "fim": "rug", "liq_fim": 100}, cfg)
+    assert motivo == "rug" and r < -90
+    # o relatorio do laboratorio mostra a secao
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for i in range(3):
+            f.write(json.dumps(dict(pc, simbolo=f"P{i}", pontuacao=75, ts=1000 + i, liq0=20000)) + "\n")
+    texto = B.analisar(cfg)
+    assert "ESTRATEGIA DO POST" in texto and "post completo" in texto and "so entrada na queda" in texto, texto
+    os.remove(cfg["ficheiro_percursos"])
+
+def t_log_analise_sem_repeticoes(pasta):
+    import logging
+    bot, cfg = novo_bot(pasta)
+    registos = []
+    h = logging.Handler(level=logging.INFO)
+    h.emit = lambda r: registos.append(r.getMessage())
+    nivel = B.log.level
+    B.log.addHandler(h)
+    B.log.setLevel(logging.INFO)
+    try:
+        listar("NOVO", idade_min=2)
+        bot.ciclo_scanner()
+        avancar(1)
+        bot.ciclo_scanner()
+    finally:
+        B.log.removeHandler(h)
+        B.log.setLevel(nivel)
+    analises = [r for r in registos if r.startswith("ANALISE NOVO")]
+    assert len(analises) == 1, registos
+    assert bot.estado["scanner_counters"]["session"]["analysis_completed"] >= 2  # foi mesmo reanalisado
+
+
+def t_telegram_em_segundo_plano(pasta):
+    enviados = []
+    original = B.requests.post
+    B.requests.post = lambda *a, **k: enviados.append(k["json"]["text"])
+    try:
+        tg = B.Telegram("123456:" + "a" * 30, "987654", em_segundo_plano=True)
+        tg.enviar("ola")
+        for _ in range(100):
+            if enviados:
+                break
+            time.sleep(0.01)
+    finally:
+        B.requests.post = original
+    assert enviados == ["ola"] and not B.Telegram("", "").ativo
 
 
 def main():

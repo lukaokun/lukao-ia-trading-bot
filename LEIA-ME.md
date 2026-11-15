@@ -27,6 +27,24 @@ O único pedido de escrita é `POST /api/proposta/decisao` (aprovar ou recusar u
 - Observação extra (só leitura, não decide compras): permissões do mint, concentração de holders (RPC público Solana) e cotação Jupiter para tokens aprovados — `observacao_extra.py`.
 - GeckoTerminal como fonte extra de descoberta em modo observação: tokens encontrados só por esta fonte são analisados e gravados, mas nunca geram propostas.
 - Decisão de propostas no Dashboard (ver acima).
+- Preço rápido da posição aberta (`preco_rapido.py`, só leitura): cotação de VENDA no Jupiter de 3 em 3 segundos; stops, alvo e trailing passam a usar esse preço. A liquidez (regras de rug) continua a vir da DexScreener, lida de 5 em 5 segundos com posição aberta. Se o Jupiter falhar, o bot volta automaticamente à DexScreener.
+- Antes de cada proposta, confirma no Jupiter que existe rota de compra e que o impacto real não passa de 1,5% (`impacto_compra_jupiter_max_pct`). Se o Jupiter não responder, não bloqueia.
+- Avisos de proposta: botão "Ativar avisos" no Dashboard (som, notificação do sistema e título a piscar) e mensagem por Telegram, se configurado.
+- Laboratório: grupo de controlo (tokens recusados com pontuação, seguidos como se fossem sinais) e características de entrada (subida 5 min/1 h, compras/vendas, idade) em cada percurso; `python bot.py --analisar` mostra aprovados vs. recusados e resultados por característica.
+- O log deixa de repetir a mesma análise do mesmo token a cada ciclo (só regista quando o motivo muda).
+
+### Ficheiro local `chaves_locais.json` (opcional, nunca vai para o Git)
+
+```json
+{
+  "helius_api_key": "...",
+  "jupiter_api_key": "...",
+  "telegram_token": "...",
+  "telegram_chat_id": "..."
+}
+```
+
+Todas as chaves são opcionais. Nunca são registadas no log nem mostradas no Dashboard. Não partilhe este ficheiro.
 
 ## Componentes
 
