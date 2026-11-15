@@ -143,9 +143,16 @@ CONFIG = {
     "percursos_controlo_max": 12,    # grupo de controlo: segue tambem tokens RECUSADOS, para ver se os filtros ajudam
     "percursos_controlo_pontuacao_min": 50,  # ...so recusados com pontuacao calculada >= X (comparaveis)
     "ficheiro_percursos": "percursos.jsonl",
+    # Pontos finos (SO GRAVACAO, nao decide nada): preco de VENDA real no Jupiter dos sinais seguidos, para o
+    # laboratorio poder testar stops apertados com dados ao ritmo do bot (a DexScreener so muda de ~30 em 30 s).
+    "percursos_finos": True,
+    "percurso_fino_minutos": 30,       # so nos primeiros X minutos de cada sinal
+    "percurso_fino_intervalo_seg": 5,  # 1 cotacao de X em X s no total (12/min; plano Free do Jupiter: 60/min)
+    "percurso_fino_valor_usd": 5.5,    # tamanho da venda cotada (igual ao de uma operacao Paper)
 
     # ---------------- Rede ----------------
     "timeout_seg": 10,               # tempo maximo de espera por cada pedido
+    "timeout_com_posicao_seg": 4,    # com posicao aberta: pedidos curtos e sem repeticoes (os stops nao esperam)
     "tentativas": 3,                 # numero de tentativas por pedido
     "espera_base_seg": 1.5,          # espera entre tentativas (duplica a cada falha)
     # intervalo minimo entre pedidos, por tipo (respeita os limites das APIs)
@@ -268,6 +275,9 @@ class ClienteHTTP:
             "rugcheck": cfg["intervalo_min_rugcheck_seg"],
         }
         self.cabecalhos = {"Accept": "application/json", "User-Agent": "paper-bot/1.0"}
+        # Com posicao aberta o Bot liga isto: 1 tentativa e timeout curto, para o scanner nunca atrasar os stops.
+        self.urgente = False
+        self.pausa_ate = {}  # grupo -> instante (monotonic) ate ao qual nao se repete o pedido depois de um 429
 
     def _respeitar_limite(self, grupo):
         intervalo = self.intervalos.get(grupo, 0.5)
@@ -282,10 +292,18 @@ class ClienteHTTP:
         """Devolve o JSON da resposta ou None se falhar. Nunca lanca excecoes."""
         tentativas = tentativas or self.cfg["tentativas"]
         espera = self.cfg["espera_base_seg"]
+        timeout = self.cfg["timeout_seg"]
+        urgente = bool(getattr(self, "urgente", False))
+        pausas = self.__dict__.setdefault("pausa_ate", {})
+        if urgente:
+            if time.monotonic() < pausas.get(grupo, 0.0):
+                return None  # ainda dentro da pausa pedida pelo servidor (429)
+            tentativas = 1
+            timeout = min(timeout, max(1.0, num(self.cfg.get("timeout_com_posicao_seg"), 4.0)))
         for tentativa in range(1, tentativas + 1):
             self._respeitar_limite(grupo)
             try:
-                r = requests.get(url, timeout=self.cfg["timeout_seg"], headers=self.cabecalhos)
+                r = requests.get(url, timeout=timeout, headers=self.cabecalhos)
                 codigo = r.status_code
                 if codigo == 200:
                     try:
@@ -298,6 +316,8 @@ class ClienteHTTP:
                     pausa = num(obter(dict(r.headers), "Retry-After"), espera * 2)
                     pausa = max(1.0, min(pausa, 30.0))
                     log.warning("Limite de pedidos (429). A esperar %.0fs...", pausa)
+                    if urgente:  # nao dorme (os stops nao esperam): salta os pedidos deste grupo durante a pausa
+                        pausas[grupo] = time.monotonic() + pausa
                     if tentativa < tentativas:
                         dormir(pausa)
                 elif codigo >= 500:
@@ -424,6 +444,16 @@ class Scanner:
         self.origem_gecko = set()      # mints encontrados so pelo GeckoTerminal (modo observacao)
         self.gecko_ultimo = None
         self.last_gecko_count = 0
+        # O Bot poe aqui uma funcao que le o preco rapido da posicao aberta entre os pedidos do scanner.
+        self.entre_pedidos = None
+
+    def _ceder_a_vez(self):
+        funcao = getattr(self, "entre_pedidos", None)
+        if callable(funcao):
+            try:
+                funcao()
+            except Exception:
+                log.exception("Erro ao ceder a vez ao preco rapido")
 
     def tokens_gecko(self):
         """Pools novas de Solana no GeckoTerminal com liquidez minima. Devolve lista de mints."""
@@ -459,6 +489,7 @@ class Scanner:
         recebidos = 0
         self.respondeu = False
         for url in (URL_PERFIS, URL_BOOSTS):
+            self._ceder_a_vez()
             dados = self.http.get_json(url, "perfis")
             self.respondeu = self.respondeu or dados is not None
             if isinstance(dados, dict):  # por seguranca, caso venha embrulhado
@@ -478,6 +509,7 @@ class Scanner:
         # Fonte extra (observacao): so acrescenta mints que o DexScreener nao trouxe.
         for mint in mints:
             self.origem_gecko.discard(mint)
+        self._ceder_a_vez()
         try:
             extra = self.tokens_gecko()
         except Exception:
@@ -515,6 +547,7 @@ class Scanner:
         self.ultimos_pares = {}
         if not a_ver:
             return [], []
+        self._ceder_a_vez()
         pares = buscar_pares(self.http, a_ver)
         if pares is None:
             self.ultimos_pares = {mint: None for mint in a_ver}
@@ -2078,7 +2111,7 @@ class Risco:
 
     def _emit_observation(self, pos, mint, *, pair=None, raw_price=None, raw_liquidity=None,
                           conditions=None, exit_reason=None, unavailable_reason=None,
-                          previous_pair_address=None):
+                          previous_pair_address=None, data_source=None):
         observer = self.observability
         if observer is None:
             return
@@ -2122,7 +2155,7 @@ class Risco:
                 "pair_address": pair_address,
                 "entry_pair_address": entry_pair,
                 "previous_pair_address": previous_pair_address,
-                "data_source": self.data_source,
+                "data_source": data_source or self.data_source,
                 # DexScreener pair data here has no source-update timestamp or RPC slot.
                 "source_timestamp_utc": None,
                 "observation_age_seconds": None,
@@ -2333,7 +2366,9 @@ class Risco:
                                    "reason": "um ou mais campos da observação estão ausentes/inválidos" if missing_now else None})
                 self._emit_observation(pos, mint, pair=par, raw_price=raw_price,
                                        raw_liquidity=raw_liquidity, conditions=conditions,
-                                       exit_reason=motivo, previous_pair_address=previous_pair)
+                                       exit_reason=motivo, previous_pair_address=previous_pair,
+                                       data_source=("Jupiter+DexScreener" if fonte_preco == "jupiter"
+                                                    and self.data_source == "DexScreener" else None))
                 pos["preco_atual"] = preco
                 pos["liq_atual"] = liq
                 pos["fonte_preco"] = fonte_preco
@@ -3284,6 +3319,7 @@ class Bot:
         self.dashboard_token = secrets.token_urlsafe(32)
         self._latest_market_pairs = {}
         self.scanner = Scanner(self.cfg, self.http)
+        self.scanner.entre_pedidos = self._vigiar_posicao_no_scanner
         self.analista = Analista(self.cfg, self.http)
         self.executor = Executor(self.cfg, self.estado, self)
         self.risco = Risco(self.cfg, self.estado, self.http, self.executor)
@@ -3291,6 +3327,12 @@ class Bot:
         self.preco_rapido = None
         self._pares_risco = {}
         self._avisos_preco_rapido = {}
+        self._avisos_tg_rapido = {}      # (mint, e_sem_rota) -> hora do ultimo aviso Telegram de preco rapido em falha
+        self._ultimo_ciclo_rapido = 0.0  # para o scanner saber quando tem de ceder a vez ao preco rapido
+        # Pontos finos do laboratorio: instancia Jupiter separada (main() cria-a no modo Paper com mercado real).
+        self.preco_fino = None
+        self._fino_ultimo = {}           # mint -> hora da ultima cotacao fina (para rodar pelos sinais)
+        self._fino_pausa_ate = 0.0       # depois de uma falha de rede/Jupiter, nao insiste ate esta hora
         self._ultimo_motivo_log = {}
         self.analisados = 0
         self.ultimo_scan = "ainda nao correu"
@@ -4212,6 +4254,7 @@ class Bot:
                 self._adiar(mint, erro)
         aprovados = []
         for mint, par in candidatos:
+            self._vigiar_posicao_no_scanner()  # com posicao aberta, o stop/trailing nao espera pelo scanner
             nome = obter(par, "baseToken", "name")
             self.em_analise = [{
                 "id": mint, "mint": mint, "simbolo": simbolo_limpo(par),
@@ -4497,8 +4540,11 @@ class Bot:
             self._avisos_preco_rapido.pop(mint, None)
             if self.preco_rapido is not None:
                 self.preco_rapido.esquecer(mint)
+        for chave in [k for k in self._avisos_tg_rapido if k[0] not in posicoes]:
+            self._avisos_tg_rapido.pop(chave, None)
         if self.preco_rapido is None or not posicoes:
             return 0
+        self._ultimo_ciclo_rapido = agora()
         novo = False
         for mint, pos in list(posicoes.items()):
             ds = num(pos.get("preco_ds")) or num(pos.get("preco_atual")) or num(pos.get("preco_entrada"))
@@ -4509,6 +4555,7 @@ class Bot:
                     self._avisos_preco_rapido[mint] = erro
                     log.warning("Preco rapido Jupiter indisponivel para %s: %s (continua a DexScreener)",
                                 pos.get("simbolo"), erro)
+                    self._avisar_preco_rapido(mint, pos, erro)
                 continue
             preco = num(r.get("preco"))
             anterior = rapidos.get(mint)
@@ -4523,10 +4570,101 @@ class Bot:
                 log.info("Preco rapido Jupiter ativo para %s (%s)", pos.get("simbolo"), self.preco_rapido.origem)
             rapidos[mint] = {"preco": preco, "ts": agora(), "impacto_pct": r.get("impacto_pct"),
                              "rota": r.get("rota")}
+            self._ponto_fino(mint, preco)  # laboratorio: aproveita a cotacao, sem pedidos a mais
             novo = True
         if not novo or not self._pares_risco:
             return 0
         return self.risco.verificar(self._pares_risco, rapido=True)
+
+    def _avisar_preco_rapido(self, mint, pos, erro):
+        """Telegram quando a posicao aberta fica sem preco rapido (no maximo 1 aviso por minuto, por token
+        e por tipo; a falta de rota de venda tem aviso proprio, que nunca fica escondido atras de outro)."""
+        try:
+            chave = (mint, erro == "sem_rota")
+            if agora() - num(self._avisos_tg_rapido.get(chave)) < 60:
+                return
+            self._avisos_tg_rapido[chave] = agora()
+            simbolo = pos.get("simbolo") or "?"
+            if erro == "sem_rota":
+                texto = (f"[PAPER] ALERTA {simbolo}: o Jupiter deixou de ter rota de VENDA (possivel rug). "
+                         "O bot continua a vigiar pela DexScreener; ve a posicao no dashboard.")
+            else:
+                texto = (f"[PAPER] AVISO {simbolo}: preco rapido Jupiter indisponivel ({erro}). "
+                         "Stop e trailing estao a usar o preco da DexScreener, que e mais lento.")
+            self.telegram.enviar(texto)
+        except Exception:
+            log.warning("Aviso de preco rapido por Telegram falhou")
+
+    def _atualizar_urgencia_http(self):
+        """Com posicao aberta, os pedidos HTTP ficam curtos (1 tentativa) para nao atrasarem os stops."""
+        try:
+            self.http.urgente = bool(self.estado["posicoes"])
+        except AttributeError:
+            pass
+
+    def _vigiar_posicao_no_scanner(self):
+        """Chamado entre analises do scanner: se houver posicao aberta e ja for hora, le o preco rapido."""
+        if not self.estado["posicoes"] or self.preco_rapido is None or not self.cfg.get("preco_rapido"):
+            return 0
+        if agora() - self._ultimo_ciclo_rapido < num(self.cfg.get("intervalo_preco_rapido_seg"), 3):
+            return 0
+        try:
+            return self.ciclo_rapido()
+        except Exception:
+            log.exception("Erro no ciclo de preco rapido (durante o scanner)")
+            return 0
+
+    def _ponto_fino(self, mint, preco_venda):
+        """Laboratorio (SO GRAVACAO): junta um ponto fino (preco de venda Jupiter) ao percurso do token.
+        Nunca mexe em 'pts' nem em nenhuma decisao; o laboratorio continua a usar 'pts'."""
+        cfg = self.cfg
+        pc = self.estado["percursos"].get(mint)
+        if not cfg.get("percursos_finos") or not isinstance(pc, dict):
+            return False
+        preco0, preco_venda = num(pc.get("preco0")), num(preco_venda)
+        seg = int(agora() - num(pc.get("ts")))
+        if preco0 <= 0 or preco_venda <= 0 or not 0 <= seg <= num(cfg.get("percurso_fino_minutos"), 30) * 60:
+            return False
+        finos = pc.get("ptsj")
+        if not isinstance(finos, list):
+            finos = pc["ptsj"] = []
+        finos.append([seg, round(preco_venda / preco0, 5)])
+        del finos[:-800]
+        return True
+
+    def ciclo_percursos_finos(self):
+        """Laboratorio (SO GRAVACAO): 1 cotacao de venda Jupiter por chamada, a rodar pelos sinais recentes.
+
+        Fica parado enquanto houver posicao aberta, para nunca gastar pedidos Jupiter de que o preco
+        rapido (stop/trailing) precisa. Nao assina nem envia nada. Devolve 1 se gravou um ponto."""
+        cfg, e = self.cfg, self.estado
+        if self.preco_fino is None or not cfg.get("percursos_finos") or e["posicoes"]:
+            return 0
+        if agora() < self._fino_pausa_ate:
+            return 0
+        limite = num(cfg.get("percurso_fino_minutos"), 30) * 60
+        ativos = [m for m, pc in e["percursos"].items()
+                  if isinstance(pc, dict) and pc.get("grupo", "sinal") != "controlo"
+                  and num(pc.get("preco0")) > 0 and 0 <= agora() - num(pc.get("ts")) <= limite]
+        for antigo in [m for m in self._fino_ultimo if m not in e["percursos"]]:
+            self._fino_ultimo.pop(antigo, None)
+        if not ativos:
+            return 0
+        mint = min(ativos, key=lambda m: self._fino_ultimo.get(m, 0.0))  # o que esta ha mais tempo sem ponto
+        self._fino_ultimo[mint] = agora()
+        pc = e["percursos"][mint]
+        ultimo = num(pc["pts"][-1][1]) if pc.get("pts") else 1.0
+        ref = pc["preco0"] * (ultimo if ultimo > 0 else 1.0)  # ultimo preco DexScreener (valida as casas decimais)
+        tokens = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5)) / pc["preco0"]
+        r = self.preco_fino.cotar(mint, tokens, ref)
+        if not isinstance(r, dict) or r.get("estado") != "ok":
+            erro = r.get("erro") if isinstance(r, dict) else None
+            if erro not in ("sem_rota", "sem_saida", "decimais_desconhecidos", "decimais_incoerentes",
+                            "preco_incoerente", "mint_invalido", "quantidade_invalida"):
+                # Falha de rede ou do Jupiter (nao deste token): cada tentativa pode demorar 3 s, por isso espera.
+                self._fino_pausa_ate = agora() + 30
+            return 0
+        return 1 if self._ponto_fino(mint, r.get("preco")) else 0
 
     def _bloqueio_rota_compra(self, mint, valor_usd):
         """Confirma no Jupiter (so leitura) que ha rota de compra e que o impacto real e aceitavel.
@@ -4608,6 +4746,8 @@ class Bot:
             linha["grupo"] = pc["grupo"]
         if isinstance(pc.get("feat"), dict):
             linha["feat"] = pc["feat"]
+        if isinstance(pc.get("ptsj"), list) and pc["ptsj"]:
+            linha["ptsj"] = pc["ptsj"]  # pontos finos (preco de venda Jupiter); o laboratorio ainda usa so 'pts'
         try:
             with open(self.cfg["ficheiro_percursos"], "a", encoding="utf-8") as f:
                 f.write(json.dumps(linha, ensure_ascii=False) + "\n")
@@ -4772,7 +4912,7 @@ class Bot:
             print("Outra instancia ja esta a operar este estado Paper Trading; arranque cancelado.")
             return
         try:
-            prox_scan = prox_risco = prox_rapido = 0.0
+            prox_scan = prox_risco = prox_rapido = prox_fino = 0.0
             self.manual_approvals.start()
             print("A arrancar... (primeira procura de tokens pode demorar alguns segundos)")
             self.url_web = iniciar_painel_web(self)
@@ -4788,6 +4928,7 @@ class Bot:
                 aprovacao_alterou, _ = self._processar_respostas_aprovacao()
                 mexeu = aprovacao_alterou
                 self._atualizar_taxa_bce()
+                self._atualizar_urgencia_http()
                 if t >= prox_risco:
                     try:
                         self.ciclo_risco()
@@ -4797,13 +4938,22 @@ class Bot:
                                             if self.estado["posicoes"] else cfg["intervalo_risco_seg"])
                     mexeu = True
                 if (cfg.get("preco_rapido") and self.preco_rapido is not None and self.estado["posicoes"]
-                        and agora() >= prox_rapido):
+                        and agora() >= max(prox_rapido, self._ultimo_ciclo_rapido
+                                           + num(cfg.get("intervalo_preco_rapido_seg"), 3))):
                     try:
                         self.ciclo_rapido()
                     except Exception:
                         log.exception("Erro no ciclo de preco rapido")
                     prox_rapido = agora() + cfg.get("intervalo_preco_rapido_seg", 3)
                     mexeu = True
+                if (cfg.get("percursos_finos") and self.preco_fino is not None and not self.estado["posicoes"]
+                        and agora() >= prox_fino):
+                    try:
+                        self.ciclo_percursos_finos()  # so gravacao; fica guardado no proximo ciclo normal
+                    except Exception:
+                        log.exception("Erro no ciclo de percursos finos")
+                    prox_fino = agora() + max(3, num(cfg.get("percurso_fino_intervalo_seg"), 5))
+                self._atualizar_urgencia_http()
                 if t >= prox_scan:
                     try:
                         self.ciclo_scanner()
@@ -5400,6 +5550,9 @@ def main(argv=None):
             chaves = ler_chaves_locais(pasta)
             if cfg.get("preco_rapido"):
                 bot.preco_rapido = PrecoRapido(chaves["jupiter_api_key"])
+                if cfg.get("percursos_finos"):
+                    # Instancia separada: uma pausa por limite de pedidos aqui nunca trava o preco da posicao aberta.
+                    bot.preco_fino = PrecoRapido(chaves["jupiter_api_key"], timeout=3.0, espera_429_seg=120.0)
             if not bot.telegram.ativo and chaves["telegram_token"] and chaves["telegram_chat_id"]:
                 bot.telegram = Telegram(chaves["telegram_token"], chaves["telegram_chat_id"])
             bot.telegram.em_segundo_plano = True

@@ -46,6 +46,16 @@ O único pedido de escrita é `POST /api/proposta/decisao` (aprovar ou recusar u
 
 Todas as chaves são opcionais. Nunca são registadas no log nem mostradas no Dashboard. Não partilhe este ficheiro.
 
+## Alterações de 15/11/2026 (scan)
+
+Nenhuma destas alterações muda a estratégia (filtros, stop, alvo, trailing, tempo) nem os limites Paper.
+
+- **Stops com prioridade sobre o scanner.** Com uma posição aberta, o scanner cede a vez ao preço rápido entre os seus pedidos e entre análises, e os pedidos HTTP passam a 1 tentativa com `timeout_com_posicao_seg` (4 s). Depois de um 429 o bot não fica parado à espera: salta esse grupo de pedidos durante a pausa.
+- **Avisos Telegram do preço rápido.** Se a posição aberta ficar sem cotação Jupiter (ou sem rota de venda), o bot avisa no Telegram, no máximo 1 vez por minuto por token e por tipo. É só um aviso: não vende por causa disso.
+- **Pontos finos no laboratório (só gravação).** `percursos_finos` grava em `ptsj` o preço de venda Jupiter dos sinais nos primeiros `percurso_fino_minutos` (30), 1 cotação de `percurso_fino_intervalo_seg` em `percurso_fino_intervalo_seg` (5 s) no total, e fica parado enquanto houver posição aberta. O laboratório (`--analisar`) continua a usar apenas `pts`; os pontos finos ficam guardados para uma decisão posterior.
+- **Fonte do preço na observabilidade.** As avaliações de risco feitas com preço Jupiter ficam registadas como `Jupiter+DexScreener` (antes diziam sempre `DexScreener`).
+- **Página pública.** Ligações paradas são largadas ao fim de 15 s e há um teto de 48 ligações em simultâneo.
+
 ## Componentes
 
 - `bot.py` contém o Scanner, o Analista, o Executor Paper, o Risk e a aplicação web.

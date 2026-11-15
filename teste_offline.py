@@ -1073,6 +1073,165 @@ def t_telegram_em_segundo_plano(pasta):
     assert enviados == ["ola"] and not B.Telegram("", "").ativo
 
 
+class _TgFalso:
+    """Telegram de teste: guarda as mensagens em vez de as enviar."""
+    ativo = True
+    em_segundo_plano = False
+
+    def __init__(self):
+        self.msgs = []
+
+    def enviar(self, texto):
+        self.msgs.append(texto)
+
+
+def t_scanner_cede_a_vez_ao_preco_rapido(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    assert bot.ciclo_risco() == 0
+    assert bot.scanner.entre_pedidos == bot._vigiar_posicao_no_scanner
+    bot.preco_rapido = _JupFalso([0.00099] * 9)
+    RELOGIO["t"] += 5
+    bot.scanner.tokens_recentes()                                  # o Scanner cede a vez entre os seus pedidos
+    assert bot.preco_rapido.pedidos == 1
+    RELOGIO["t"] += 5
+    bot.preco_rapido = _JupFalso([0.00099] * 6)
+    assert bot._vigiar_posicao_no_scanner() == 0 and bot.preco_rapido.pedidos == 1  # primeira leitura
+    assert bot._vigiar_posicao_no_scanner() == 0 and bot.preco_rapido.pedidos == 1  # ainda nao passaram 3 s
+    listar("OUTRO")
+    listar("MAIS")
+    RELOGIO["t"] += 5
+    antes = bot.preco_rapido.pedidos
+    bot.ciclo_scanner()
+    assert bot.preco_rapido.pedidos > antes and m in bot.estado["posicoes"]  # leu o preco a meio das analises
+    bot.preco_rapido = _JupFalso([0.0009])                        # -10% durante o scanner (stop de teste: -6%)
+    listar("TERCEIRO")
+    RELOGIO["t"] += 5
+    bot.ciclo_scanner()
+    assert m not in bot.estado["posicoes"]
+    assert any(v["mint"] == m and v["tipo"] == "VENDA" and v["motivo"].startswith("STOP_LOSS") for v in trades(cfg))
+    for aberto in list(bot.estado["posicoes"]):                   # sem posicao aberta nao faz pedidos
+        bot.executor.anular(aberto, "teste")
+    bot.preco_rapido = _JupFalso([0.001])
+    assert bot._vigiar_posicao_no_scanner() == 0 and bot.preco_rapido.pedidos == 0
+
+
+def t_http_urgente_nao_atrasa_os_stops(pasta):
+    bot, cfg = novo_bot(pasta)
+    http = bot.http
+    MERCADO["modo"] = "em_baixo"
+    n = MERCADO["pedidos"]
+    assert http.get_json(B.URL_PERFIS, "perfis") is None and MERCADO["pedidos"] - n == cfg["tentativas"]
+    http.urgente = True
+    n = MERCADO["pedidos"]
+    assert http.get_json(B.URL_PERFIS, "perfis") is None and MERCADO["pedidos"] - n == 1  # sem repeticoes
+    MERCADO["modo"] = "429"
+    n = MERCADO["pedidos"]
+    assert http.get_json(B.URL_PERFIS, "perfis") is None and MERCADO["pedidos"] - n == 1
+    assert http.get_json(B.URL_PERFIS, "perfis") is None and MERCADO["pedidos"] - n == 1  # em pausa: nem pede
+    assert http.get_json(B.URL_BOOSTS, "pares") is None and MERCADO["pedidos"] - n == 2   # outro grupo nao e afetado
+    http.urgente = False
+    MERCADO["modo"] = "ok"
+    assert http.get_json(B.URL_PERFIS, "perfis") == []            # fora do modo urgente a pausa nao se aplica
+    bot._atualizar_urgencia_http()
+    assert bot.http.urgente is False
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    bot._atualizar_urgencia_http()
+    assert bot.http.urgente is True                               # com posicao aberta o Bot liga o modo urgente
+
+
+def t_aviso_telegram_preco_rapido_em_falha(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    simbolo = bot.estado["posicoes"][m]["simbolo"]
+    assert bot.ciclo_risco() == 0
+    bot.telegram = tg = _TgFalso()
+    bot.preco_rapido = _JupFalso([None, None, None])
+    bot.ciclo_rapido()
+    bot.ciclo_rapido()
+    assert len(tg.msgs) == 1 and simbolo in tg.msgs[0] and "timeout" in tg.msgs[0]  # 1 aviso, nao 1 por ciclo
+
+    class _SemRota(_JupFalso):
+        def cotar(self, mint, tokens, preco_ref=None):
+            self.pedidos += 1
+            return {"estado": "erro", "erro": "sem_rota", "sem_rota_seguidas": self.pedidos}
+
+    bot.preco_rapido = _SemRota([])
+    bot.ciclo_rapido()
+    bot.ciclo_rapido()
+    assert len(tg.msgs) == 2 and "rota de VENDA" in tg.msgs[1]    # aviso proprio, logo a seguir ao outro
+    assert m in bot.estado["posicoes"]                            # e so um aviso: nao vende por causa disto
+    bot.preco_rapido = _JupFalso([0.00099])
+    assert bot.ciclo_rapido() == 0 and len(tg.msgs) == 2          # voltou a responder: sem mais avisos
+
+
+def t_percursos_finos_so_gravacao(pasta):
+    bot, cfg = comprar_um(pasta)
+    m = mint_de("BOM")
+    assert m in bot.estado["percursos"] and bot.ciclo_risco() == 0
+    bot.preco_fino = fino = _JupFalso([0.00101, 0.00102, 0.00103])
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 0  # com posicao aberta nao gasta pedidos Jupiter
+    bot.preco_rapido = _JupFalso([0.00099, 0.0009])
+    assert bot.ciclo_rapido() == 0
+    assert [p[1] for p in bot.estado["percursos"][m]["ptsj"]] == [0.99]  # a cotacao da posicao serve de ponto fino
+    assert bot.ciclo_rapido() == 1 and m not in bot.estado["posicoes"]   # stop
+    pc = bot.estado["percursos"][m]
+    assert [p[1] for p in pc["ptsj"]] == [0.99, 0.9] and pc["pts"][0] == [0, 1.0]
+    pts_antes = copy.deepcopy(pc["pts"])
+    assert bot.ciclo_percursos_finos() == 1 and fino.pedidos == 1  # sem posicao: 1 cotacao por chamada
+    pc = bot.estado["percursos"][m]
+    assert [p[1] for p in pc["ptsj"]] == [0.99, 0.9, 1.01] and pc["pts"] == pts_antes  # 'pts' nunca e tocado
+    pc["grupo"] = "controlo"
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # grupo de controlo nao gasta pedidos
+    pc["grupo"] = "sinal"
+    bot.cfg["percursos_finos"] = False
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # desligado no CONFIG
+    bot.cfg["percursos_finos"] = True
+    bot.preco_fino = _JupFalso([None])
+    assert bot.ciclo_percursos_finos() == 0                        # Jupiter falha: nada muda
+    assert len(bot.estado["percursos"][m]["ptsj"]) == 3
+    bot.preco_fino = espera = _JupFalso([0.00105])
+    assert bot.ciclo_percursos_finos() == 0 and espera.pedidos == 0  # ...e nao insiste nos 30 s seguintes
+    RELOGIO["t"] += 31
+    assert bot.ciclo_percursos_finos() == 1 and espera.pedidos == 1
+    assert [p[1] for p in bot.estado["percursos"][m]["ptsj"]] == [0.99, 0.9, 1.01, 1.05]
+    bot.preco_fino = fino
+    avancar(31)
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # passados os 30 minutos deixa de cotar
+    avancar(60)
+    bot.ciclo_risco()                                              # o percurso (90 min nos testes) fecha
+    assert m not in bot.estado["percursos"]
+    with open(cfg["ficheiro_percursos"], encoding="utf-8") as f:
+        linha = json.loads(f.read().splitlines()[-1])
+    assert linha["mint"] == m and linha["pts"][0] == [0, 1.0]
+    assert [p[1] for p in linha["ptsj"]] == [0.99, 0.9, 1.01, 1.05]
+    assert "LABORATORIO" in B.analisar(cfg)                        # o laboratorio continua a ler o ficheiro
+
+
+def t_fonte_do_preco_na_observacao(pasta):
+    bot, cfg = comprar_um(pasta)
+
+    class _Obs:
+        def __init__(self):
+            self.eventos = []
+
+        def record_evaluation(self, evento):
+            self.eventos.append(evento)
+
+        def note_caller_error(self):
+            pass
+
+    original = bot.risco.observability
+    bot.risco.observability = obs = _Obs()
+    try:
+        assert bot.ciclo_risco() == 0 and obs.eventos[-1]["data_source"] == "DexScreener"
+        bot.preco_rapido = _JupFalso([0.00099])
+        assert bot.ciclo_rapido() == 0 and obs.eventos[-1]["data_source"] == "Jupiter+DexScreener"
+    finally:
+        bot.risco.observability = original
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

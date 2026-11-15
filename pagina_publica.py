@@ -16,6 +16,7 @@ import csv
 import json
 import math
 import os
+import sys
 import threading
 import time
 import urllib.request
@@ -286,10 +287,46 @@ atualizar();setInterval(atualizar,10000);
 </html>"""
 
 
+class Servidor(ThreadingHTTPServer):
+    """Servidor publico com um teto de ligacoes em simultaneo.
+
+    A pagina corre na mesma maquina do bot: sem teto, muitas ligacoes lentas vindas da internet
+    podiam gastar a memoria de que o bot precisa. Acima do teto, a ligacao e fechada logo."""
+    daemon_threads = True
+    request_queue_size = 32
+    max_ligacoes = 48
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._vagas = threading.BoundedSemaphore(self.max_ligacoes)
+
+    def process_request(self, request, client_address):
+        if not self._vagas.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._vagas.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._vagas.release()
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return  # o visitante desligou a meio: nao enche o registo do servico
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MemeBotPublico/1.0"
     sys_version = ""
     pasta = "."
+    timeout = 15  # larga ligacoes paradas ou lentas (sem isto ficavam abertas para sempre)
 
     def _enviar(self, codigo, corpo, tipo, csp=None):
         b = corpo if isinstance(corpo, bytes) else corpo.encode("utf-8")
@@ -358,8 +395,7 @@ def main(argv=None):
     ap.add_argument("--pasta", default=os.path.dirname(os.path.abspath(__file__)))
     a = ap.parse_args(argv)
     Handler.pasta = a.pasta
-    srv = ThreadingHTTPServer(("0.0.0.0", a.porta), Handler)
-    srv.daemon_threads = True
+    srv = Servidor(("0.0.0.0", a.porta), Handler)
     print(f"Pagina publica em http://0.0.0.0:{a.porta}  (pasta {a.pasta})", flush=True)
     srv.serve_forever()
 
