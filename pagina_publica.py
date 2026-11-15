@@ -27,7 +27,8 @@ CACHE_SEG = 5
 BOT_URL = "http://127.0.0.1:8000"
 _cache_bot = {"t": 0.0, "estado": None, "pagina": None, "pagina_t": 0.0}
 CAMPOS_REMOVIDOS = ("propostas_paper", "paper_purchase_readiness")
-CHAVES_INTERNAS = {"proposal_id", "session_id", "operation_id", "stop_id"}
+# "carteiras" e "quem": a lista de carteiras seguidas e privada (o bot ja a retira; aqui e a segunda barreira)
+CHAVES_INTERNAS = {"proposal_id", "session_id", "operation_id", "stop_id", "carteiras", "quem"}
 
 
 def _limpar(v):

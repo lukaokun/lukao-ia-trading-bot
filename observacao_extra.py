@@ -174,6 +174,82 @@ def _donos_das_maiores_contas(contas_resp, supply, rpc_url, timeout, opener, max
     return top
 
 
+FICHEIRO_CARTEIRAS = "wallet_watchlist.json"
+MAX_CARTEIRAS = 40
+
+
+def ler_carteiras_seguidas(pasta):
+    """Le wallet_watchlist.json (ficheiro local, ignorado pelo Git): {"wallets": ["endereco", ...]}.
+    Devolve os enderecos validos, sem repetidos (no maximo MAX_CARTEIRAS). Nunca lanca excecoes."""
+    if not pasta:
+        return []
+    try:
+        with open(os.path.join(pasta, FICHEIRO_CARTEIRAS), "r", encoding="utf-8-sig") as f:
+            dados = json.load(f)
+    except (OSError, ValueError, UnicodeError):
+        return []
+    lista = dados.get("wallets") if isinstance(dados, dict) else dados
+    if not isinstance(lista, list):
+        return []
+    carteiras = []
+    for item in lista:
+        endereco = item.strip() if isinstance(item, str) else ""
+        if MINT_RE.fullmatch(endereco) and endereco not in carteiras:
+            carteiras.append(endereco)
+    return carteiras[:MAX_CARTEIRAS]
+
+
+def carteiras_dentro(mint, carteiras, timeout=6.0, opener=None, rpc_url=PUBLIC_RPC_URL, pausa_seg=0.12):
+    """Quantas carteiras seguidas tem este token neste momento (so leitura; 1 pedido RPC por carteira).
+
+    Nao descodifica compras nem vendas: ve apenas o saldo atual de cada carteira neste token.
+    Nao decide nada; fica gravado com o sinal para o laboratorio comparar resultados."""
+    carteiras = list(carteiras or [])[:MAX_CARTEIRAS]
+    out = {"estado": "indisponivel", "n_lista": len(carteiras), "consultadas": 0, "dentro": None,
+           "pct_total": None, "quem": [], "erro": None}
+    if not carteiras:
+        out["estado"] = "sem_lista"
+        return out
+    supply = None
+    resp, erro = _http_json(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply",
+                                      "params": [mint, {"commitment": "confirmed"}]}, timeout=timeout, opener=opener)
+    try:
+        supply = int(resp["result"]["value"]["amount"]) if not erro else None
+    except (KeyError, TypeError, ValueError):
+        supply = None
+    quem, falhas = [], 0
+    for carteira in carteiras:
+        resp, erro = _http_json(rpc_url, {"jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
+                                          "params": [carteira, {"mint": mint},
+                                                     {"encoding": "jsonParsed", "commitment": "confirmed"}]},
+                                timeout=timeout, opener=opener)
+        if erro or not isinstance(resp, dict) or "error" in resp:
+            falhas += 1
+            out["erro"] = erro or "rpc_erro"
+            if falhas >= 3:  # RPC em baixo ou limite de pedidos: nao insiste
+                break
+            continue
+        try:
+            total = sum(int(conta["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+                        for conta in resp["result"]["value"])
+        except (KeyError, TypeError, ValueError):
+            falhas += 1
+            out["erro"] = "resposta_invalida"
+            continue
+        out["consultadas"] += 1
+        if total > 0:
+            quem.append([carteira, round(total / supply * 100, 4) if supply and supply > 0 else None])
+        if pausa_seg and opener is None:
+            time.sleep(pausa_seg)
+    if out["consultadas"] == 0:
+        return out
+    quem.sort(key=lambda x: -(x[1] or 0))
+    pcts = [x[1] for x in quem if x[1] is not None]
+    out.update(estado="ok" if out["consultadas"] == len(carteiras) else "parcial", dentro=len(quem),
+               pct_total=round(sum(pcts), 4) if len(pcts) == len(quem) else None, quem=quem)
+    return out
+
+
 def cotacao_jupiter(mint, valor_usd, preco_ref_usd, decimais, timeout=6.0, opener=None):
     """Cotacao real USDC -> token para o valor da ordem Paper (nao executa nada)."""
     out = {"estado": "indisponivel", "impacto_pct": None, "slippage_real_pct": None,
@@ -227,7 +303,7 @@ def auditar_mint(mint, timeout=6.0, opener=None, rpc_url=PUBLIC_RPC_URL):
 
 
 def observar(mint, valor_usd, preco_ref_usd, slippage_simulado_pct=None, timeout=6.0, opener=None, auditor=None,
-             rpc_url=PUBLIC_RPC_URL, origem_rpc="publico"):
+             rpc_url=PUBLIC_RPC_URL, origem_rpc="publico", carteiras=None):
     """Recolhe as tres observacoes. Nunca lanca excecoes."""
     resultado = {"versao": VERSAO, "observado_utc": _agora_utc(), "modo": "observacao",
                  "slippage_simulado_pct": slippage_simulado_pct, "rpc": origem_rpc}
@@ -250,6 +326,8 @@ def observar(mint, valor_usd, preco_ref_usd, slippage_simulado_pct=None, timeout
     if decimais is None:
         decimais = resultado["holders"].get("decimais")
     resultado["jupiter"] = cotacao_jupiter(mint, valor_usd, preco_ref_usd, decimais, timeout=timeout, opener=opener)
+    if carteiras:  # so quando existe uma lista de carteiras seguidas (wallet_watchlist.json)
+        resultado["carteiras"] = carteiras_dentro(mint, carteiras, timeout=timeout, opener=opener, rpc_url=rpc_url)
     return resultado
 
 
@@ -266,6 +344,9 @@ class ObservadorExtra:
         self._lock = threading.Lock()
         self._dados = {}
         self._em_curso = set()
+        # Pasta onde esta o wallet_watchlist.json; None = sem carteiras seguidas. Lido a cada sinal,
+        # por isso mudar a lista nao obriga a reiniciar o bot.
+        self.pasta_carteiras = None
 
     def pedir(self, mint, valor_usd, preco_ref_usd, slippage_simulado_pct=None):
         if not self.ativo or not isinstance(mint, str):
@@ -283,7 +364,8 @@ class ObservadorExtra:
         try:
             if self._observar is observar:
                 r = observar(mint, valor_usd, preco_ref_usd, slippage_simulado_pct,
-                             rpc_url=self.rpc_url, origem_rpc=self.origem_rpc)
+                             rpc_url=self.rpc_url, origem_rpc=self.origem_rpc,
+                             carteiras=ler_carteiras_seguidas(getattr(self, "pasta_carteiras", None)))
             else:
                 r = self._observar(mint, valor_usd, preco_ref_usd, slippage_simulado_pct)
         except Exception as exc:  # defensivo: observar() ja nao lanca

@@ -54,7 +54,7 @@ import requests
 from early_accumulation import score_acumulacao
 from smart_filters_market import MarketSnapshotRecorder
 from smart_protection_observability import SmartProtectionObservability
-from observacao_extra import ObservadorExtra, configurar_rpc
+from observacao_extra import ObservadorExtra, configurar_rpc, ler_carteiras_seguidas
 from preco_rapido import PrecoRapido, ler_chaves_locais
 from paper_trading_limits import (
     ECB_SOURCE, EcbRateError, MAX_RATE_AGE_DAYS, MAX_OPERATION_EUR, MAX_OPEN_POSITIONS,
@@ -3870,8 +3870,19 @@ class Bot:
         dados = obs.todos()
         if not dados:
             return self.recentes
-        return [dict(r, observacao_extra=dados[r["mint"]]) if isinstance(r, dict) and r.get("mint") in dados else r
+        return [dict(r, observacao_extra=self._observacao_para_o_painel(dados[r["mint"]]))
+                if isinstance(r, dict) and r.get("mint") in dados else r
                 for r in self.recentes]
+
+    @staticmethod
+    def _observacao_para_o_painel(obs):
+        """Copia da observacao sem a lista de carteiras seguidas (privada) nem os donos das contas (volumoso)."""
+        limpa = dict(obs)
+        if isinstance(limpa.get("carteiras"), dict):
+            limpa["carteiras"] = {k: v for k, v in limpa["carteiras"].items() if k != "quem"}
+        if isinstance(limpa.get("holders"), dict):
+            limpa["holders"] = {k: v for k, v in limpa["holders"].items() if k != "top"}
+        return limpa
 
     def registar_analise(self, mint, par, analise):
         """Guarda os ultimos tokens analisados (aprovados ou nao) para o radar e as listas."""
@@ -5408,6 +5419,7 @@ def analisar(cfg):
             L.append(f"    {lo}-{hi}: {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
     L += _secao_controlo(percursos, controlo, atual, cfg)
     L += _secao_caracteristicas(todos, atual, cfg)
+    L += _secao_carteiras(todos, atual, cfg)
     L += _secao_estrategia_post(percursos, todos, cfg)
     L += _secao_por_dia(cfg)
     L += ["", "  COMO LER", "    - 'media' ja inclui os custos simulados (slippage e taxas, a entrada e a saida).",
@@ -5468,6 +5480,47 @@ def _secao_caracteristicas(todos, regra, cfg):
             if g:
                 L.append("  " + _linha_grupo(nome, g, regra, cfg))
     L.append("    Com poucos percursos por faixa (menos de 20) as diferencas ainda sao sobretudo sorte.")
+    return L
+
+
+def _secao_carteiras(todos, regra, cfg):
+    """Carteiras seguidas (wallet_watchlist.json) e donos que se repetem nos sinais. So observacao."""
+    L = ["", "  CARTEIRAS (so observacao: nada disto decide compras)"]
+    com = [pc for pc in todos if obter(pc, "obs", "carteiras", "estado") in ("ok", "parcial")]
+    if com:
+        dentro = lambda pc: int(num(obter(pc, "obs", "carteiras", "dentro")))
+        L.append(f"    Carteiras seguidas: {len(com)} percursos com a lista consultada (aprovados + controlo)")
+        for nome, escolhe in (("nenhuma carteira seguida dentro", lambda pc: dentro(pc) == 0),
+                              ("1 carteira seguida dentro", lambda pc: dentro(pc) == 1),
+                              ("2 ou mais dentro", lambda pc: dentro(pc) >= 2)):
+            grupo = [pc for pc in com if escolhe(pc)]
+            if grupo:
+                L.append(_linha_grupo(nome, grupo, regra, cfg))
+    else:
+        L.append("    Carteiras seguidas: ainda sem dados (wallet_watchlist.json vazio, ou sem sinais desde que existe).")
+    vistos, com_donos = {}, 0
+    for pc in todos:
+        top = obter(pc, "obs", "holders", "top")
+        if not isinstance(top, list):
+            continue
+        com_donos += 1
+        subiu = max(num(p[1]) for p in pc["pts"]) >= 1.5
+        donos = {x[0] for x in top if isinstance(x, list) and len(x) == 2 and isinstance(x[0], str)
+                 and x[0] and x[0] != pc.get("par")}
+        for dono in donos:
+            registo = vistos.setdefault(dono, [0, 0, 0])
+            registo[0] += 1
+            registo[1] += 1 if subiu else 0
+            registo[2] += 1 if pc.get("fim") != "tempo" else 0
+    repetidos = sorted(((d, r) for d, r in vistos.items() if r[0] >= 3),
+                       key=lambda x: (-x[1][1] / x[1][0], -x[1][0], x[0]))
+    L.append(f"    Donos que se repetem entre as maiores contas ({com_donos} percursos com dados; minimo 3 aparicoes):")
+    if not repetidos:
+        L.append("      Ainda nenhum: precisa de mais sinais gravados (os donos sao guardados desde 15/11/2026).")
+    for dono, (n, subiram, rugs) in repetidos[:12]:
+        L.append(f"      {dono:<44} {n:>3} sinais   {subiram:>2} chegaram a +50%   {rugs:>2} acabaram em rug")
+    L += ["    Um dono repetido pode ser uma boa carteira, mas tambem um bot, uma bolsa, a propria DEX ou o criador",
+          "    dos tokens. Com poucas aparicoes e sobretudo sorte: serve para escolher candidatas, nao para copiar."]
     return L
 
 
@@ -5716,6 +5769,9 @@ def main(argv=None):
         bot.obs_extra.ativo = bool(cfg.get("observacao_extra")) and not args.demo
         bot.obs_extra.rpc_url, bot.obs_extra.origem_rpc = configurar_rpc(pasta)
         log.info("Observacao extra: RPC %s", bot.obs_extra.origem_rpc)  # nunca regista a chave
+        if not args.demo:
+            bot.obs_extra.pasta_carteiras = pasta
+            log.info("Carteiras seguidas (wallet_watchlist.json): %d", len(ler_carteiras_seguidas(pasta)))
         if not args.demo:
             chaves = ler_chaves_locais(pasta)
             if cfg.get("preco_rapido"):

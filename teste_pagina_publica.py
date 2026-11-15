@@ -69,6 +69,12 @@ class PaginaPublicaTests(unittest.TestCase):
         self.assertEqual((dados["fechados"], dados["perdas"], dados["total"]), (1, 1, 90.0))
         self.assertNotIn("segredo-interno", corpo.decode("utf-8"))
 
+    def test_lista_de_carteiras_seguidas_nunca_e_publicada(self):
+        estado = {"recentes": [{"mint": "M", "observacao_extra": {"carteiras": {"dentro": 1, "quem": [["W", 1.0]]},
+                                                                  "holders": {"top10_pct": 40.0}}}], "quem": "x"}
+        self.assertEqual(P._limpar(estado),
+                         {"recentes": [{"mint": "M", "observacao_extra": {"holders": {"top10_pct": 40.0}}}]})
+
     def test_caminho_desconhecido_da_404(self):
         self.assertEqual(self._pedido("GET", "/chaves_locais.json")[0], 404)
         self.assertEqual(self._pedido("GET", "/../estado.json")[0], 404)

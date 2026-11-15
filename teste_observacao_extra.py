@@ -90,6 +90,56 @@ class ObservacaoExtraTests(unittest.TestCase):
         antigo = OE.concentracao_holders(MINT, opener=opener_falso(respostas_ok))  # sem enderecos: nem pede
         self.assertEqual((antigo["estado"], antigo["top"]), ("ok", None))
 
+    def test_carteiras_seguidas_lista_e_saldos(self):
+        import os
+        import tempfile
+        c1, c2, c3 = "3" * 31 + "A", "3" * 31 + "B", "3" * 31 + "C"
+        with tempfile.TemporaryDirectory() as pasta:
+            self.assertEqual(OE.ler_carteiras_seguidas(pasta), [])            # sem ficheiro: lista vazia
+            self.assertEqual(OE.ler_carteiras_seguidas(None), [])
+            caminho = os.path.join(pasta, "wallet_watchlist.json")
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump({"wallets": [c1, " " + c2 + " ", c1, "SUBSTITUIR_PELO_ENDERECO_SOLANA_1", 5, c3]}, f)
+            self.assertEqual(OE.ler_carteiras_seguidas(pasta), [c1, c2, c3])  # so validas, sem repetidas
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump({"wallets": ["4" * 31 + chr(65 + i % 8) + "5" * (i // 8) for i in range(60)]}, f)
+            self.assertEqual(len(OE.ler_carteiras_seguidas(pasta)), OE.MAX_CARTEIRAS)
+            with open(caminho, "w", encoding="utf-8") as f:
+                f.write("{isto nao e json")
+            self.assertEqual(OE.ler_carteiras_seguidas(pasta), [])
+        saldos = {c1: ["40"], c2: [], c3: ["5", "5"]}
+
+        def respostas(pedido):
+            corpo = json.loads(pedido.data.decode("utf-8"))
+            if corpo["method"] == "getTokenSupply":
+                return {"result": {"value": {"amount": "1000"}}}
+            if corpo["method"] == "getTokenAccountsByOwner":
+                carteira, filtro, opcoes = corpo["params"]
+                assert filtro == {"mint": MINT} and opcoes["encoding"] == "jsonParsed"
+                return {"result": {"value": [{"account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": a}}}}}}
+                                             for a in saldos[carteira]]}}
+            raise AssertionError(corpo["method"])
+
+        r = OE.carteiras_dentro(MINT, [c1, c2, c3], opener=opener_falso(respostas))
+        self.assertEqual((r["estado"], r["n_lista"], r["consultadas"], r["dentro"]), ("ok", 3, 3, 2))
+        self.assertEqual(r["quem"], [[c1, 4.0], [c3, 1.0]])
+        self.assertEqual(r["pct_total"], 5.0)
+        self.assertEqual(OE.carteiras_dentro(MINT, [])["estado"], "sem_lista")
+        sem_rede = OE.carteiras_dentro(MINT, [c1, c2, c3, c1], opener=opener_falso(lambda p: OSError("sem rede")))
+        self.assertEqual((sem_rede["estado"], sem_rede["consultadas"], sem_rede["dentro"]), ("indisponivel", 0, None))
+        base = OE.observar(MINT, 5.42, 0.005, opener=opener_falso(respostas_ok), auditor=AuditorFalso())
+        self.assertNotIn("carteiras", base)                                  # sem lista: nem consulta
+
+        def tudo(pedido):
+            if pedido.full_url.startswith(OE.JUPITER_QUOTE_URL):
+                return respostas_ok(pedido)
+            metodo = json.loads(pedido.data.decode("utf-8"))["method"]
+            return respostas(pedido) if metodo == "getTokenAccountsByOwner" else respostas_ok(pedido)
+
+        com = OE.observar(MINT, 5.42, 0.005, opener=opener_falso(tudo), auditor=AuditorFalso(), carteiras=[c1, c2])
+        self.assertEqual((com["carteiras"]["estado"], com["carteiras"]["dentro"]), ("ok", 1))
+        self.assertEqual(com["holders"]["top10_pct"], 57.0)
+
     def test_cotacao_jupiter_impacto_e_slippage_real(self):
         r = OE.cotacao_jupiter(MINT, 5.42, 0.005, 6, opener=opener_falso(respostas_ok))
         self.assertEqual(r["estado"], "ok")

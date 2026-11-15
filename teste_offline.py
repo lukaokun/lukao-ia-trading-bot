@@ -1299,6 +1299,48 @@ def t_percurso_grava_par_e_operacoes_por_dia(pasta):
     assert any(l.strip().startswith(dia) and "1 fechadas" in l and " 0 ganhas" in l for l in txt.splitlines())
 
 
+def t_laboratorio_carteiras_e_painel_sem_a_lista(pasta):
+    bot, cfg = novo_bot(pasta)
+    base = {"simbolo": "X", "pontuacao": 80, "preco0": 0.001, "liq0": 50000, "liq_fim": 50000}
+
+    def pc(nome, i, pts, fim, top, dentro=None):
+        d = dict(base, mint=mint_de(nome), ts=1_799_000_000 + i, par="PAR" + nome, fim=fim, pts=pts,
+                 obs={"holders": {"top10_pct": 50.0, "top": top}})
+        if dentro is not None:
+            d["obs"]["carteiras"] = {"estado": "ok", "n_lista": 2, "consultadas": 2, "dentro": dentro, "quem": []}
+        return d
+
+    sobe, cai = [[0, 1.0], [60, 1.8], [5400, 1.6]], [[0, 1.0], [60, 0.5], [120, 0.2]]
+    lista = [pc("CA", 1, sobe, "tempo", [["PARCA", 30.0], ["DonoBom", 5.0], ["DonoMau", 2.0]], dentro=1),
+             pc("CB", 2, sobe, "tempo", [["DonoBom", 4.0], ["DonoMau", 2.0], [None, 1.0]], dentro=2),
+             pc("CC", 3, cai, "rug", [["DonoBom", 3.0], ["DonoMau", 9.0], ["Raro", 1.0]], dentro=0),
+             pc("CD", 4, cai, "rug", [["DonoMau", 8.0], ["PARCD", 20.0]])]
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for x in lista:
+            f.write(json.dumps(x) + "\n")
+    txt = B.analisar(cfg)
+    assert "CARTEIRAS (so observacao" in txt and "3 percursos com a lista consultada" in txt
+    for nome in ("nenhuma carteira seguida dentro", "1 carteira seguida dentro", "2 ou mais dentro"):
+        assert nome in txt
+    linhas = [l.split() for l in txt.splitlines() if "chegaram a +50%" in l and "acabaram em rug" in l]
+    assert [(l[0], l[1], l[3], l[7]) for l in linhas] == [("DonoBom", "3", "2", "1"), ("DonoMau", "4", "2", "2")]
+    assert "PARCA " not in txt and "Raro" not in txt              # a pool e os donos raros nao entram
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        f.write(json.dumps(dict(lista[0], obs={})) + "\n")
+    txt = B.analisar(cfg)
+    assert "Carteiras seguidas: ainda sem dados" in txt and "Ainda nenhum" in txt
+    # O dashboard (e a pagina publica) nunca recebem a lista de carteiras seguidas nem os donos das contas.
+    limpa = B.Bot._observacao_para_o_painel({"holders": {"top10_pct": 1, "top": [["a", 1]]},
+                                             "carteiras": {"dentro": 1, "quem": [["w", 1]]}, "jupiter": {"estado": "ok"}})
+    assert limpa == {"holders": {"top10_pct": 1}, "carteiras": {"dentro": 1}, "jupiter": {"estado": "ok"}}
+    bot.recentes = [{"mint": mint_de("CA")}]
+    bot.obs_extra._dados[mint_de("CA")] = {"carteiras": {"dentro": 1, "quem": [["CarteiraSecreta", 1.0]]},
+                                           "holders": {"top": [["DonoQualquer", 2.0]]}}
+    bot.atualizar_snapshot()
+    assert "CarteiraSecreta" not in bot.snapshot and "DonoQualquer" not in bot.snapshot
+    assert json.loads(bot.snapshot)["recentes"][0]["observacao_extra"]["carteiras"] == {"dentro": 1}
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})
