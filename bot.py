@@ -5521,6 +5521,7 @@ def analisar(cfg):
               "    Se a 2.a metade for muito pior, a regra so 'acertou' por acaso - nao confies nela."]
 
     L += _secao_pontos_finos(percursos, [r for _, r in resultados[:5]], atual, cfg)
+    L += _secao_entrada_adiada(percursos, atual, cfg)
     L += _secao_observacao_extra(percursos, atual, cfg)
     L += ["", "  POR FONTE DE DESCOBERTA (com as regras atuais)"]
     for fonte in ("dexscreener", "geckoterminal"):
@@ -5536,6 +5537,7 @@ def analisar(cfg):
             L.append(f"    {lo}-{hi}: {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
     L += _secao_controlo(percursos, controlo, atual, cfg)
     L += _secao_caracteristicas(todos, atual, cfg)
+    L += _secao_filtros_a_testar(percursos, atual, cfg)
     L += _secao_carteiras(todos, atual, cfg)
     L += _secao_estrategia_post(percursos, todos, cfg)
     L += _secao_por_dia(cfg)
@@ -5597,6 +5599,127 @@ def _secao_caracteristicas(todos, regra, cfg):
             if g:
                 L.append("  " + _linha_grupo(nome, g, regra, cfg))
     L.append("    Com poucos percursos por faixa (menos de 20) as diferencas ainda sao sobretudo sorte.")
+    return L
+
+
+def _top10_sem_pool(pc):
+    """Top 10 de holders sem a conta da pool do par; None se nao der para saber."""
+    top, pool = obter(pc, "obs", "holders", "top"), pc.get("par")
+    validos = [x for x in top if isinstance(x, list) and len(x) == 2] if isinstance(top, list) else []
+    if not pool or not any(x[0] == pool for x in validos):
+        return None
+    return sum(num(x[1]) for x in [x for x in validos if x[0] != pool][:10])
+
+
+def _secao_filtros_a_testar(percursos, regra, cfg):
+    """Hipoteses de filtros aplicadas aos sinais ja gravados. Nenhuma esta ativa no bot."""
+    def f(pc, chave):
+        v = obter(pc, "feat", chave)
+        return num(v, None) if v is not None else None
+
+    def soma_h1(pc):
+        c, v = f(pc, "compras_h1"), f(pc, "vendas_h1")
+        return c + v if c is not None and v is not None else None
+
+    def compras_h1(pc):
+        total = soma_h1(pc)
+        return f(pc, "compras_h1") / total * 100 if total else None
+
+    def teste(valor, minimo=None, maximo=None):
+        def aplica(pc):
+            v = valor(pc)
+            if v is None:
+                return None
+            return (minimo is None or v >= minimo) and (maximo is None or v <= maximo)
+        return aplica
+
+    def autoridades(pc):
+        m = obter(pc, "obs", "mint")
+        if not isinstance(m, dict) or m.get("mint_authority") is None or m.get("freeze_authority") is None:
+            return None
+        return m.get("mint_authority") == "revoked" and m.get("freeze_authority") == "revoked"
+
+    externos = [
+        ("liquidez >= $25.000", teste(lambda pc: num(pc.get("liq0")) or None, 25000)),
+        ("idade 15 a 90 min", teste(lambda pc: f(pc, "idade_min"), 15, 90)),
+        ("market cap $50k a $1,5M", teste(lambda pc: f(pc, "fdv"), 50000, 1500000)),
+        ("volume 1h >= $15.000", teste(lambda pc: f(pc, "vol_h1"), 15000)),
+        ("transacoes 1h >= 50", teste(soma_h1, 50)),
+        ("subida 1h <= 80%", teste(lambda pc: f(pc, "h1"), None, 80)),
+        ("subida 5 min <= 40%", teste(lambda pc: f(pc, "m5"), None, 40)),
+    ]
+
+    def todos_juntos(pc):
+        r = [t(pc) for _, t in externos]
+        return None if any(x is None for x in r) else all(r)
+
+    testes = externos + [
+        ("os 7 de cima juntos", todos_juntos),
+        ("compras 1h <= 80%", teste(compras_h1, None, 80)),
+        ("pontuacao 70 a 79", teste(lambda pc: num(pc.get("pontuacao"), None), 70, 79)),
+        ("top10 sem a pool <= 40%", teste(_top10_sem_pool, None, 40)),
+        ("mint e freeze revogadas", autoridades),
+    ]
+    L = ["", f"  FILTROS A TESTAR (hipoteses; NENHUM esta ativo no bot) - {len(percursos)} sinais aprovados, regras atuais"]
+    for nome, aplica in testes:
+        resultados = [(pc, aplica(pc)) for pc in percursos]
+        ficam = [pc for pc, r in resultados if r is True]
+        saem = [pc for pc, r in resultados if r is False]
+        if not ficam and not saem:
+            L.append(f"    {nome:<26} ainda sem dados")
+            continue
+        partes = []
+        for rotulo, grupo in (("ficam", ficam), ("saem", saem)):
+            if grupo:
+                media, acerto = _medir(grupo, regra, cfg)
+                partes.append(f"{rotulo} {len(grupo):>3}: media {media:+7.2f}%  acerto {acerto:5.1f}%")
+            else:
+                partes.append(f"{rotulo}   0" + " " * 35)
+        L.append(f"    {nome:<26} " + "   |   ".join(partes))
+    L += ["    Um filtro so ajuda se os que FICAM forem claramente melhores do que os que SAEM, com dezenas de",
+          "    sinais de cada lado. Com poucos sinais, estas diferencas sao sobretudo sorte."]
+    return L
+
+
+def repetir_entrada_adiada(pc, regra, cfg, espera_seg, queda_max_pct):
+    """Laboratorio: em vez de comprar no sinal, espera `espera_seg` e so entra se o preco real (ponto fino)
+    nao tiver caido mais de `queda_max_pct` face ao preco do sinal. Devolve (estado, resultado em % ou None),
+    com estado "entrou", "evitada" ou "sem_dados" (sem ponto fino perto do fim da espera)."""
+    serie = _serie_fina(pc)
+    idx = next((i for i, p in enumerate(serie) if p[2] and p[0] >= espera_seg), None)
+    if idx is None or idx >= len(serie) - 1:
+        return "sem_dados", None
+    seg0, rel0, _ = serie[idx]
+    if seg0 > espera_seg + 60 or rel0 <= 0:
+        return "sem_dados", None
+    if rel0 < 1 - queda_max_pct / 100.0:
+        return "evitada", None
+    nova = [(0, 1.0, True)] + [(s - seg0, r / rel0, fino) for s, r, fino in serie[idx + 1:]]
+    return "entrou", repetir_serie(pc, nova, regra, cfg)[0]
+
+
+def _secao_entrada_adiada(percursos, regra, cfg):
+    """Esperar uns minutos antes de entrar ajudava? So nos percursos com pontos finos."""
+    com = [pc for pc in percursos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    L = ["", f"  ENTRADA ADIADA (hipotese; o bot NAO faz isto) - {len(com)} percursos com pontos finos, regras atuais"]
+    if not com:
+        return L + ["    Ainda sem dados: precisa de percursos com pontos finos."]
+    imediato = {id(pc): repetir_serie(pc, _serie_fina(pc), regra, cfg)[0] for pc in com}
+    media = lambda valores: sum(valores) / len(valores)
+    L.append(f"    entrar logo no sinal (referencia)      {len(com):>3} entradas   media {media(list(imediato.values())):+7.2f}%")
+    for espera, queda in ((60, 5), (120, 5), (180, 5), (300, 5), (180, 0), (180, 100)):
+        r = [(pc, *repetir_entrada_adiada(pc, regra, cfg, espera, queda)) for pc in com]
+        entrou = [x[2] for x in r if x[1] == "entrou"]
+        evitadas = [imediato[id(x[0])] for x in r if x[1] == "evitada"]
+        sem = sum(1 for x in r if x[1] == "sem_dados")
+        condicao = ("sem condicao" if queda >= 100 else "se nao caiu" if queda == 0 else f"se caiu menos de {queda}%")
+        linha = f"    esperar {espera // 60} min, {condicao:<21} {len(entrou):>3} entradas"
+        linha += f"   media {media(entrou):+7.2f}%" if entrou else "   media     -   "
+        linha += f"   | evitadas {len(evitadas)}" + (f" (dariam {media(evitadas):+.2f}% entrando logo)" if evitadas else "")
+        L.append(linha + (f"   | sem dados {sem}" if sem else ""))
+    L += ["    'evitadas' = sinais em que nao se entrava; entre parenteses, o que deram a quem entrou logo.",
+          "    O preco de entrada adiada e o de VENDA no Jupiter (um pouco abaixo do de compra): resultado algo otimista.",
+          "    Adiar so ajuda se as entradas ficarem melhores E as evitadas forem as mas. Com poucos percursos e sorte."]
     return L
 
 
@@ -5866,15 +5989,15 @@ def main(argv=None):
         pass
     if args.sem_limpar:
         cfg["limpar_ecra"] = False
+    if args.analisar:  # so leitura dos percursos gravados: pode correr com o bot ligado
+        print(analisar(cfg))
+        return 0
     process_lock = ProcessInstanceLock(cfg["ficheiro_estado"])
     if not process_lock.acquire():
         print("Outra instancia ja esta a operar este estado Paper Trading; arranque cancelado.")
         return 2
     bot = None
     try:
-        if args.analisar:
-            print(analisar(cfg))
-            return 0
         config_path = os.path.join(pasta, "config_operacoes.json")
         aplicar_config_operacional(cfg, config_path)
         configurar_log(cfg)

@@ -1393,6 +1393,60 @@ def t_mensagens_telegram_legiveis(pasta):
     assert bot2.ciclo_risco() == 1 and not bot2.estado["posicoes"]                   # venda feita apesar do aviso falhar
 
 
+def t_laboratorio_filtros_a_testar_e_entrada_adiada(pasta):
+    bot, cfg = novo_bot(pasta)
+    regra = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"], cfg["trailing_distancia_pct"],
+             cfg["tempo_maximo_min"])
+    sobe, cai = [[0, 1.0], [60, 1.1], [600, 1.3], [5400, 1.3]], [[0, 1.0], [60, 0.8], [120, 0.3]]
+
+    def pc(nome, i, pts, fim, liq, idade, pontuacao, **extra):
+        return dict({"mint": mint_de(nome), "simbolo": nome, "pontuacao": pontuacao, "ts": 1_799_000_000 + i,
+                     "preco0": 0.001, "liq0": liq, "liq_fim": 1000 if fim == "rug" else liq, "fim": fim, "pts": pts,
+                     "feat": {"idade_min": idade, "fdv": 200000, "vol_h1": 20000, "compras_h1": 60, "vendas_h1": 40,
+                              "h1": 30, "m5": 5}}, **extra)
+
+    bom = pc("FA", 1, sobe, "tempo", 40000, 30, 75, ptsj=[[30, 1.0], [60, 1.02], [90, 1.05], [300, 1.2]])
+    mau = pc("FB", 2, cai, "rug", 16000, 200, 85, ptsj=[[30, 0.95], [60, 0.8], [90, 0.5]])
+    sem = pc("FC", 3, cai, "rug", 30000, 20, 90)
+    sem["feat"] = None                                            # percurso antigo, sem caracteristicas
+    # entrada adiada, caso a caso
+    assert B.repetir_entrada_adiada(sem, regra, cfg, 60, 5) == ("sem_dados", None)       # sem pontos finos
+    assert B.repetir_entrada_adiada(mau, regra, cfg, 60, 5) == ("evitada", None)         # ja tinha caido 20%
+    estado, valor = B.repetir_entrada_adiada(bom, regra, cfg, 60, 5)
+    assert estado == "entrou" and valor is not None
+    assert B.repetir_entrada_adiada(mau, regra, cfg, 60, 100)[0] == "entrou"             # sem condicao entra sempre
+    assert B.repetir_entrada_adiada(bom, regra, cfg, 1000, 5) == ("sem_dados", None)     # espera maior do que os dados
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for x in (bom, mau, sem):
+            f.write(json.dumps(x) + "\n")
+    txt = B.analisar(cfg)
+    linhas = {l.strip()[:26].strip(): l for l in txt.splitlines()}
+    assert "FILTROS A TESTAR (hipoteses; NENHUM esta ativo no bot) - 3 sinais" in txt
+    liq = linhas["liquidez >= $25.000"]
+    assert "ficam   2:" in liq and "saem   1:" in liq                                    # FA e FC ficam; FB sai
+    idade = linhas["idade 15 a 90 min"]
+    assert "ficam   1:" in idade and "saem   1:" in idade                                # FC nao tem dados: nao conta
+    assert "ficam   1:" in linhas["os 7 de cima juntos"] and "saem   1:" in linhas["os 7 de cima juntos"]
+    assert "ficam   1:" in linhas["pontuacao 70 a 79"] and "saem   2:" in linhas["pontuacao 70 a 79"]
+    assert "ainda sem dados" in linhas["top10 sem a pool <= 40%"] and "ainda sem dados" in linhas["mint e freeze revogadas"]
+    assert "ENTRADA ADIADA (hipotese; o bot NAO faz isto) - 2 percursos com pontos finos" in txt
+    um = next(l for l in txt.splitlines() if "esperar 1 min, se caiu menos de 5%" in l)
+    assert "  1 entradas" in um and "evitadas 1 (dariam" in um
+    assert "esperar 3 min, sem condicao" in txt
+    # o --analisar funciona com o bot a correr (so leitura; nao pede o lock de instancia unica)
+    import contextlib
+    import io
+    trinco = B.ProcessInstanceLock(os.path.join(os.path.dirname(os.path.abspath(B.__file__)), B.CONFIG["ficheiro_estado"]))
+    assert trinco.acquire()
+    try:
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            codigo = B.main(["--analisar"])
+        assert codigo == 0 and "LABORATORIO" in saida.getvalue()
+    finally:
+        trinco.release()
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})
