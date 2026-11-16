@@ -1341,6 +1341,58 @@ def t_laboratorio_carteiras_e_painel_sem_a_lista(pasta):
     assert json.loads(bot.snapshot)["recentes"][0]["observacao_extra"]["carteiras"] == {"dentro": 1}
 
 
+def t_mensagens_telegram_legiveis(pasta):
+    bot, cfg = novo_bot(pasta)
+    bot.telegram = tg = _TgFalso()
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    m = mint_de("BOM")
+    simbolo = bot.estado["posicoes"][m]["simbolo"]
+    proposta = next(x for x in tg.msgs if "NOVA PROPOSTA" in x)
+    assert proposta.startswith("🔔 [PAPER] NOVA PROPOSTA — $" + simbolo) and "(mínimo 70)" in proposta
+    assert "Liquidez: $60,000 · Market cap: $400,000" in proposta and "Idade: 60 min" in proposta
+    assert "⏳ Expira em 90 segundos." in proposta and proposta.endswith("https://dexscreener.com/solana/" + m)
+    compra = next(x for x in tg.msgs if "COMPRA" in x)
+    assert compra.startswith("🟢 [PAPER] COMPRA — $" + simbolo) and "Preço de entrada: $0.00" in compra
+    assert "Saídas: stop -6% · alvo +25% · trailing 10/8 · máximo 60 min" in compra
+    mexer("BOM", preco=0.0009)
+    assert bot.ciclo_risco() == 1
+    venda = tg.msgs[-1]
+    assert venda.startswith("🔴 [PAPER] VENDA — $" + simbolo) and "Resultado: -$" in venda
+    assert "Motivo: stop-loss (preço a -10.0%)" in venda and "Carteira: $" in venda
+    for tecnico, legivel in (("TRAILING +15.8% (pico +36.3%)", "trailing stop (saiu a +15.8%; pico +36.3%)"),
+                             ("TAKE_PROFIT +101.2%", "alvo atingido (preço a +101.2%)"),
+                             ("TEMPO 120min (+3.0%)", "tempo máximo (120 min; preço a +3.0%)"),
+                             ("RUG liquidez $2,475", "possível rug: liquidez $2,475"),
+                             ("RUG preco caiu 55% de repente", "possível rug: preço caiu 55% de repente"),
+                             ("outra coisa", "outra coisa"), ("", "—")):
+        assert B.motivo_legivel(tecnico) == legivel, tecnico
+    assert B.texto_venda("X", "TRAILING +15.8% (pico +36.3%)", 0.49, 8.9, 1.7, 79.2).startswith("✅ [PAPER] VENDA — $X\nResultado: +$0.49 (+8.9%)")
+    assert B.texto_venda("X", "RUG liquidez $2,475", -11.68, -97.3, 0.4, 68.0).startswith("⚠️ [PAPER] VENDA")
+    assert "Duração: menos de 1 min" in B.texto_venda("X", "STOP_LOSS -12.0%", -1.0, -18.0, 0.4, 68.0)
+    sem_dados = B.texto_proposta(cfg, "X", "mint invalido", 80, "5.526", None)
+    assert "Valor a simular: $5.53" in sem_dados and "Liquidez" not in sem_dados and "dexscreener" not in sem_dados
+    resumo = bot.resumo_telegram()
+    assert resumo.startswith("📊 [PAPER] RESUMO\nCarteira: $") and "Fechadas: 1 · 0 ganhas · 1 perdidas (0%)" in resumo
+    assert "Posição aberta: nenhuma" in resumo and "tokens analisados" in resumo and "====" not in resumo
+    assert bot._texto_estado_bot("▶️", "iniciado").startswith("▶️ [PAPER] Bot iniciado · carteira $")
+    assert bot._texto_estado_bot("▶️", "iniciado").endswith("sem posição aberta")
+    assert all("[PAPER]" in x for x in tg.msgs)                   # nunca se confunde com dinheiro real
+    assert B.texto_compra({}, "X", m, "5.526", 0.0000565, None, 0).startswith("🟢 [PAPER] COMPRA — $X\nValor: $5.53")
+    assert "Saídas" not in B.texto_compra({}, "X", m, 5, 0.001, 80, 0) and "mínimo" not in B.texto_proposta({}, "X", m, 80, 5, {})
+
+    class _TgAvariado(_TgFalso):
+        def enviar(self, texto):
+            raise RuntimeError("telegram em baixo")
+
+    bot2, cfg2 = novo_bot(pasta)
+    bot2.telegram = _TgAvariado()
+    listar("BOM")
+    assert bot2.ciclo_scanner() == 1 and mint_de("BOM") in bot2.estado["posicoes"]   # compra feita apesar do aviso falhar
+    mexer("BOM", preco=0.0009)
+    assert bot2.ciclo_risco() == 1 and not bot2.estado["posicoes"]                   # venda feita apesar do aviso falhar
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

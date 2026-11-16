@@ -184,6 +184,10 @@ canvas.cv{display:block;width:100%}
 .cl .p{background:rgba(var(--vd-rgb),.14);color:var(--vd)}.cl .x{background:rgba(var(--vm-rgb),.14);color:var(--vm)}.cl .n{background:rgba(255,255,255,.05);color:var(--mut)}
 .cl em{margin-left:auto;font-style:normal;font-size:9.5px;color:var(--mut)}
 .motivo{padding:10px 12px;border:1px solid var(--lin);border-left:3px solid var(--k);border-radius:8px;font:500 11.5px var(--mono);background:rgba(255,255,255,.02)}
+.rl-tit{font:700 13px var(--mono);color:var(--txt)}.rl-tit small{display:block;margin:3px 0 8px;font:500 10.5px var(--mono);color:var(--txt3)}
+.rl{padding:8px 0 7px;border-top:1px dashed rgba(var(--tq2-rgb),.12)}.rl-c{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font:600 11.5px var(--mono);color:var(--txt2)}.rl-c b{font-weight:700;white-space:nowrap;color:var(--txt)}
+.rl-b{height:4px;margin:6px 0 5px;border-radius:3px;background:rgba(255,255,255,.08);overflow:hidden}.rl-b i{display:block;height:100%;border-radius:3px;background:var(--k)}
+.rl-x{font:500 10.5px var(--mono);color:var(--txt3)}.rl-n{margin-top:8px;padding-top:7px;border-top:1px dashed rgba(var(--tq2-rgb),.12);font:500 10px var(--mono);color:var(--mut)}
 .hist{display:grid;gap:0;padding-left:8px}
 .hi{position:relative;padding:0 0 10px 16px;border-left:1px solid var(--lin2);font:500 10.5px var(--mono)}
 .hi::before{content:"";position:absolute;left:-5px;top:3px;width:9px;height:9px;border-radius:50%;background:var(--k);box-shadow:0 0 8px var(--k)}
@@ -694,6 +698,26 @@ const gav=$('gaveta'),veu=$('veu');let gavId=null,gavCh=null;
 function abrir(id){const t=tokens.get(id);if(!t)return;gavId=id;gavCh=null;V.sel=id;esconderTip();renderGaveta(t);gav.classList.add('on');veu.classList.add('on');gav.setAttribute('aria-hidden','false')}
 function fecharGaveta(){gav.classList.remove('on');veu.classList.remove('on');gav.setAttribute('aria-hidden','true');gavId=null;V.sel=null}
 veu.onclick=fecharGaveta;addEventListener('keydown',e=>{if(e.key==='Escape'){if($('al-wrap').classList.contains('on'))fecharAlerta();else if(LV.aberto)fecharLive();else fecharGaveta()}});
+const RL_MAX={liquidez:20,'mcap/liq':10,idade:10,volume:20,compras:20,momento:5,acumulacao:5,rugcheck:10};
+function resultadoLegivel(txt){const caixa=el('div','motivo'),m=/^(APROVADO|REPROVADO) (\d+)\/100 \[([^\]]*)\]\s*(.*)$/.exec(String(txt||''));
+ if(!m){caixa.textContent=txt||'—';return caixa}
+ const pts={},f={};m[3].split(/\s+/).forEach(p=>{const i=p.lastIndexOf('=');if(i>0&&p.slice(i+1)!==''&&isFinite(+p.slice(i+1)))pts[p.slice(0,i)]=+p.slice(i+1)});
+ m[4].split(/\s+/).forEach(p=>{const i=p.indexOf('=');if(i>0)f[p.slice(0,i)]=p.slice(i+1)});
+ const ac=/^([^()]+)\(([\d.]+)\/10\)$/.exec(f.acumulacao||''),mi=parseInt(f.idade,10),rc=f.rugcheck;
+ const idade=isFinite(mi)?(mi<120?mi+' minutos desde que o par foi criado':(mi/60).toLocaleString('pt-PT',{maximumFractionDigits:1})+' horas desde que o par foi criado'):null;
+ const linhas=[['liquidez','Liquidez da pool',f.liq?f.liq+' disponíveis para negociar':null],
+  ['mcap/liq','Tamanho face à liquidez',f.mcap?'Market cap de '+f.mcap:null],
+  ['idade','Idade do par',idade],
+  ['volume','Volume negociado',f.vol1h?f.vol1h+' na última hora':null],
+  ['compras','Pressão compradora',f.compras1h?f.compras1h+' das transações da última hora foram compras':null],
+  ['momento','Momento do preço',f.m5&&f.h1?f.m5+' em 5 minutos · '+f.h1+' em 1 hora':null],
+  ['acumulacao','Acumulação',ac?ac[1].charAt(0).toUpperCase()+ac[1].slice(1)+' ('+ac[2]+' em 10)':null],
+  ['rugcheck','RugCheck (segurança)',rc==null?null:rc!==''&&isFinite(+rc)?'Risco '+rc+' em 100 (quanto mais baixo, melhor)':'Não consultado']];
+ const minimo=typeof D!=='undefined'&&D&&isFinite(+D.minimo)?+D.minimo:null,tit=el('div','rl-tit',(m[1]==='APROVADO'?'Aprovado':'Reprovado')+' com '+m[2]+' pontos em 100');
+ tit.append(el('small',null,minimo!=null?'Mínimo para gerar sinal: '+minimo+' pontos. Cada linha mostra os pontos ganhos e o máximo possível.':'Cada linha mostra os pontos ganhos e o máximo possível.'));caixa.append(tit);
+ linhas.forEach(([k,nome,expl])=>{if(!(k in pts))return;const max=RL_MAX[k],r=el('div','rl'),c=el('div','rl-c'),b=el('div','rl-b'),i=el('i');
+  c.append(el('span',null,nome),el('b',null,pts[k]+' / '+max));i.style.width=Math.max(0,Math.min(100,pts[k]/max*100))+'%';b.append(i);r.append(c,b);if(expl)r.append(el('div','rl-x',expl));caixa.append(r)});
+ caixa.append(el('div','rl-n','Os pontos são arredondados, por isso a soma pode diferir 1 ponto do total.'));return caixa}
 function renderGaveta(t){const ch=JSON.stringify([t.cat,t.rot,t.score,t.preco,t.liq,t.var,t.motivo,t.hist.length,t.crit.length,(t.o||{}).observacao_extra||null]);if(ch===gavCh)return;const novo=gavCh===null;gavCh=ch;const k=COR[t.cat],o=t.o||{};gav.style.setProperty('--k',k);gav.replaceChildren();
  const h=el('div','gv-h'),av=el('div','av');av.style.setProperty('--k',k);if(t.img){const im=el('img');im.alt='';im.referrerPolicy='no-referrer';im.src=t.img;im.onerror=()=>{im.remove();av.textContent=t.sim.slice(0,3)};av.append(im)}else av.textContent=t.sim.slice(0,3);
  const tt=el('div');tt.append(el('h2',null,'$'+t.sim),el('small',null,t.nome||'—'));const x=el('button','fechar','✕');x.setAttribute('aria-label','Fechar detalhes');x.onclick=fecharGaveta;h.append(av,tt,x);
@@ -705,7 +729,7 @@ function renderGaveta(t){const ch=JSON.stringify([t.cat,t.rot,t.score,t.preco,t.
  if(o.blocking_criterion){const b=o.blocking_criterion;extras.push('Primeiro bloqueio: '+(b.name||b.id||'—')+' · observado: '+(b.observed??'—'))}
  if(Array.isArray(o.missing_fields)&&o.missing_fields.length)extras.push('Dados indisponíveis: '+o.missing_fields.join(', '));if(Array.isArray(o.invalid_fields)&&o.invalid_fields.length)extras.push('Dados inválidos: '+o.invalid_fields.join(', '));
  if(o.technical_error)extras.push('Erro técnico: '+(o.technical_error.message||o.technical_error.type||'—'));
- const mt=el('div','motivo',t.motivo);const cl=el('div');if(!t.crit.length)cl.append(el('div','cl',t.cat==='analise'?'Análise em curso…':'Sem critérios publicados.'));
+ const mt=resultadoLegivel(t.motivo);const cl=el('div');if(!t.crit.length)cl.append(el('div','cl',t.cat==='analise'?'Análise em curso…':'Sem critérios publicados.'));
  t.crit.forEach(c=>{if(!c)return;const s=c.status==='passed'?'p':c.status==='rejected'?'x':c.status==='pending_data'?'w':'n';const r=el('div','cl');r.append(el('i',s,s==='p'?'✓':s==='x'?'✕':s==='w'?'…':'–'),el('span',null,c.name||c.id||'—'),el('em',null,s==='p'?'passou':s==='x'?'bloqueou':s==='w'?'dados pendentes':'não avaliado'));if(c.reason)r.title=String(c.reason);cl.append(r)});
  const hs=el('div','hist');t.hist.slice().reverse().forEach(e=>{const r=el('div','hi');r.style.setProperty('--k',COR[e.e]);r.append(el('small',null,new Date(e.t).toLocaleTimeString('pt-PT')),e.txt);hs.append(r)});
  const sec=s=>el('div','gv-sec',s),lk=el('a','link-ext','Ver na DexScreener ↗');lk.href='https://dexscreener.com/solana/'+encodeURIComponent(t.id);lk.target='_blank';lk.rel='noopener noreferrer';

@@ -373,6 +373,92 @@ class Telegram:
             log.warning("Telegram falhou: %s", type(e).__name__)
 
 
+# ---------------------------------------------------------------------------
+# Textos das mensagens do Telegram (so texto: nao decidem nem alteram nada)
+# ---------------------------------------------------------------------------
+def _link_dexscreener(mint):
+    return f"https://dexscreener.com/solana/{mint}" if isinstance(mint, str) and MINT_VALIDO.fullmatch(mint) else ""
+
+
+def motivo_legivel(motivo):
+    """Traduz o motivo tecnico de uma venda (ex.: 'STOP_LOSS -17.0%') para uma frase curta."""
+    m = str(motivo or "").strip()
+    x = re.match(r"STOP_LOSS ([+-][\d.]+)%", m)
+    if x:
+        return f"stop-loss (preço a {x.group(1)}%)"
+    x = re.match(r"TAKE_PROFIT ([+-][\d.]+)%", m)
+    if x:
+        return f"alvo atingido (preço a {x.group(1)}%)"
+    x = re.match(r"TRAILING ([+-][\d.]+)% \(pico ([+-][\d.]+)%\)", m)
+    if x:
+        return f"trailing stop (saiu a {x.group(1)}%; pico {x.group(2)}%)"
+    x = re.match(r"TEMPO (\d+)min \(([+-][\d.]+)%\)", m)
+    if x:
+        return f"tempo máximo ({x.group(1)} min; preço a {x.group(2)}%)"
+    if m.startswith("RUG"):
+        return "possível rug: " + m[3:].strip().replace("preco", "preço")
+    return m or "—"
+
+
+def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90):
+    par = par if isinstance(par, dict) else {}
+    minimo = cfg.get("pontuacao_minima")
+    L = [f"🔔 [PAPER] NOVA PROPOSTA — ${simbolo}",
+         f"Pontuação: {pontuacao}/100" + (f" (mínimo {num(minimo):.0f})" if minimo is not None else ""),
+         f"Valor a simular: ${num(valor_usd):.2f}", ""]
+    liq, mcap = num(obter(par, "liquidity", "usd")), num(par.get("marketCap")) or num(par.get("fdv"))
+    partes = ([f"Liquidez: ${liq:,.0f}"] if liq > 0 else []) + ([f"Market cap: ${mcap:,.0f}"] if mcap > 0 else [])
+    if partes:
+        L.append(" · ".join(partes))
+    criado = num(par.get("pairCreatedAt"))
+    compras, vendas = num(obter(par, "txns", "h1", "buys")), num(obter(par, "txns", "h1", "sells"))
+    partes = []
+    if criado > 0:
+        minutos = max(0.0, (agora() - criado / 1000.0) / 60.0)
+        partes.append("Idade: " + (f"{minutos:.0f} min" if minutos < 120 else f"{minutos / 60:.1f} h"))
+    if compras + vendas > 0:
+        partes.append(f"Compras na última hora: {compras / (compras + vendas) * 100:.0f}%")
+    if partes:
+        L.append(" · ".join(partes))
+    partes = [f"{num(v):+.0f}% em {nome}" for v, nome in ((obter(par, "priceChange", "m5"), "5 min"),
+                                                         (obter(par, "priceChange", "h1"), "1 h")) if v is not None]
+    if partes:
+        L.append("Preço: " + " · ".join(partes))
+    L += ["", f"⏳ Expira em {segundos} segundos.", "Aprova ou recusa no dashboard privado."]
+    link = _link_dexscreener(mint)
+    return "\n".join(L + ([link] if link else []))
+
+
+def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquidez):
+    saidas = []
+    if cfg.get("stop_loss_pct") is not None:
+        saidas.append(f"stop {num(cfg['stop_loss_pct']):.0f}%")
+        saidas.append(f"alvo +{num(cfg['take_profit_pct']):.0f}%" if cfg.get("take_profit_pct") else "sem alvo fixo")
+        saidas.append(f"trailing {num(cfg['trailing_ativar_pct']):.0f}/{num(cfg.get('trailing_distancia_pct')):.0f}"
+                      if cfg.get("trailing_ativar_pct") else "sem trailing")
+        if cfg.get("tempo_maximo_min"):
+            saidas.append(f"máximo {num(cfg['tempo_maximo_min']):.0f} min")
+    L = [f"🟢 [PAPER] COMPRA — ${simbolo}",
+         f"Valor: ${num(valor_usd):.2f} · Pontuação: {pontuacao}/100",
+         f"Preço de entrada: ${preco_txt(preco_entrada)}"]
+    if num(liquidez) > 0:
+        L.append(f"Liquidez: ${num(liquidez):,.0f}")
+    if saidas:
+        L.append("Saídas: " + " · ".join(saidas))
+    link = _link_dexscreener(mint)
+    return "\n".join(L + ([link] if link else []))
+
+
+def texto_venda(simbolo, motivo, pnl, pnl_pct, duracao_min, carteira):
+    icone = "⚠️" if str(motivo or "").startswith("RUG") else "✅" if pnl > 0 else "🔴"
+    duracao = "menos de 1 min" if duracao_min < 1 else f"{duracao_min:.0f} min"
+    return "\n".join([f"{icone} [PAPER] VENDA — ${simbolo}",
+                      f"Resultado: {'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({pnl_pct:+.1f}%)",
+                      f"Motivo: {motivo_legivel(motivo)}",
+                      f"Duração: {duracao}",
+                      f"Carteira: ${num(carteira):.2f}"])
+
+
 # ============================================================================
 # Leitura dos pares da DexScreener (partilhado pelo Scanner e pelo Risco)
 # ============================================================================
@@ -1947,10 +2033,11 @@ class Executor:
         self.bot.acao(f"COMPRA {simbolo} debito=${plan_fields['debit_total_usd']} "
                       f"preco_efetivo=${plan_fields['effective_price_usd']} "
                       f"(pontuacao {analise['pontuacao']})")
-        self.bot.telegram.enviar(
-            f"[PAPER] COMPRA {simbolo}\nValor: ${plan_fields['debit_total_usd']}\n"
-            f"Preco efetivo: ${plan_fields['effective_price_usd']}\n"
-            f"Pontuacao: {analise['pontuacao']}/100\nLiquidez: ${liq:,.0f}\n{pos['url']}")
+        try:  # o aviso nunca pode estragar uma compra que ja ficou registada
+            self.bot.telegram.enviar(texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
+                                                  analise.get("pontuacao"), liq))
+        except Exception:
+            log.warning("Aviso de compra por Telegram falhou")
         return pos
 
     def anular(self, mint, motivo):
@@ -2014,9 +2101,10 @@ class Executor:
             }
             self.bot.paper_operations.commit(e, candidato, linha, "SELL")
         self.bot.acao(f"VENDA {pos['simbolo']} [{motivo}] P&L ${pnl:+.2f} ({pnl_pct:+.1f}%)")
-        self.bot.telegram.enviar(
-            f"[PAPER] VENDA {pos['simbolo']}\nMotivo: {motivo}\nP&L: ${pnl:+.2f} ({pnl_pct:+.1f}%)\n"
-            f"Duracao: {duracao:.0f} min\nSaldo: ${e['saldo']:.2f}")
+        try:  # o aviso nunca pode estragar uma venda que ja ficou registada
+            self.bot.telegram.enviar(texto_venda(pos["simbolo"], motivo, pnl, pnl_pct, duracao, e["saldo"]))
+        except Exception:
+            log.warning("Aviso de venda por Telegram falhou")
         return pnl
 
 
@@ -4382,9 +4470,8 @@ class Bot:
             log.info("PROPOSTA PAPER %s %s valor=$%.4f score=%s expira em 90s",
                      proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"], proposta["score"])
             try:
-                self.telegram.enviar(
-                    f"[PAPER] NOVA PROPOSTA: {proposta['symbol']} - pontuacao {proposta['score']} - "
-                    f"${num(proposta['amount_usd']):.2f}\nAbre o dashboard para aprovar ou recusar (expira em 90 s).")
+                self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
+                                                    proposta["amount_usd"], par))
             except Exception:
                 log.warning("Aviso de proposta por Telegram falhou")
             if not self._registar_auditoria_aprovacao("proposed", proposta):
@@ -4601,11 +4688,11 @@ class Bot:
             self._avisos_tg_rapido[chave] = agora()
             simbolo = pos.get("simbolo") or "?"
             if erro == "sem_rota":
-                texto = (f"[PAPER] ALERTA {simbolo}: o Jupiter deixou de ter rota de VENDA (possivel rug). "
-                         "O bot continua a vigiar pela DexScreener; ve a posicao no dashboard.")
+                texto = (f"🚨 [PAPER] ALERTA — ${simbolo}\nO Jupiter deixou de ter rota de VENDA (possível rug).\n"
+                         "O bot continua a vigiar pela DexScreener; vê a posição no dashboard.")
             else:
-                texto = (f"[PAPER] AVISO {simbolo}: preco rapido Jupiter indisponivel ({erro}). "
-                         "Stop e trailing estao a usar o preco da DexScreener, que e mais lento.")
+                texto = (f"⚠️ [PAPER] AVISO — ${simbolo}\nPreço rápido Jupiter indisponível ({erro}).\n"
+                         "Stop e trailing estão a usar o preço da DexScreener, que é mais lento.")
             self.telegram.enviar(texto)
         except Exception:
             log.warning("Aviso de preco rapido por Telegram falhou")
@@ -4900,6 +4987,29 @@ class Bot:
         L.append("  Lembra-te: resultados em simulacao NAO garantem resultados reais.")
         return "\n".join(L)
 
+    def resumo_telegram(self):
+        """Resumo curto para o telemovel (o resumo() completo continua a ser o do terminal)."""
+        e = self.estado
+        st = e["stats"]
+        total = self.valor_total()
+        inicial = e["saldo_inicial"] or 1.0
+        acerto = f" ({st['ganhos'] / st['fechados'] * 100:.0f}%)" if st["fechados"] else ""
+        abertas = ", ".join("$" + str(p.get("simbolo")) for p in e["posicoes"].values()) or "nenhuma"
+        dia = obter(e, "scanner_counters", "daily", datetime.fromtimestamp(agora()).date().isoformat(), defeito={})
+        dia = dia if isinstance(dia, dict) else {}
+        return "\n".join([
+            "📊 [PAPER] RESUMO",
+            f"Carteira: ${total:.2f} ({(total / inicial - 1) * 100:+.1f}% desde o início)",
+            f"Fechadas: {st['fechados']} · {st['ganhos']} ganhas · {st['perdas']} perdidas{acerto}",
+            f"Posição aberta: {abertas}",
+            f"Hoje: {int(num(dia.get('analysis_completed')))} tokens analisados · "
+            f"{int(num(dia.get('approved')))} aprovados"])
+
+    def _texto_estado_bot(self, icone, estado):
+        abertas = ", ".join("$" + str(p.get("simbolo")) for p in self.estado["posicoes"].values())
+        return (f"{icone} [PAPER] Bot {estado} · carteira ${self.valor_total():.2f} · "
+                + (f"posição aberta: {abertas}" if abertas else "sem posição aberta"))
+
     # ---------- ciclo principal ----------
     def _fechar_observabilidade(self):
         observabilidade = getattr(self, "smart_protection_observability", None)
@@ -4939,7 +5049,10 @@ class Bot:
                 signal.signal(signal.SIGTERM, _pedido_de_paragem)
             except (ValueError, OSError, AttributeError):
                 pass
-            self.telegram.enviar("[PAPER] Bot iniciado. Saldo: $%.2f" % self.estado["saldo"])
+            try:
+                self.telegram.enviar(self._texto_estado_bot("▶️", "iniciado"))
+            except Exception:
+                log.warning("Aviso de arranque por Telegram falhou")
             while True:
                 t = agora()
                 aprovacao_alterou, _ = self._processar_respostas_aprovacao()
@@ -4998,7 +5111,10 @@ class Bot:
                     intervalo = cfg["telegram_resumo_min"] * 60
                     if intervalo and agora() - self.ultimo_resumo_tg >= intervalo:
                         self.ultimo_resumo_tg = agora()
-                        self.telegram.enviar("[PAPER]" + self.resumo())
+                        try:
+                            self.telegram.enviar(self.resumo_telegram())
+                        except Exception:
+                            log.warning("Resumo por Telegram falhou")
                 dormir(0.5)
         except KeyboardInterrupt:
             print("\nA parar... a guardar o estado.")
@@ -5014,7 +5130,8 @@ class Bot:
                 self.guardar()
                 texto = self.resumo()
                 print(texto)
-                self.telegram.enviar("[PAPER] Bot parado." + texto)
+                self.telegram.em_segundo_plano = False  # a sair: envia ja, senao a mensagem perdia-se com o processo
+                self.telegram.enviar(self._texto_estado_bot("⏹️", "parado"))
             except Exception:
                 log.exception("Erro durante o encerramento do bot Paper")
             finally:
