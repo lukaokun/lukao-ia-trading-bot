@@ -62,7 +62,8 @@ def _num(v, defeito=None):
 def _motivo_curto(m):
     m = str(m or "").upper()
     for chave, nome in (("STOP", "Stop-loss"), ("TRAILING", "Trailing"), ("RUG", "Rug"),
-                        ("TEMPO", "Tempo"), ("ALVO", "Alvo"), ("TAKE", "Alvo"), ("PERDA", "Sem dados")):
+                        ("TEMPO", "Tempo"), ("ALVO", "Alvo"), ("TAKE", "Alvo"), ("PERDA", "Sem dados"),
+                        ("MANUAL", "Manual")):
         if chave in m:
             return nome
     return "Venda"

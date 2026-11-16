@@ -169,6 +169,7 @@ CONFIG = {
     # ---------------- Telegram (opcional) ----------------
     "telegram_resumo_min": 60,       # envia um resumo de X em X minutos (0 = desligado)
     "telegram_botoes": True,         # botoes Aprovar/Recusar nas propostas (so o chat privado configurado)
+    "telegram_venda_manual": True,   # botao "Vender agora" nas mensagens de compra (venda Paper, com confirmacao)
 
     # ---------------- Plataforma web (sinais em direto) ----------------
     "painel_web": True,              # liga a pagina web com os sinais
@@ -391,12 +392,14 @@ class TelegramDecisoes:
 
     ERROS_FATAIS = ("http_401", "http_404", "http_409")
 
-    def __init__(self, token, chat, decidir, pendente, avisar=None, post=None):
+    def __init__(self, token, chat, decidir, pendente, avisar=None, post=None, vender=None, posicao_aberta=None):
         self.token = str(token or "").strip()
         self.chat = str(chat or "").strip()
         self.decidir = decidir      # fn(proposal_id, "aprovar"|"recusar") -> (ok, mensagem)
         self.pendente = pendente    # fn(proposal_id) -> bool
         self.avisar = avisar        # fn(texto): aviso unico se os botoes tiverem de ser desligados
+        self.vender = vender                  # fn(mint) -> (ok, mensagem): pede a venda manual ao ciclo principal
+        self.posicao_aberta = posicao_aberta  # fn(mint) -> bool
         self._post = post           # so nos testes
         # so chat privado: num grupo, outros membros poderiam carregar nos botoes
         self.ativo = bool(self.token) and re.fullmatch(r"\d{3,20}", self.chat) is not None
@@ -411,6 +414,24 @@ class TelegramDecisoes:
     def botoes_proposta(proposal_id):
         return [[{"text": "✅ Aprovar", "callback_data": "a:" + proposal_id},
                  {"text": "❌ Recusar", "callback_data": "r:" + proposal_id}]]
+
+    @staticmethod
+    def botoes_venda(mint):
+        return [[{"text": "🔴 Vender agora", "callback_data": "v:" + mint}]]
+
+    @staticmethod
+    def botoes_confirmar_venda(mint):
+        return [[{"text": "✅ Sim, vender", "callback_data": "y:" + mint},
+                 {"text": "↩️ Não", "callback_data": "k:" + mint}]]
+
+    def fechar_posicoes(self, abertas):
+        """Tira o botao "Vender agora" das compras cujas posicoes ja fecharam (pelas regras ou a mao)."""
+        if not self.ativo:
+            return
+        with self._lock:
+            fechadas = [k for k in self._mensagens if k.startswith("pos:") and k[4:] not in abertas]
+        for chave in fechadas:
+            self.fechar(chave, "Posição fechada.")
 
     @staticmethod
     def botoes_confirmar(proposal_id):
@@ -484,7 +505,11 @@ class TelegramDecisoes:
             self._responder(callback_id, "Não autorizado.")
             log.warning("Telegram: clique ignorado (nao veio do chat privado configurado)")
             return "nao_autorizado"
-        m = re.fullmatch(r"([arsn]):([0-9a-f]{32})", str(cq.get("data") or ""))
+        dados = str(cq.get("data") or "")
+        mv = re.fullmatch(r"([vyk]):([A-Za-z0-9]{30,50})", dados)  # o mesmo formato que MINT_VALIDO
+        if mv:
+            return self._processar_venda(mv.group(1), mv.group(2), callback_id, message_id)
+        m = re.fullmatch(r"([arsn]):([0-9a-f]{32})", dados)
         if not m:
             self._responder(callback_id, "Botão inválido.")
             return "invalido"
@@ -517,6 +542,34 @@ class TelegramDecisoes:
         self._escrever_estado(proposal_id, "⏳ Aprovada no Telegram; a revalidar…" if decisao == "aprovar"
                               else "❌ Recusada no Telegram.", message_id=message_id)
         return decisao
+
+    def _processar_venda(self, acao, mint, callback_id, message_id):
+        aberta = callable(self.posicao_aberta) and callable(self.vender) and self.posicao_aberta(mint)
+        if not aberta:
+            self._responder(callback_id, "Esta posição já está fechada.", alerta=True)
+            self._mudar_botoes(message_id, None)
+            return "venda_fechada"
+        if acao == "v":
+            self._mudar_botoes(message_id, self.botoes_confirmar_venda(mint))
+            self._responder(callback_id, "Confirma a venda Paper agora?")
+            return "confirmar_venda"
+        if acao == "k":
+            self._mudar_botoes(message_id, self.botoes_venda(mint))
+            self._responder(callback_id, "Cancelado: a posição continua aberta.")
+            return "venda_cancelada"
+        try:
+            ok, mensagem = self.vender(mint)
+        except Exception:
+            log.exception("Falha ao pedir venda manual pelo Telegram; nada foi vendido")
+            ok, mensagem = False, "erro interno; nada foi vendido"
+        if not ok:
+            self._responder(callback_id, f"Não foi possível: {mensagem}", alerta=True)
+            self._mudar_botoes(message_id, self.botoes_venda(mint))
+            return "venda_recusada"
+        log.info("Venda manual PAPER pedida no Telegram para %s", mint)
+        self._responder(callback_id, "A vender em Paper; recebes a mensagem de venda em segundos.")
+        self._mudar_botoes(message_id, None)
+        return "vender"
 
     def _desligar(self, erro):
         self.ativo = False
@@ -607,6 +660,8 @@ def motivo_legivel(motivo):
         return f"tempo máximo ({x.group(1)} min; preço a {x.group(2)}%)"
     if m.startswith("RUG"):
         return "possível rug: " + m[3:].strip().replace("preco", "preço")
+    if m.startswith("MANUAL"):
+        return "venda manual (decisão tua no Telegram)"
     return m or "—"
 
 
@@ -641,7 +696,7 @@ def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90, c
     return "\n".join(L + ([link] if link else []))
 
 
-def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquidez):
+def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquidez, com_botao=False):
     saidas = []
     if cfg.get("stop_loss_pct") is not None:
         saidas.append(f"stop {num(cfg['stop_loss_pct']):.0f}%")
@@ -657,6 +712,8 @@ def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquid
         L.append(f"Liquidez: ${num(liquidez):,.0f}")
     if saidas:
         L.append("Saídas: " + " · ".join(saidas))
+    if com_botao:
+        L.append("Para vender antes, usa o botão em baixo.")
     link = _link_dexscreener(mint)
     return "\n".join(L + ([link] if link else []))
 
@@ -2259,8 +2316,16 @@ class Executor:
                       f"preco_efetivo=${plan_fields['effective_price_usd']} "
                       f"(pontuacao {analise['pontuacao']})")
         try:  # o aviso nunca pode estragar uma compra que ja ficou registada
-            self.bot.telegram.enviar(texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
-                                                  analise.get("pontuacao"), liq))
+            tgd = getattr(self.bot, "tg_decisoes", None)
+            if tgd is not None and tgd.ativo and callable(tgd.vender) and MINT_VALIDO.fullmatch(mint):
+                self.bot.telegram.enviar(
+                    texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
+                                 analise.get("pontuacao"), liq, com_botao=True),
+                    botoes=tgd.botoes_venda(mint),
+                    ao_enviar=lambda mid, texto, chave="pos:" + mint: tgd.registar_mensagem(chave, mid, texto))
+            else:
+                self.bot.telegram.enviar(texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
+                                                      analise.get("pontuacao"), liq))
         except Exception:
             log.warning("Aviso de compra por Telegram falhou")
         return pos
@@ -3651,6 +3716,7 @@ class Bot:
         self._fino_ultimo = {}           # mint -> hora da ultima cotacao fina (para rodar pelos sinais)
         self._fino_pausa_ate = 0.0       # depois de uma falha de rede/Jupiter, nao insiste ate esta hora
         self.tg_decisoes = None          # botoes Aprovar/Recusar no Telegram (correr() liga-os)
+        self._vendas_manuais = queue.Queue()  # mints com venda manual pedida (o ciclo principal e que vende)
         self._ultimo_motivo_log = {}
         self.analisados = 0
         self.ultimo_scan = "ainda nao correu"
@@ -4949,6 +5015,11 @@ class Bot:
 
     def _vigiar_posicao_no_scanner(self):
         """Chamado entre analises do scanner: se houver posicao aberta e ja for hora, le o preco rapido."""
+        if self.estado["posicoes"] and not self._vendas_manuais.empty():
+            try:
+                self._processar_vendas_manuais()  # uma venda pedida no Telegram nao espera pelo scanner
+            except Exception:
+                log.exception("Erro na venda manual (durante o scanner)")
         if not self.estado["posicoes"] or self.preco_rapido is None or not self.cfg.get("preco_rapido"):
             return 0
         if agora() - self._ultimo_ciclo_rapido < num(self.cfg.get("intervalo_preco_rapido_seg"), 3):
@@ -5010,6 +5081,43 @@ class Bot:
                 self._fino_pausa_ate = agora() + 30
             return 0
         return 1 if self._ponto_fino(mint, r.get("preco")) else 0
+
+    def _posicao_aberta(self, mint):
+        return mint in self.estado.get("posicoes", {})
+
+    def _pedido_venda_telegram(self, mint):
+        """Regista o pedido; a venda e feita pelo ciclo principal (nunca a partir da thread do Telegram)."""
+        cfg = self.cfg
+        if cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False:
+            return False, "modo Paper indisponivel; nada foi feito"
+        if not self._posicao_aberta(mint):
+            return False, "a posicao ja esta fechada"
+        self._vendas_manuais.put(mint)
+        return True, "pedido registado"
+
+    def _processar_vendas_manuais(self):
+        """Vende em Paper as posicoes pedidas no Telegram, ao preco mais recente conhecido."""
+        vendas = 0
+        while True:
+            try:
+                mint = self._vendas_manuais.get_nowait()
+            except queue.Empty:
+                return vendas
+            pos = self.estado["posicoes"].get(mint)
+            if pos is None:
+                continue
+            preco = (self.risco._preco_rapido_valido(mint) or num(pos.get("preco_atual"))
+                     or num(pos.get("preco_entrada")))
+            liq = num(pos.get("liq_atual")) or num(pos.get("liq_entrada"))
+            if preco <= 0:
+                log.warning("Venda manual de %s adiada: sem preco valido", pos.get("simbolo"))
+                self._vendas_manuais.put(mint)
+                return vendas
+            try:
+                if self.executor.vender(mint, preco, liq, "MANUAL (Telegram)") is not None:
+                    vendas += 1
+            except (PaperOperationError, PaperOperationAuthorizationError):
+                log.exception("Venda manual de %s recusada na persistencia Paper", pos.get("simbolo"))
 
     def _proposta_pendente(self, proposal_id):
         gestor = getattr(self, "manual_approvals", None)
@@ -5302,8 +5410,11 @@ class Bot:
             prox_scan = prox_risco = prox_rapido = prox_fino = 0.0
             self.manual_approvals.start()
             if cfg.get("telegram_botoes") and self.modo != "demo" and getattr(self.telegram, "ativo", False):
+                manual = bool(cfg.get("telegram_venda_manual"))
                 self.tg_decisoes = TelegramDecisoes(self.telegram.token, self.telegram.chat, self._decisao_telegram,
-                                                    self._proposta_pendente, avisar=self.telegram.enviar)
+                                                    self._proposta_pendente, avisar=self.telegram.enviar,
+                                                    vender=self._pedido_venda_telegram if manual else None,
+                                                    posicao_aberta=self._posicao_aberta if manual else None)
                 if self.tg_decisoes.ativo:
                     self.tg_decisoes.iniciar()
                 log.info("Botoes Aprovar/Recusar no Telegram: %s", "ligados" if self.tg_decisoes.ativo
@@ -5324,6 +5435,13 @@ class Bot:
                 t = agora()
                 aprovacao_alterou, _ = self._processar_respostas_aprovacao()
                 mexeu = aprovacao_alterou
+                try:
+                    if self._processar_vendas_manuais():
+                        mexeu = True
+                except Exception:
+                    log.exception("Erro na venda manual")
+                if self.tg_decisoes is not None:
+                    self.tg_decisoes.fechar_posicoes(set(self.estado["posicoes"]))
                 self._atualizar_taxa_bce()
                 self._atualizar_urgencia_http()
                 if t >= prox_risco:

@@ -159,6 +159,50 @@ class TelegramBotoesTests(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(len(self.api.pedidos), antes)
 
+    def test_vender_agora_pede_confirmacao(self):
+        mint = "So11111111111111111111111111111111111111112"
+        abertas, pedidos = {mint}, []
+
+        def vender(m):
+            pedidos.append(m)
+            abertas.discard(m)
+            return True, "pedido registado"
+
+        tg = bot.TelegramDecisoes("123:abc", CHAT, None, None, post=self.api, vender=vender,
+                                  posicao_aberta=lambda m: m in abertas)
+        self.assertEqual(tg.processar(clique("v:" + mint)), "confirmar_venda")
+        self.assertEqual(pedidos, [])                                       # carregar em Vender nao vende nada
+        markup = [j for m, j in self.api.pedidos if m == "editMessageReplyMarkup"][-1]["reply_markup"]
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "y:" + mint)
+        self.assertEqual(tg.processar(clique("k:" + mint, update_id=2)), "venda_cancelada")
+        self.assertEqual(pedidos, [])
+        self.assertEqual(tg.processar(clique("y:" + mint, de="111", update_id=3)), "nao_autorizado")
+        self.assertEqual(tg.processar(clique("y:" + mint, update_id=4)), "vender")
+        self.assertEqual(pedidos, [mint])
+        self.assertEqual(tg.processar(clique("y:" + mint, update_id=5)), "venda_fechada")   # segundo clique: nada
+        self.assertEqual(pedidos, [mint])
+        sem = bot.TelegramDecisoes("123:abc", CHAT, None, None, post=self.api)              # venda manual desligada
+        self.assertEqual(sem.processar(clique("y:" + mint)), "venda_fechada")
+
+    def test_venda_recusada_pelo_bot_mantem_o_botao(self):
+        mint = "So11111111111111111111111111111111111111112"
+        tg = bot.TelegramDecisoes("123:abc", CHAT, None, None, post=self.api,
+                                  vender=lambda m: (False, "modo Paper indisponivel"), posicao_aberta=lambda m: True)
+        self.assertEqual(tg.processar(clique("y:" + mint)), "venda_recusada")
+        markup = [j for m, j in self.api.pedidos if m == "editMessageReplyMarkup"][-1]["reply_markup"]
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "v:" + mint)
+
+    def test_fechar_posicoes_tira_o_botao_de_venda(self):
+        tg = bot.TelegramDecisoes("123:abc", CHAT, None, None, post=self.api)
+        tg.registar_mensagem("pos:AAA", 90, "COMPRA AAA")
+        tg.registar_mensagem("pos:BBB", 91, "COMPRA BBB")
+        tg.fechar_posicoes({"BBB"})
+        fim = time.time() + 3
+        while "editMessageText" not in self.api.metodos() and time.time() < fim:
+            time.sleep(0.01)
+        editados = [j for m, j in self.api.pedidos if m == "editMessageText"]
+        self.assertEqual([(j["message_id"], j["text"]) for j in editados], [(90, "COMPRA AAA\n\nPosição fechada.")])
+
     def test_token_nunca_vai_para_o_registo(self):
         def rebenta(url, json=None, timeout=None):
             raise ConnectionError("falhou " + url)

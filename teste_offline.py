@@ -1520,6 +1520,57 @@ def t_telegram_botoes_ligados_ao_arrancar(pasta):
         assert "Botoes Aprovar/Recusar no Telegram: ligados" in f.read()
 
 
+def t_venda_manual_pelo_telegram(pasta):
+    bot, cfg = novo_bot(pasta)
+    pedidos = []
+
+    def api(url, json=None, timeout=None):
+        pedidos.append((url.rsplit("/", 1)[1], json))
+        return Resposta(200, {"ok": True, "result": True})
+
+    class _TgComBotoes(_TgFalso):
+        def enviar(self, texto, botoes=None, ao_enviar=None):
+            self.msgs.append(texto)
+            self.botoes.append(botoes)
+            if ao_enviar is not None:
+                ao_enviar(700 + len(self.msgs), texto)
+
+    bot.telegram = tg = _TgComBotoes()
+    tg.botoes = []
+    bot.tg_decisoes = B.TelegramDecisoes("123:abc", "987654", bot._decisao_telegram, bot._proposta_pendente, post=api,
+                                         vender=bot._pedido_venda_telegram, posicao_aberta=bot._posicao_aberta)
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    m = mint_de("BOM")
+    compra = next(x for x in tg.msgs if "COMPRA" in x)
+    assert "Para vender antes, usa o botão em baixo." in compra
+    assert tg.botoes[tg.msgs.index(compra)][0][0]["callback_data"] == "v:" + m
+    clique = lambda dados, n: {"update_id": n, "callback_query": {"id": f"c{n}", "data": dados, "from": {"id": 987654},
+                                                                   "message": {"message_id": 1, "chat": {"id": 987654}}}}
+    assert bot.tg_decisoes.processar(clique("v:" + m, 1)) == "confirmar_venda" and m in bot.estado["posicoes"]
+    assert bot.tg_decisoes.processar(clique("y:" + m, 2)) == "vender"
+    assert m in bot.estado["posicoes"]                              # a thread do Telegram nunca vende
+    mexer("BOM", preco=0.00105)
+    assert bot.ciclo_risco() == 0                                   # +5%: as regras nao vendiam
+    assert bot._processar_vendas_manuais() == 1 and m not in bot.estado["posicoes"]
+    venda = trades(cfg)[-1]
+    assert venda["tipo"] == "VENDA" and venda["motivo"] == "MANUAL (Telegram)"
+    assert abs(float(venda["preco_mercado"]) - 0.00105) < 1e-12
+    assert bot.estado["stats"]["por_motivo"]["MANUAL"]["n"] == 1
+    assert "Motivo: venda manual (decisão tua no Telegram)" in tg.msgs[-1]
+    assert bot._processar_vendas_manuais() == 0                     # nada pendente
+    assert bot._pedido_venda_telegram(m) == (False, "a posicao ja esta fechada")
+    bot.tg_decisoes.fechar_posicoes(set(bot.estado["posicoes"]))    # o botao desaparece da mensagem de compra
+    fim = time.time() + 3
+    while not any(mt == "editMessageText" for mt, _ in pedidos) and time.time() < fim:
+        time.sleep(0.01)
+    assert [j for mt, j in pedidos if mt == "editMessageText"][-1]["text"].endswith("Posição fechada.")
+    bot.cfg["mode"] = "live"                                        # fora do modo Paper nunca regista pedidos
+    assert bot._pedido_venda_telegram(m)[0] is False
+    bot.cfg["mode"] = "paper"
+    assert B.motivo_legivel("MANUAL (Telegram)") == "venda manual (decisão tua no Telegram)"
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

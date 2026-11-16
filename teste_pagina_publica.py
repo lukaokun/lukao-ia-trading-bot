@@ -75,6 +75,10 @@ class PaginaPublicaTests(unittest.TestCase):
         self.assertEqual(P._limpar(estado),
                          {"recentes": [{"mint": "M", "observacao_extra": {"holders": {"top10_pct": 40.0}}}]})
 
+    def test_motivo_manual_na_pagina_publica(self):
+        self.assertEqual(P._motivo_curto("MANUAL (Telegram)"), "Manual")
+        self.assertEqual(P._motivo_curto("STOP_LOSS -12.0%"), "Stop-loss")
+
     def test_caminho_desconhecido_da_404(self):
         self.assertEqual(self._pedido("GET", "/chaves_locais.json")[0], 404)
         self.assertEqual(self._pedido("GET", "/../estado.json")[0], 404)
