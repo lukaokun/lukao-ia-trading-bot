@@ -1447,6 +1447,79 @@ def t_laboratorio_filtros_a_testar_e_entrada_adiada(pasta):
         trinco.release()
 
 
+def t_telegram_botoes_na_proposta_e_resultado(pasta):
+    bot, cfg = novo_bot(pasta)
+    pedidos = []
+
+    def api(url, json=None, timeout=None):
+        pedidos.append((url.rsplit("/", 1)[1], json))
+        return Resposta(200, {"ok": True, "result": True})
+
+    class _TgComBotoes(_TgFalso):
+        def enviar(self, texto, botoes=None, ao_enviar=None):
+            self.msgs.append(texto)
+            self.botoes.append(botoes)
+            if ao_enviar is not None:
+                ao_enviar(501, texto)
+
+    bot.telegram = tg = _TgComBotoes()
+    tg.botoes = []
+    bot.tg_decisoes = B.TelegramDecisoes("123:abc", "987654", bot._decisao_telegram, bot._proposta_pendente, post=api)
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    proposta = next(x for x in tg.msgs if "NOVA PROPOSTA" in x)
+    assert "Aprova ou recusa nos botões em baixo, ou no dashboard privado." in proposta
+    botoes = tg.botoes[tg.msgs.index(proposta)]
+    assert [b["text"] for b in botoes[0]] == ["✅ Aprovar", "❌ Recusar"]
+    assert all(b is None for m, b in zip(tg.msgs, tg.botoes) if "NOVA PROPOSTA" not in m)   # so a proposta tem botoes
+    fim = time.time() + 3                                         # a compra fecha a mensagem com o resultado
+    while not any(m == "editMessageText" for m, _ in pedidos) and time.time() < fim:
+        time.sleep(0.01)
+    texto = [j for m, j in pedidos if m == "editMessageText"][-1]
+    assert texto["message_id"] == 501 and texto["text"].endswith("✅ Compra Paper feita.")
+    assert bot._proposta_pendente("0" * 32) is False              # sem gestor real: nunca pendente
+    assert bot._decisao_telegram("0" * 32, "aprovar") == (False, "gestor de propostas indisponivel")
+    bot.tg_decisoes = None                                        # sem botoes: mensagem antiga, sem teclado
+    tg.botoes = []
+    mexer("BOM", preco=0.0009)
+    bot.ciclo_risco()
+    listar("OUTRO")
+    bot.ciclo_scanner()
+    ultima = [x for x in tg.msgs if "NOVA PROPOSTA" in x][-1]
+    assert "Aprova ou recusa no dashboard privado." in ultima and tg.botoes[tg.msgs.index(ultima) - len(tg.msgs)] is None
+
+
+def t_telegram_botoes_ligados_ao_arrancar(pasta):
+    bot, cfg = novo_bot(pasta)
+    B.aplicar_config_operacional(cfg)
+    bot.estado["operational_session"].update({
+        "fx_usd_per_eur": "1.15",
+        "fx_reference_date": datetime.now(timezone.utc).date().isoformat(),
+        "fx_locked_at_utc": datetime.now(timezone.utc).isoformat(),
+        "fx_source": "European Central Bank (ECB) daily reference rate",
+    })
+    B.guardar_estado(cfg, bot.estado, strict=True)
+    bot._fx_rate_persisted = True
+    bot.telegram = B.Telegram("123456:" + "a" * 30, "987654")
+    chamadas = {"n": 0}
+
+    def dormir_que_para(s):
+        RELOGIO["t"] += max(s, 0)
+        chamadas["n"] += 1
+        if chamadas["n"] > 5:
+            raise KeyboardInterrupt
+
+    antigo = B.dormir
+    B.dormir = dormir_que_para
+    try:
+        bot.correr()
+    finally:
+        B.dormir = antigo
+    assert bot.tg_decisoes is not None and bot.tg_decisoes._stop.is_set()   # ligado ao arrancar, parado ao sair
+    with open(cfg["ficheiro_log"], encoding="utf-8") as f:
+        assert "Botoes Aprovar/Recusar no Telegram: ligados" in f.read()
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

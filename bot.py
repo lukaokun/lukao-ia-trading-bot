@@ -168,6 +168,7 @@ CONFIG = {
 
     # ---------------- Telegram (opcional) ----------------
     "telegram_resumo_min": 60,       # envia um resumo de X em X minutos (0 = desligado)
+    "telegram_botoes": True,         # botoes Aprovar/Recusar nas propostas (so o chat privado configurado)
 
     # ---------------- Plataforma web (sinais em direto) ----------------
     "painel_web": True,              # liga a pagina web com os sinais
@@ -353,24 +354,233 @@ class Telegram:
         self.ativo = bool(self.token and self.chat)
         self.em_segundo_plano = bool(em_segundo_plano)
 
-    def enviar(self, texto):
-        """Envia uma mensagem. Se nao estiver configurado, nao faz nada."""
+    def enviar(self, texto, botoes=None, ao_enviar=None):
+        """Envia uma mensagem. Se nao estiver configurado, nao faz nada.
+        botoes: teclado inline do Telegram; ao_enviar(message_id, texto) e chamado se a mensagem for aceite."""
         if not self.ativo:
             return
         if self.em_segundo_plano:  # nunca atrasa o ciclo do bot (stops e propostas)
-            threading.Thread(target=self._enviar, args=(texto,), name="telegram", daemon=True).start()
+            threading.Thread(target=self._enviar, args=(texto, botoes, ao_enviar), name="telegram", daemon=True).start()
             return
-        self._enviar(texto)
+        self._enviar(texto, botoes, ao_enviar)
 
-    def _enviar(self, texto):
+    def _enviar(self, texto, botoes=None, ao_enviar=None):
+        corpo = {"chat_id": self.chat, "text": texto[:4000]}
+        if botoes:
+            corpo["reply_markup"] = {"inline_keyboard": botoes}
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat, "text": texto[:4000]},
+                json=corpo,
                 timeout=8,
             )
+            if ao_enviar is not None and getattr(r, "status_code", 0) == 200:
+                mid = obter(r.json(), "result", "message_id")
+                if isinstance(mid, int) and not isinstance(mid, bool):
+                    ao_enviar(mid, corpo["text"])
         except Exception as e:
             log.warning("Telegram falhou: %s", type(e).__name__)
+
+
+class TelegramDecisoes:
+    """Botoes Aprovar/Recusar nas propostas Paper, com confirmacao ("Sim, aprovar").
+
+    So aceita cliques do chat PRIVADO configurado (id do utilizador = id do chat); qualquer outro e ignorado.
+    A decisao segue pela mesma fila do dashboard e o bot revalida tudo antes de executar em Paper.
+    Le os cliques por getUpdates numa thread propria: nunca atrasa o ciclo do bot. O token nunca vai para o log."""
+
+    ERROS_FATAIS = ("http_401", "http_404", "http_409")
+
+    def __init__(self, token, chat, decidir, pendente, avisar=None, post=None):
+        self.token = str(token or "").strip()
+        self.chat = str(chat or "").strip()
+        self.decidir = decidir      # fn(proposal_id, "aprovar"|"recusar") -> (ok, mensagem)
+        self.pendente = pendente    # fn(proposal_id) -> bool
+        self.avisar = avisar        # fn(texto): aviso unico se os botoes tiverem de ser desligados
+        self._post = post           # so nos testes
+        # so chat privado: num grupo, outros membros poderiam carregar nos botoes
+        self.ativo = bool(self.token) and re.fullmatch(r"\d{3,20}", self.chat) is not None
+        self.desligado_motivo = None if self.ativo else "chat de grupo ou Telegram nao configurado"
+        self.offset = None
+        self._mensagens = {}        # proposal_id -> (message_id, texto original)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def botoes_proposta(proposal_id):
+        return [[{"text": "✅ Aprovar", "callback_data": "a:" + proposal_id},
+                 {"text": "❌ Recusar", "callback_data": "r:" + proposal_id}]]
+
+    @staticmethod
+    def botoes_confirmar(proposal_id):
+        return [[{"text": "✅ Sim, aprovar", "callback_data": "s:" + proposal_id},
+                 {"text": "↩️ Não", "callback_data": "n:" + proposal_id}]]
+
+    def _api(self, metodo, corpo, timeout=10):
+        post = self._post or requests.post
+        try:
+            r = post(f"https://api.telegram.org/bot{self.token}/{metodo}", json=corpo, timeout=timeout)
+        except Exception as e:  # nunca regista a excecao inteira: o URL leva o token
+            return None, f"rede_{type(e).__name__}"
+        codigo = getattr(r, "status_code", 0)
+        try:
+            dados = r.json()
+        except Exception:
+            dados = None
+        if codigo == 200 and isinstance(dados, dict) and dados.get("ok"):
+            return dados.get("result"), None
+        return None, f"http_{codigo}"
+
+    def registar_mensagem(self, proposal_id, message_id, texto):
+        with self._lock:
+            self._mensagens[proposal_id] = (message_id, texto)
+            while len(self._mensagens) > 50:
+                self._mensagens.pop(next(iter(self._mensagens)))
+
+    def _responder(self, callback_id, texto, alerta=False):
+        if callback_id:
+            self._api("answerCallbackQuery", {"callback_query_id": callback_id, "text": texto[:190],
+                                              "show_alert": bool(alerta)})
+
+    def _mudar_botoes(self, message_id, botoes):
+        if isinstance(message_id, int):
+            self._api("editMessageReplyMarkup", {"chat_id": self.chat, "message_id": message_id,
+                                                 "reply_markup": {"inline_keyboard": botoes or []}})
+
+    def _escrever_estado(self, proposal_id, estado, message_id=None, final=False):
+        """Acrescenta o estado ao texto original da proposta e tira os botoes."""
+        with self._lock:
+            guardada = self._mensagens.pop(proposal_id, None) if final else self._mensagens.get(proposal_id)
+        if guardada is None:
+            if message_id is not None:
+                self._mudar_botoes(message_id, None)
+            return False
+        mid, texto = guardada
+        self._api("editMessageText", {"chat_id": self.chat, "message_id": mid,
+                                      "text": (texto + "\n\n" + estado)[:4000]})
+        return True
+
+    def fechar(self, proposal_id, estado):
+        """Chamado pelo ciclo principal quando a proposta fica resolvida (em segundo plano)."""
+        if not self.ativo:
+            return
+        with self._lock:
+            if proposal_id not in self._mensagens:
+                return
+        threading.Thread(target=self._escrever_estado, args=(proposal_id, estado), kwargs={"final": True},
+                         name="telegram-fechar", daemon=True).start()
+
+    def processar(self, update):
+        """Trata um clique. Devolve o que aconteceu (para o registo e para os testes)."""
+        cq = update.get("callback_query") if isinstance(update, dict) else None
+        if not isinstance(cq, dict):
+            return None
+        callback_id = cq.get("id")
+        de = str(obter(cq, "from", "id", defeito=""))
+        chat = str(obter(cq, "message", "chat", "id", defeito=""))
+        message_id = obter(cq, "message", "message_id")
+        if de != self.chat or chat != self.chat:
+            self._responder(callback_id, "Não autorizado.")
+            log.warning("Telegram: clique ignorado (nao veio do chat privado configurado)")
+            return "nao_autorizado"
+        m = re.fullmatch(r"([arsn]):([0-9a-f]{32})", str(cq.get("data") or ""))
+        if not m:
+            self._responder(callback_id, "Botão inválido.")
+            return "invalido"
+        acao, proposal_id = m.groups()
+        if not self.pendente(proposal_id):
+            self._responder(callback_id, "Esta proposta já foi decidida ou expirou.", alerta=True)
+            self._mudar_botoes(message_id, None)
+            return "fechada"
+        if acao == "a":
+            self._mudar_botoes(message_id, self.botoes_confirmar(proposal_id))
+            self._responder(callback_id, "Confirma a compra Paper?")
+            return "confirmar"
+        if acao == "n":
+            self._mudar_botoes(message_id, self.botoes_proposta(proposal_id))
+            self._responder(callback_id, "Cancelado: a proposta continua pendente.")
+            return "voltou"
+        decisao = "aprovar" if acao == "s" else "recusar"
+        try:
+            ok, mensagem = self.decidir(proposal_id, decisao)
+        except Exception:
+            log.exception("Falha ao decidir proposta pelo Telegram; nada foi executado")
+            ok, mensagem = False, "erro interno; nada foi executado"
+        if not ok:
+            self._responder(callback_id, f"Não foi possível: {mensagem}", alerta=True)
+            self._mudar_botoes(message_id, None)
+            return "recusado_pelo_bot"
+        log.info("Proposta PAPER %s %s no Telegram", proposal_id[:12], "aprovada" if decisao == "aprovar" else "recusada")
+        self._responder(callback_id, "Aprovada: o bot vai revalidar e comprar em Paper." if decisao == "aprovar"
+                        else "Recusada.")
+        self._escrever_estado(proposal_id, "⏳ Aprovada no Telegram; a revalidar…" if decisao == "aprovar"
+                              else "❌ Recusada no Telegram.", message_id=message_id)
+        return decisao
+
+    def _desligar(self, erro):
+        self.ativo = False
+        self.desligado_motivo = erro
+        log.warning("Botoes do Telegram desligados (%s); as propostas continuam no dashboard", erro)
+        if callable(self.avisar):
+            try:
+                self.avisar("⚠️ [PAPER] Os botões Aprovar/Recusar no Telegram foram desligados ("
+                            + ("outro programa está a ler este bot do Telegram" if erro == "http_409" else erro)
+                            + "). As propostas continuam no dashboard privado.")
+            except Exception:
+                pass
+
+    def ciclo(self, timeout=25):
+        """Um pedido getUpdates. Devolve o numero de cliques tratados, ou o erro."""
+        corpo = {"timeout": timeout, "allowed_updates": ["callback_query"]}
+        if self.offset is not None:
+            corpo["offset"] = self.offset
+        resultado, erro = self._api("getUpdates", corpo, timeout=timeout + 10)
+        if erro:
+            if erro in self.ERROS_FATAIS:
+                self._desligar(erro)
+            return erro
+        tratados = 0
+        for update in resultado if isinstance(resultado, list) else []:
+            update_id = update.get("update_id") if isinstance(update, dict) else None
+            if isinstance(update_id, int):
+                self.offset = max(self.offset or 0, update_id + 1)
+            try:
+                if self.processar(update) is not None:
+                    tratados += 1
+            except Exception:
+                log.exception("Erro a tratar um clique do Telegram")
+        return tratados
+
+    def descartar_antigos(self):
+        """Ao arrancar, ignora cliques feitos enquanto o bot estava parado."""
+        resultado, erro = self._api("getUpdates", {"offset": -1, "timeout": 0, "allowed_updates": ["callback_query"]})
+        if erro:
+            if erro in self.ERROS_FATAIS:
+                self._desligar(erro)
+            return False
+        ids = [u.get("update_id") for u in resultado or [] if isinstance(u, dict) and isinstance(u.get("update_id"), int)]
+        if ids:
+            self.offset = max(ids) + 1
+        return True
+
+    def _correr(self):
+        while not self._stop.is_set() and self.ativo and not self.descartar_antigos():
+            self._stop.wait(5)
+        while not self._stop.is_set() and self.ativo:
+            r = self.ciclo()
+            if isinstance(r, str):
+                self._stop.wait(5)
+
+    def iniciar(self):
+        if not self.ativo or (self._thread is not None and self._thread.is_alive()):
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._correr, name="telegram-botoes", daemon=True)
+        self._thread.start()
+
+    def parar(self):
+        self._stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +610,7 @@ def motivo_legivel(motivo):
     return m or "—"
 
 
-def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90):
+def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90, com_botoes=False):
     par = par if isinstance(par, dict) else {}
     minimo = cfg.get("pontuacao_minima")
     L = [f"🔔 [PAPER] NOVA PROPOSTA — ${simbolo}",
@@ -424,7 +634,9 @@ def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90):
                                                          (obter(par, "priceChange", "h1"), "1 h")) if v is not None]
     if partes:
         L.append("Preço: " + " · ".join(partes))
-    L += ["", f"⏳ Expira em {segundos} segundos.", "Aprova ou recusa no dashboard privado."]
+    L += ["", f"⏳ Expira em {segundos} segundos.",
+          "Aprova ou recusa nos botões em baixo, ou no dashboard privado." if com_botoes
+          else "Aprova ou recusa no dashboard privado."]
     link = _link_dexscreener(mint)
     return "\n".join(L + ([link] if link else []))
 
@@ -1331,6 +1543,7 @@ class ManualApprovalManager:
         self._issued_codes = set()
         self._forced_reasons = {}
         self._dashboard_decided = {}  # proposal_id -> "aprovar" | "recusar" (decisoes feitas no dashboard)
+        self._origem_decisao = {}     # proposal_id -> "dashboard" | "telegram"
         self._terminal_command_handler = terminal_command_handler
         self._terminal_buffer = ""
         self._requests = queue.Queue()
@@ -1527,7 +1740,8 @@ class ManualApprovalManager:
                             print("Comandos terminais: PARAR_PAPER <motivo> | REARMAR_PAPER <ID_PARAGEM> <motivo>")
                             print("Resposta ausente, incompleta, incorreta ou expirada rejeita a proposta.")
             if active_id is not None and active_id in self._dashboard_decided:
-                print(f"\nProposta {active_id[:12]} decidida no dashboard ({self._dashboard_decided[active_id]}).")
+                print(f"\nProposta {active_id[:12]} decidida no {self._origem_decisao.get(active_id, 'dashboard')} "
+                      f"({self._dashboard_decided[active_id]}).")
                 active_id = active_deadline = None
                 self._terminal_buffer = ""
             if active_id is not None and time.monotonic() >= active_deadline:
@@ -1581,7 +1795,15 @@ class ManualApprovalManager:
             else:
                 print("Sem proposta ativa. Comando: PARAR_PAPER <motivo> ou REARMAR_PAPER <ID_PARAGEM> <motivo>.")
 
-    def decidir_dashboard(self, proposal_id, decisao):
+    def esta_pendente(self, proposal_id):
+        """True se a proposta ainda espera decisao (nao decidida, nao expirada)."""
+        with self._lock:
+            proposal = self._pending.get(proposal_id)
+            return (proposal is not None and self._statuses.get(proposal_id) == "pending"
+                    and proposal_id not in self._dashboard_decided
+                    and proposal.expires_monotonic > time.monotonic())
+
+    def decidir_dashboard(self, proposal_id, decisao, origem="dashboard"):
         """Decisao explicita vinda do dashboard local (Paper). Usa a mesma fila que o terminal.
 
         Aprovar equivale a escrever no terminal a linha APROVAR <id> <codigo>; o Executor continua a
@@ -1594,14 +1816,15 @@ class ManualApprovalManager:
             if proposal is None or self._statuses.get(proposal_id) != "pending":
                 return False, "proposta inexistente ou ja decidida"
             if proposal_id in self._dashboard_decided:
-                return False, "proposta ja decidida no dashboard"
+                return False, f"proposta ja decidida no {self._origem_decisao.get(proposal_id, 'dashboard')}"
             if proposal.expires_monotonic <= time.monotonic():
                 return False, "proposta expirada"
             self._dashboard_decided[proposal_id] = decisao
+            self._origem_decisao[proposal_id] = "telegram" if origem == "telegram" else "dashboard"
             if decisao == "aprovar":
                 self._results.put((proposal_id, f"APROVAR {proposal.proposal_id} {proposal.confirmation_code}"))
                 return True, "aprovada; o Executor vai revalidar e executar em Paper"
-        self.cancel(proposal_id, "recusada no dashboard")
+        self.cancel(proposal_id, "recusada no Telegram" if origem == "telegram" else "recusada no dashboard")
         return True, "recusada"
 
     def invalidate_pending(self, reason):
@@ -1655,7 +1878,8 @@ class ManualApprovalManager:
                     continue
                 accepted = (proposal.expires_monotonic > time.monotonic()
                             and answer == f"APROVAR {proposal.proposal_id} {proposal.confirmation_code}")
-                reason = ("aprovada no dashboard" if self._dashboard_decided.get(proposal_id) == "aprovar"
+                reason = (("aprovada no Telegram" if self._origem_decisao.get(proposal_id) == "telegram"
+                           else "aprovada no dashboard") if self._dashboard_decided.get(proposal_id) == "aprovar"
                           else "aprovada manualmente") if accepted else (
                     "proposta expirada" if proposal.expires_monotonic <= time.monotonic()
                     else "ID ou codigo incorreto")
@@ -1707,6 +1931,7 @@ class ManualApprovalManager:
             self._issued_ids.clear()
             self._issued_codes.clear()
             self._forced_reasons.clear()
+            self._origem_decisao.clear()
 
 
 class Executor:
@@ -3425,6 +3650,7 @@ class Bot:
         self.preco_fino = None
         self._fino_ultimo = {}           # mint -> hora da ultima cotacao fina (para rodar pelos sinais)
         self._fino_pausa_ate = 0.0       # depois de uma falha de rede/Jupiter, nao insiste ate esta hora
+        self.tg_decisoes = None          # botoes Aprovar/Recusar no Telegram (correr() liga-os)
         self._ultimo_motivo_log = {}
         self.analisados = 0
         self.ultimo_scan = "ainda nao correu"
@@ -4470,8 +4696,16 @@ class Bot:
             log.info("PROPOSTA PAPER %s %s valor=$%.4f score=%s expira em 90s",
                      proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"], proposta["score"])
             try:
-                self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
-                                                    proposta["amount_usd"], par))
+                tgd = getattr(self, "tg_decisoes", None)
+                pid = proposta["proposal_id"]
+                if tgd is not None and tgd.ativo and isinstance(pid, str):
+                    self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
+                                                        proposta["amount_usd"], par, com_botoes=True),
+                                         botoes=tgd.botoes_proposta(pid),
+                                         ao_enviar=lambda mid, texto, pid=pid: tgd.registar_mensagem(pid, mid, texto))
+                else:
+                    self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
+                                                        proposta["amount_usd"], par))
             except Exception:
                 log.warning("Aviso de proposta por Telegram falhou")
             if not self._registar_auditoria_aprovacao("proposed", proposta):
@@ -4500,15 +4734,23 @@ class Bot:
             descarte = getattr(self.manual_approvals, "discard", None)
             if callable(descarte):
                 descarte(token)
-        def resolver_sinal(proposal_id, state):
+        def resolver_sinal(proposal_id, state, motivo=None):
             for item in reversed(self.estado.get("sinais", [])):
                 if item.get("proposal_id") == proposal_id:
                     item["estado"] = state
-                    return
+                    break
+            tgd = getattr(self, "tg_decisoes", None)
+            if tgd is not None:
+                try:
+                    tgd.fechar(proposal_id, "✅ Compra Paper feita." if state == "comprado" else
+                               f"❌ Sem compra: {motivo}." if motivo else
+                               "⚠️ Aprovada, mas sem compra: o preço ou as condições mudaram (vê o dashboard).")
+                except Exception:
+                    log.warning("Atualizar a mensagem da proposta no Telegram falhou")
         for proposta, token, aceite, motivo in self.manual_approvals.drain_results():
             alterou = True
             if not aceite:
-                resolver_sinal(proposta["proposal_id"], "sem_vaga")
+                resolver_sinal(proposta["proposal_id"], "sem_vaga", motivo)
                 if token:
                     descartar(token)
                 self._registar_auditoria_aprovacao(
@@ -4517,7 +4759,8 @@ class Bot:
                 continue
             if not self._registar_auditoria_aprovacao(
                     "approved", proposta, "confirmação manual aceite pelo gestor"
-                    + (" (dashboard)" if motivo == "aprovada no dashboard" else "")):
+                    + (" (dashboard)" if motivo == "aprovada no dashboard" else
+                       " (Telegram)" if motivo == "aprovada no Telegram" else "")):
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
                 self.acao("Compra bloqueada: não foi possível persistir a confirmação manual")
@@ -4767,6 +5010,23 @@ class Bot:
                 self._fino_pausa_ate = agora() + 30
             return 0
         return 1 if self._ponto_fino(mint, r.get("preco")) else 0
+
+    def _proposta_pendente(self, proposal_id):
+        gestor = getattr(self, "manual_approvals", None)
+        return isinstance(gestor, ManualApprovalManager) and gestor.esta_pendente(proposal_id)
+
+    def _decisao_telegram(self, proposal_id, decisao):
+        """Mesmas verificacoes do dashboard. Devolve (ok, mensagem). Falha sempre fechada."""
+        cfg = self.cfg
+        if (cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False
+                or cfg.get("manual_confirmation_required") is not True):
+            return False, "modo Paper com confirmacao manual indisponivel; nada foi feito"
+        if decisao == "aprovar" and self._emergency_stop_is_active():
+            return False, "paragem de emergencia ativa; aprovacao recusada"
+        gestor = getattr(self, "manual_approvals", None)
+        if not isinstance(gestor, ManualApprovalManager):
+            return False, "gestor de propostas indisponivel"
+        return gestor.decidir_dashboard(proposal_id, decisao, origem="telegram")
 
     def _bloqueio_rota_compra(self, mint, valor_usd):
         """Confirma no Jupiter (so leitura) que ha rota de compra e que o impacto real e aceitavel.
@@ -5041,6 +5301,13 @@ class Bot:
         try:
             prox_scan = prox_risco = prox_rapido = prox_fino = 0.0
             self.manual_approvals.start()
+            if cfg.get("telegram_botoes") and self.modo != "demo" and getattr(self.telegram, "ativo", False):
+                self.tg_decisoes = TelegramDecisoes(self.telegram.token, self.telegram.chat, self._decisao_telegram,
+                                                    self._proposta_pendente, avisar=self.telegram.enviar)
+                if self.tg_decisoes.ativo:
+                    self.tg_decisoes.iniciar()
+                log.info("Botoes Aprovar/Recusar no Telegram: %s", "ligados" if self.tg_decisoes.ativo
+                         else "desligados (" + str(self.tg_decisoes.desligado_motivo) + ")")
             print("A arrancar... (primeira procura de tokens pode demorar alguns segundos)")
             self.url_web = iniciar_painel_web(self)
             self.retomar()
@@ -5119,6 +5386,8 @@ class Bot:
         except KeyboardInterrupt:
             print("\nA parar... a guardar o estado.")
         finally:
+            if self.tg_decisoes is not None:
+                self.tg_decisoes.parar()
             try:
                 if self.servidor_web:
                     self.servidor_web.shutdown()
