@@ -147,8 +147,10 @@ CONFIG = {
     # Pontos finos (SO GRAVACAO, nao decide nada): preco de VENDA real no Jupiter dos sinais seguidos, para o
     # laboratorio poder testar stops apertados com dados ao ritmo do bot (a DexScreener so muda de ~30 em 30 s).
     "percursos_finos": True,
-    "percurso_fino_minutos": 30,       # so nos primeiros X minutos de cada sinal
-    "percurso_fino_intervalo_seg": 5,  # 1 cotacao de X em X s no total (12/min; plano Free do Jupiter: 60/min)
+    "percurso_fino_minutos": 180,      # durante X minutos de cada sinal (o percurso inteiro)
+    "percurso_fino_intervalo_seg": 2,  # sem posicao aberta: 1 cotacao de X em X s no total (30/min; Free = 60/min)
+    "percurso_fino_intervalo_com_posicao_seg": 5,  # com posicao: 12/min, que se juntam aos 20/min do preco rapido
+    "percurso_fino_min_por_sinal_seg": 10,         # o mesmo sinal nunca tem pontos finos a menos de X s
     "percurso_fino_valor_usd": 5.5,    # tamanho da venda cotada (igual ao de uma operacao Paper)
     # So para o relatorio do laboratorio ("custos reais"): taxa de rede estimada por transacao. E uma HIPOTESE
     # conservadora, ainda por medir; nao entra em nenhuma decisao nem na contabilidade Paper.
@@ -5044,24 +5046,35 @@ class Bot:
         finos = pc.get("ptsj")
         if not isinstance(finos, list):
             finos = pc["ptsj"] = []
+        if finos and seg - num(finos[-1][0]) < num(cfg.get("percurso_fino_min_por_sinal_seg"), 10):
+            return False  # pontos demasiado juntos nao acrescentam nada e enchem o estado.json
         finos.append([seg, round(preco_venda / preco0, 5)])
-        del finos[:-800]
+        del finos[:-1200]
         return True
 
     def ciclo_percursos_finos(self):
         """Laboratorio (SO GRAVACAO): 1 cotacao de venda Jupiter por chamada, a rodar pelos sinais recentes.
 
-        Fica parado enquanto houver posicao aberta, para nunca gastar pedidos Jupiter de que o preco
-        rapido (stop/trailing) precisa. Nao assina nem envia nada. Devolve 1 se gravou um ponto."""
+        O token da posicao aberta fica de fora: ja tem pontos do preco rapido. Com posicao aberta o ciclo
+        principal chama isto mais devagar, para nao tirar pedidos Jupiter ao preco rapido (stop/trailing).
+        Nao assina nem envia nada. Devolve 1 se gravou um ponto."""
         cfg, e = self.cfg, self.estado
-        if self.preco_fino is None or not cfg.get("percursos_finos") or e["posicoes"]:
+        if self.preco_fino is None or not cfg.get("percursos_finos"):
             return 0
         if agora() < self._fino_pausa_ate:
             return 0
         limite = num(cfg.get("percurso_fino_minutos"), 30) * 60
+        minimo = num(cfg.get("percurso_fino_min_por_sinal_seg"), 10)
+
+        def recente(pc):  # ja tem um ponto fino ha menos de `minimo` segundos
+            finos = pc.get("ptsj")
+            return (isinstance(finos, list) and finos
+                    and agora() - num(pc.get("ts")) - num(finos[-1][0]) < minimo)
+
         ativos = [m for m, pc in e["percursos"].items()
-                  if isinstance(pc, dict) and pc.get("grupo", "sinal") != "controlo"
-                  and num(pc.get("preco0")) > 0 and 0 <= agora() - num(pc.get("ts")) <= limite]
+                  if isinstance(pc, dict) and pc.get("grupo", "sinal") != "controlo" and m not in e["posicoes"]
+                  and num(pc.get("preco0")) > 0 and 0 <= agora() - num(pc.get("ts")) <= limite
+                  and not recente(pc)]
         for antigo in [m for m in self._fino_ultimo if m not in e["percursos"]]:
             self._fino_ultimo.pop(antigo, None)
         if not ativos:
@@ -5461,13 +5474,14 @@ class Bot:
                         log.exception("Erro no ciclo de preco rapido")
                     prox_rapido = agora() + cfg.get("intervalo_preco_rapido_seg", 3)
                     mexeu = True
-                if (cfg.get("percursos_finos") and self.preco_fino is not None and not self.estado["posicoes"]
-                        and agora() >= prox_fino):
+                if cfg.get("percursos_finos") and self.preco_fino is not None and agora() >= prox_fino:
                     try:
                         self.ciclo_percursos_finos()  # so gravacao; fica guardado no proximo ciclo normal
                     except Exception:
                         log.exception("Erro no ciclo de percursos finos")
-                    prox_fino = agora() + max(3, num(cfg.get("percurso_fino_intervalo_seg"), 5))
+                    passo = (cfg.get("percurso_fino_intervalo_com_posicao_seg", 5) if self.estado["posicoes"]
+                             else cfg.get("percurso_fino_intervalo_seg", 2))
+                    prox_fino = agora() + max(2, num(passo, 5))
                 self._atualizar_urgencia_http()
                 if t >= prox_scan:
                     try:

@@ -1168,20 +1168,27 @@ def t_aviso_telegram_preco_rapido_em_falha(pasta):
 
 def t_percursos_finos_so_gravacao(pasta):
     bot, cfg = comprar_um(pasta)
+    bot.cfg["percurso_fino_minutos"] = 30                         # janela curta nos testes (o bot usa 180)
     m = mint_de("BOM")
     assert m in bot.estado["percursos"] and bot.ciclo_risco() == 0
     bot.preco_fino = fino = _JupFalso([0.00101, 0.00102, 0.00103])
-    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 0  # com posicao aberta nao gasta pedidos Jupiter
-    bot.preco_rapido = _JupFalso([0.00099, 0.0009])
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 0  # o token da posicao usa o preco rapido
+    bot.preco_rapido = _JupFalso([0.00099, 0.00098, 0.0009])
     assert bot.ciclo_rapido() == 0
-    assert [p[1] for p in bot.estado["percursos"][m]["ptsj"]] == [0.99]  # a cotacao da posicao serve de ponto fino
+    finos = lambda: [p[1] for p in bot.estado["percursos"][m]["ptsj"]]
+    assert finos() == [0.99]                                       # a cotacao da posicao serve de ponto fino
+    assert bot.ciclo_rapido() == 0 and finos() == [0.99]           # menos de 10 s depois: nao grava outro
+    RELOGIO["t"] += 11
     assert bot.ciclo_rapido() == 1 and m not in bot.estado["posicoes"]   # stop
     pc = bot.estado["percursos"][m]
-    assert [p[1] for p in pc["ptsj"]] == [0.99, 0.9] and pc["pts"][0] == [0, 1.0]
+    assert finos() == [0.99, 0.9] and pc["pts"][0] == [0, 1.0]
     pts_antes = copy.deepcopy(pc["pts"])
+    RELOGIO["t"] += 11
     assert bot.ciclo_percursos_finos() == 1 and fino.pedidos == 1  # sem posicao: 1 cotacao por chamada
     pc = bot.estado["percursos"][m]
-    assert [p[1] for p in pc["ptsj"]] == [0.99, 0.9, 1.01] and pc["pts"] == pts_antes  # 'pts' nunca e tocado
+    assert finos() == [0.99, 0.9, 1.01] and pc["pts"] == pts_antes  # 'pts' nunca e tocado
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # o mesmo sinal so de 10 em 10 s
+    RELOGIO["t"] += 11
     pc["grupo"] = "controlo"
     assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # grupo de controlo nao gasta pedidos
     pc["grupo"] = "sinal"
@@ -1195,10 +1202,10 @@ def t_percursos_finos_so_gravacao(pasta):
     assert bot.ciclo_percursos_finos() == 0 and espera.pedidos == 0  # ...e nao insiste nos 30 s seguintes
     RELOGIO["t"] += 31
     assert bot.ciclo_percursos_finos() == 1 and espera.pedidos == 1
-    assert [p[1] for p in bot.estado["percursos"][m]["ptsj"]] == [0.99, 0.9, 1.01, 1.05]
+    assert finos() == [0.99, 0.9, 1.01, 1.05]
     bot.preco_fino = fino
     avancar(31)
-    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # passados os 30 minutos deixa de cotar
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1  # passada a janela deixa de cotar
     avancar(60)
     bot.ciclo_risco()                                              # o percurso (90 min nos testes) fecha
     assert m not in bot.estado["percursos"]
@@ -1207,6 +1214,24 @@ def t_percursos_finos_so_gravacao(pasta):
     assert linha["mint"] == m and linha["pts"][0] == [0, 1.0]
     assert [p[1] for p in linha["ptsj"]] == [0.99, 0.9, 1.01, 1.05]
     assert "LABORATORIO" in B.analisar(cfg)                        # o laboratorio continua a ler o ficheiro
+
+
+def t_percursos_finos_com_posicao_aberta(pasta):
+    bot, cfg = comprar_um(pasta)
+    assert cfg["percurso_fino_minutos"] == 180 and B.CONFIG["percurso_fino_intervalo_com_posicao_seg"] == 5
+    m, outro = mint_de("BOM"), mint_de("OUTRO")
+    bot.estado["percursos"][outro] = dict(copy.deepcopy(bot.estado["percursos"][m]), simbolo="OUTRO", ts=int(B.agora()))
+    bot.preco_fino = fino = _JupFalso([0.0011, 0.0012])
+    assert bot.ciclo_percursos_finos() == 1 and fino.pedidos == 1  # os outros sinais continuam a ter pontos
+    assert [p[1] for p in bot.estado["percursos"][outro]["ptsj"]] == [1.1]
+    assert not bot.estado["percursos"][m].get("ptsj")              # a posicao aberta nao gasta pedidos extra
+    assert bot.ciclo_percursos_finos() == 0 and fino.pedidos == 1
+    RELOGIO["t"] += 11
+    assert bot.ciclo_percursos_finos() == 1 and fino.pedidos == 2
+    avancar(150)                                                  # 2,5 horas depois ainda grava (antes eram 30 min)
+    bot.estado["percursos"][outro]["ts"] = int(B.agora()) - 150 * 60
+    fino.precos = [0.0013]
+    assert bot.ciclo_percursos_finos() == 1
 
 
 def t_fonte_do_preco_na_observacao(pasta):
