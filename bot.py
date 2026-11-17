@@ -3433,6 +3433,9 @@ def _pagina_neural():
     return pagina if pagina.startswith("<!DOCTYPE html>") and "/api/estado" in pagina else None
 
 
+IMAGENS_ASSETS = ("/assets/mascote_oficial.png", "/assets/mascote_chifres.png")  # a 2.a e a do tema "Chifres"
+
+
 class _ServidorWeb(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = os.name != "nt"  # no Windows, reutilizar deixava dois bots abrir a mesma porta
@@ -3453,8 +3456,8 @@ class _PedidoWeb(BaseHTTPRequestHandler):
             corpo, tipo = PAGINA_HTML.encode("utf-8"), "text/html; charset=utf-8"
         elif caminho == "/api/estado":
             corpo, tipo = self.server.bot.snapshot.encode("utf-8"), "application/json; charset=utf-8"
-        elif caminho == "/assets/mascote_oficial.png":
-            caminho_mascote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "mascote_oficial.png")
+        elif caminho in IMAGENS_ASSETS:  # so imagens desta lista fixa; nenhum outro ficheiro da pasta e servido
+            caminho_mascote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", caminho.rsplit("/", 1)[1])
             try:
                 with open(caminho_mascote, "rb") as ficheiro:
                     corpo = ficheiro.read()

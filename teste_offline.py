@@ -1633,6 +1633,30 @@ def t_laboratorio_pontuacao_por_criterio(pasta):
     assert B._componentes(pcs[2], B._componentes_do_log(cfg)) == {"liquidez": 8.0, "volume": 20.0, "compras": 18.0}
 
 
+def t_tema_chifres_imagem_e_dashboard(pasta):
+    import urllib.error
+    import urllib.request
+    bot, cfg = novo_bot(pasta)
+    bot.atualizar_snapshot()
+    cfg["painel_web"] = True
+    B.iniciar_painel_web(bot)
+    try:
+        base = f"http://127.0.0.1:{bot.servidor_web.server_address[1]}"
+        img = urllib.request.urlopen(base + "/assets/mascote_chifres.png", timeout=5)
+        assert img.headers["Content-Type"] == "image/png" and img.read(8) == b"\x89PNG\r\n\x1a\n"
+        for proibido in ("/assets/bot.py", "/assets/../bot.py", "/assets/dashboard_neural.html", "/assets/outra.png"):
+            try:
+                urllib.request.urlopen(base + proibido, timeout=5)
+                raise AssertionError("servido sem estar na lista: " + proibido)
+            except urllib.error.HTTPError as erro:
+                assert erro.code == 404
+        pagina = urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8")
+        assert '"chifres": "Chifres"' in pagina and "desenhaFoto" in pagina and "FOTO_OLHOS" in pagina
+    finally:
+        bot.servidor_web.shutdown()
+        bot.servidor_web.server_close()
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})

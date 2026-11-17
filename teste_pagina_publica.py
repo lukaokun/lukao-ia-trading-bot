@@ -79,6 +79,15 @@ class PaginaPublicaTests(unittest.TestCase):
         self.assertEqual(P._motivo_curto("MANUAL (Telegram)"), "Manual")
         self.assertEqual(P._motivo_curto("STOP_LOSS -12.0%"), "Stop-loss")
 
+    def test_imagem_do_tema(self):
+        import shutil
+        os.makedirs(os.path.join(self.tmp.name, "assets"), exist_ok=True)
+        origem = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "mascote_chifres.png")
+        shutil.copy(origem, os.path.join(self.tmp.name, "assets", "mascote_chifres.png"))
+        estado, cab, corpo = self._pedido("GET", "/assets/mascote_chifres.png")
+        self.assertEqual((estado, cab.get("Content-Type"), corpo[:4]), (200, "image/png", b"\x89PNG"))
+        self.assertEqual(self._pedido("GET", "/assets/outra.png")[0], 404)
+
     def test_caminho_desconhecido_da_404(self):
         self.assertEqual(self._pedido("GET", "/chaves_locais.json")[0], 404)
         self.assertEqual(self._pedido("GET", "/../estado.json")[0], 404)

@@ -365,9 +365,9 @@ class Handler(BaseHTTPRequestHandler):
             if e is None:
                 return self._enviar(503, '{"erro":"bot indisponivel"}', "application/json")
             return self._enviar(200, e, "application/json; charset=utf-8")
-        if caminho == "/assets/mascote_oficial.png":
+        if caminho in ("/assets/mascote_oficial.png", "/assets/mascote_chifres.png"):  # lista fixa de imagens
             try:
-                with open(os.path.join(self.pasta, "assets", "mascote_oficial.png"), "rb") as f:
+                with open(os.path.join(self.pasta, "assets", caminho.rsplit("/", 1)[1]), "rb") as f:
                     return self._enviar(200, f.read(3_000_000), "image/png")
             except OSError:
                 return self._enviar(404, "nao encontrado", "text/plain; charset=utf-8")

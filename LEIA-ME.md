@@ -18,6 +18,8 @@ A configuração de exemplo está em `config_operacoes.example.json`. A configur
 
 Com o bot já em execução, o Dashboard Neural está disponível apenas na máquina local em <http://127.0.0.1:8000> (o anterior continua em `/classico`). Não exponha a porta, não crie encaminhamento de portas e não permita acesso pela rede local.
 
+**Tema "Chifres":** no menu Tema do dashboard (privado e público). Usa a imagem `assets/mascote_chifres.png`, que fica só no PC e no servidor (a pasta `assets/` de imagens está no `.gitignore`, não vai para o GitHub). A foto substitui a esfera e os cometas saem dos olhos para os tokens. Só as imagens `mascote_oficial.png` e `mascote_chifres.png` são servidas; nenhum outro ficheiro da pasta. Sem a imagem, o tema mostra só as cores.
+
 O único pedido de escrita é `POST /api/proposta/decisao` (aprovar ou recusar uma proposta Paper pendente). O servidor só o aceita com o endereço e a origem locais, uma chave secreta gerada em cada arranque e servida apenas à própria página, modo Paper com confirmação manual e, para aprovar, sem paragem de emergência ativa. Cada decisão pede confirmação ("Sim") na página e o Executor revalida tudo antes de executar.
 
 ## Alterações de 14/11/2026
