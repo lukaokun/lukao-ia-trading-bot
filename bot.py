@@ -5213,7 +5213,9 @@ class Bot:
                     "par": str(par.get("pairAddress", "")), "pts": [[0, 1.0]], "sem_dados": 0,
                     "fonte": "geckoterminal" if mint in getattr(self.scanner, "origem_gecko", ()) else "dexscreener",
                     "grupo": "controlo" if grupo == "controlo" else "sinal",
-                    "feat": self._caracteristicas_entrada(par)}
+                    "feat": self._caracteristicas_entrada(par),
+                    "comp": {k: round(num(v), 2) for k, v in (analise.get("detalhes") or {}).items()
+                             if isinstance(k, str)}}
 
     def _fechar_percurso(self, mint, fim, liq_fim):
         pc = self.estado["percursos"].pop(mint)
@@ -5229,6 +5231,8 @@ class Bot:
             linha["grupo"] = pc["grupo"]
         if isinstance(pc.get("feat"), dict):
             linha["feat"] = pc["feat"]
+        if isinstance(pc.get("comp"), dict) and pc["comp"]:
+            linha["comp"] = pc["comp"]  # pontos de cada criterio da pontuacao (laboratorio)
         if pc.get("par"):
             linha["par"] = pc["par"]  # endereco publico da pool: o laboratorio usa-o para descontar a pool nos holders
         if isinstance(pc.get("ptsj"), list) and pc["ptsj"]:
@@ -5938,6 +5942,7 @@ def analisar(cfg):
             L.append(f"    {lo}-{hi}: {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
     L += _secao_controlo(percursos, controlo, atual, cfg)
     L += _secao_caracteristicas(todos, atual, cfg)
+    L += _secao_pontuacao_por_criterio(percursos, atual, cfg)
     L += _secao_filtros_a_testar(percursos, atual, cfg)
     L += _secao_carteiras(todos, atual, cfg)
     L += _secao_estrategia_post(percursos, todos, cfg)
@@ -6010,6 +6015,81 @@ def _top10_sem_pool(pc):
     if not pool or not any(x[0] == pool for x in validos):
         return None
     return sum(num(x[1]) for x in [x for x in validos if x[0] != pool][:10])
+
+
+CRITERIOS_PONTUACAO = (("liquidez", "Liquidez", 20), ("mcap/liq", "Market cap/liquidez", 10), ("idade", "Idade", 10),
+                       ("volume", "Volume", 20), ("compras", "Pressao compradora", 20), ("momento", "Momento", 5),
+                       ("acumulacao", "Acumulacao", 5), ("rugcheck", "RugCheck", 10))
+_ANALISE_LOG_RE = re.compile(r"\(([A-Za-z0-9]{30,50})\): (?:APROVADO|REPROVADO) (\d+)/100 \[([^\]]*)\]")
+
+
+def _componentes_do_log(cfg):
+    """Pontos de cada criterio por token, lidos das linhas ANALISE do bot.log (para os percursos antigos).
+    Devolve {mint: [(pontuacao, {criterio: pontos}), ...]}. Nunca lanca excecoes."""
+    resultado = {}
+    try:
+        with open(cfg["ficheiro_log"], encoding="utf-8", errors="replace") as f:
+            for linha in f:
+                if "ANALISE " not in linha or "/100 [" not in linha:
+                    continue
+                m = _ANALISE_LOG_RE.search(linha)
+                if not m:
+                    continue
+                pontos = {}
+                for parte in m.group(3).split():
+                    nome, _, valor = parte.rpartition("=")
+                    if nome and valor.replace(".", "", 1).isdigit():
+                        pontos[nome] = float(valor)
+                if pontos:
+                    resultado.setdefault(m.group(1), []).append((int(m.group(2)), pontos))
+    except (OSError, KeyError, TypeError):
+        pass
+    return resultado
+
+
+def _componentes(pc, do_log):
+    """Pontos de cada criterio deste sinal: os gravados no percurso, ou os do bot.log com a mesma pontuacao."""
+    comp = pc.get("comp")
+    if isinstance(comp, dict) and comp:
+        return {k: num(v) for k, v in comp.items()}
+    candidatos = do_log.get(pc.get("mint")) or []
+    iguais = [p for total, p in candidatos if total == int(num(pc.get("pontuacao"), -1))]
+    return (iguais or [p for _, p in candidatos] or [None])[-1]
+
+
+def _secao_pontuacao_por_criterio(percursos, regra, cfg):
+    """Que criterio da pontuacao separa os sinais bons dos maus? So relatorio."""
+    do_log = _componentes_do_log(cfg)
+    com = [(pc, c) for pc in percursos for c in [_componentes(pc, do_log)] if c]
+    L = ["", f"  PONTUACAO POR CRITERIO (o que distingue 70-79 de 80+?) - {len(com)} de {len(percursos)} sinais com detalhe"]
+    if not com:
+        return L + ["    Ainda sem dados: o detalhe vem do bot.log ou dos percursos gravados a partir de 17/11/2026."]
+    baixo = [c for pc, c in com if num(pc.get("pontuacao")) < 80]
+    alto = [c for pc, c in com if num(pc.get("pontuacao")) >= 80]
+    media = lambda grupo, k: sum(num(c.get(k)) for c in grupo) / len(grupo) if grupo else None
+    txt = lambda v: "   -  " if v is None else f"{v:5.1f}"
+    L.append(f"    {'criterio':<20} {'max':>3}  {'70-79':>6} {'80+':>6}   |  com MAIS pontos neste criterio  |  com MENOS pontos")
+    L.append(f"    {'':<20} {'':>3}  {f'({len(baixo)})':>6} {f'({len(alto)})':>6}   |  (a mediana conta como 'mais')  |")
+    for chave, nome, maximo in CRITERIOS_PONTUACAO:
+        valores = sorted(num(c.get(chave)) for _, c in com if chave in c)
+        if not valores:
+            continue
+        mediana = valores[len(valores) // 2]
+        mais = [pc for pc, c in com if chave in c and num(c.get(chave)) >= mediana]
+        menos = [pc for pc, c in com if chave in c and num(c.get(chave)) < mediana]
+        partes = []
+        for grupo in (mais, menos):
+            if grupo:
+                m, a = _medir(grupo, regra, cfg)
+                partes.append(f"{len(grupo):>3}: media {m:+7.2f}%  acerto {a:5.1f}%")
+            else:
+                partes.append(f"{'0':>3}: (todos iguais)            ")
+        L.append(f"    {nome:<20} {maximo:>3}  {txt(media(baixo, chave)):>6} {txt(media(alto, chave)):>6}   |  "
+                 + "  |  ".join(partes))
+    L += ["    Colunas 70-79 e 80+: pontos medios desse criterio em cada grupo. Um criterio que da mais pontos aos 80+",
+          "    e cujos sinais 'com mais pontos' correm pior e o candidato a estar a premiar a coisa errada.",
+          "    Com poucos sinais de cada lado, as diferencas sao sobretudo sorte."]
+    return L
 
 
 def _secao_filtros_a_testar(percursos, regra, cfg):

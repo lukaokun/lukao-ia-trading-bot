@@ -1596,6 +1596,43 @@ def t_venda_manual_pelo_telegram(pasta):
     assert B.motivo_legivel("MANUAL (Telegram)") == "venda manual (decisão tua no Telegram)"
 
 
+def t_laboratorio_pontuacao_por_criterio(pasta):
+    bot, cfg = novo_bot(pasta)
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    m = mint_de("BOM")
+    comp = bot.estado["percursos"][m]["comp"]
+    assert set(comp) >= {"liquidez", "volume", "compras", "rugcheck"}       # o percurso guarda os pontos por criterio
+    avancar(91)
+    bot.ciclo_risco()
+    with open(cfg["ficheiro_percursos"], encoding="utf-8") as f:
+        assert json.loads(f.read().splitlines()[-1])["comp"] == comp
+    base = {"simbolo": "X", "preco0": 0.001, "liq0": 50000, "liq_fim": 50000}
+    sobe, cai = [[0, 1.0], [60, 1.4], [5400, 1.4]], [[0, 1.0], [60, 0.7], [120, 0.5]]
+    pcs = [dict(base, mint=mint_de("CA"), ts=1_799_000_001, pontuacao=75, fim="tempo", pts=sobe,
+                comp={"liquidez": 8, "volume": 10, "compras": 20}),
+           dict(base, mint=mint_de("CB"), ts=1_799_000_002, pontuacao=85, fim="rug", pts=cai,
+                comp={"liquidez": 8, "volume": 20, "compras": 20}),
+           dict(base, mint=mint_de("CC"), ts=1_799_000_003, pontuacao=82, fim="rug", pts=cai),   # sem comp: vem do log
+           dict(base, mint=mint_de("CD"), ts=1_799_000_004, pontuacao=71, fim="tempo", pts=sobe)]  # sem detalhe nenhum
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for x in pcs:
+            f.write(json.dumps(x) + "\n")
+    with open(cfg["ficheiro_log"], "a", encoding="utf-8") as f:
+        f.write(f"2026-11-13 09:00:00 INFO ANALISE A(b) ({mint_de('CC')}): APROVADO 79/100 [liquidez=1 volume=1 compras=1]\n")
+        f.write(f"2026-11-13 09:01:00 INFO ANALISE A(b) ({mint_de('CC')}): APROVADO 82/100 [liquidez=8 volume=20 compras=18] x\n")
+        f.write(f"2026-11-13 09:02:00 INFO ANALISE Z ({mint_de('ZZ')}): Liquidez baixa ($8,217).\n")
+    txt = B.analisar(cfg)
+    assert "PONTUACAO POR CRITERIO (o que distingue 70-79 de 80+?) - 3 de 4 sinais com detalhe" in txt
+    linhas = {l.split()[0]: l for l in txt.splitlines() if l.strip().startswith(("Liquidez ", "Volume ", "Pressao "))}
+    vol = next(l for l in txt.splitlines() if l.strip().startswith("Volume "))
+    assert "  10.0   20.0" in vol                                    # 70-79 tem 10 pontos de volume; 80+ tem 20
+    assert "2: media" in vol and "1: media" in vol                   # 2 com mais volume (os maus), 1 com menos
+    liq = next(l for l in txt.splitlines() if l.strip().startswith("Liquidez "))
+    assert "0: (todos iguais)" in liq
+    assert B._componentes(pcs[2], B._componentes_do_log(cfg)) == {"liquidez": 8.0, "volume": 20.0, "compras": 18.0}
+
+
 def main():
     B.requests.get = get_falso
     B.requests.post = lambda *a, **k: Resposta(200, {})
