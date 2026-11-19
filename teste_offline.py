@@ -1404,7 +1404,7 @@ def t_mensagens_telegram_legiveis(pasta):
     resumo = bot.resumo_telegram()
     assert resumo.startswith("📊 [PAPER] RESUMO\nCarteira: $") and "Fechadas: 1 · 0 ganhas · 1 perdidas (0%)" in resumo
     assert "Posição aberta: nenhuma" in resumo and "tokens analisados" in resumo and "====" not in resumo
-    assert bot._texto_estado_bot("▶️", "iniciado").startswith("▶️ [PAPER] Bot iniciado · carteira $")
+    assert bot._texto_estado_bot("▶️", "iniciado").startswith("▶️ [PAPER] SpiderBot iniciado · carteira $")
     assert bot._texto_estado_bot("▶️", "iniciado").endswith("sem posição aberta")
     assert all("[PAPER]" in x for x in tg.msgs)                   # nunca se confunde com dinheiro real
     assert B.texto_compra({}, "X", m, "5.526", 0.0000565, None, 0).startswith("🟢 [PAPER] COMPRA — $X\nValor: $5.53")

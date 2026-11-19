@@ -3264,7 +3264,7 @@ PAGINA_HTML = r'''<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#041011">
-<title>MemeBot · Scanner de Meme Coins</title>
+<title>SpiderBot · Scanner de Meme Coins</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23f7a531'/%3E%3Crect x='8' y='11' width='16' height='12' rx='4' fill='%23041011'/%3E%3Ccircle cx='13' cy='17' r='1.6' fill='%23f7a531'/%3E%3Ccircle cx='19' cy='17' r='1.6' fill='%23f7a531'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,400;0,500;0,600;0,700;1,800&display=swap" rel="stylesheet">
@@ -3613,12 +3613,12 @@ h2 small{font-size:12.5px;color:var(--mut);font-weight:400}
 </defs></svg>
 <div class="app">
  <aside class="lado">
-  <div class="marca"><img class="mascote" src="/assets/mascote_oficial.png" alt="Mascote oficial MemeBot" decoding="async"><span class="pro">♛ PRO</span><b>MemeBot</b><small>AI Crypto Scanner</small></div>
+  <div class="marca"><img class="mascote" src="/assets/mascote_oficial.png" alt="Mascote oficial SpiderBot" decoding="async"><span class="pro">♛ PRO</span><b>MemeBot</b><small>AI Crypto Scanner</small></div>
   <nav class="nav" id="nav"></nav>
  </aside>
  <main>
   <header>
-   <div><div class="logo-m"><img class="mascote" src="/assets/mascote_oficial.png" alt="Mascote oficial MemeBot" decoding="async">MemeBot<span>♛ PRO</span></div><h1>Scanner de <em>Meme Coins</em></h1><p class="sub" id="sub">Em tempo real, à procura das próximas grandes oportunidades.</p></div>
+   <div><div class="logo-m"><img class="mascote" src="/assets/mascote_oficial.png" alt="Mascote oficial SpiderBot" decoding="async">SpiderBot<span>♛ PRO</span></div><h1>Scanner de <em>Meme Coins</em></h1><p class="sub" id="sub">Em tempo real, à procura das próximas grandes oportunidades.</p></div>
    <div class="chips"><span class="chip modo" id="cmode">Modo: Indisponível</span><span class="chip"><i class="sol"></i>Solana</span><span class="chip" id="cvivo"><span class="pt"></span><span id="tvivo">A ligar</span></span><span class="chip"><svg class="i gira" viewBox="0 0 24 24"><use href="#i-ciclo"/></svg><span id="relogio">Indisponível</span></span></div>
   </header>
   <section class="stats">
@@ -3634,7 +3634,7 @@ h2 small{font-size:12.5px;color:var(--mut);font-weight:400}
      <div class="radar"><div class="base"><i></i><i></i><i></i></div>
       <div class="globo"><div class="mapa"></div><svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="13"/><circle cx="50" cy="50" r="25"/><circle cx="50" cy="50" r="37"/><path d="M50 0v100M0 50h100M15 15l70 70M85 15 15 85"/><ellipse cx="50" cy="50" rx="18" ry="50"/><ellipse cx="50" cy="50" rx="36" ry="50"/><ellipse cx="50" cy="50" rx="50" ry="18"/><ellipse cx="50" cy="50" rx="50" ry="36"/></svg><div class="varre" id="varre"></div></div>
       <div class="aro"></div><div class="blips" id="blips"></div>
-      <div class="nucleo"><img class="mascote mascote-radar" src="/assets/mascote_oficial.png" alt="Mascote oficial MemeBot" decoding="async"></div>
+      <div class="nucleo"><img class="mascote mascote-radar" src="/assets/mascote_oficial.png" alt="Mascote oficial SpiderBot" decoding="async"></div>
      </div>
      <div class="radar-legenda" aria-label="Estados das moedas no radar"><span><i></i>Em análise</span><span class="ok"><i></i>Aprovada</span><span class="no"><i></i>Rejeitada</span></div>
      <svg id="fio"><line id="fiol"/></svg>
@@ -6316,7 +6316,7 @@ class Bot:
 
     def _texto_estado_bot(self, icone, estado):
         abertas = ", ".join("$" + str(p.get("simbolo")) for p in self.estado["posicoes"].values())
-        return (f"{icone} [PAPER] Bot {estado} · carteira ${self.valor_total():.2f} · "
+        return (f"{icone} [PAPER] SpiderBot {estado} · carteira ${self.valor_total():.2f} · "
                 + (f"posição aberta: {abertas}" if abertas else "sem posição aberta"))
 
     # ---------- ciclo principal ----------

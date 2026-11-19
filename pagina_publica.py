@@ -201,7 +201,7 @@ PAGINA = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#041011">
-<title>MemeBot · Resultados (simulação)</title>
+<title>SpiderBot · Resultados (simulação)</title>
 <style>
 :root{--bg:#041011;--bg2:#071a1c;--lin:rgba(94,234,212,.14);--txt:#e8f1f0;--txt2:#b9cfcc;--mut:#7f9896;--tq:#22e0c8;--vd:#2ee6a8;--vm:#ff6b6b;--ou:#f7a531;
 --mono:ui-monospace,"JetBrains Mono",Consolas,monospace}
@@ -236,7 +236,7 @@ footer{margin-top:22px;color:var(--mut);font-size:12px;text-align:center}
 <body>
 <div class="w">
 <header>
- <div><h1>MemeBot <b>//</b> Resultados</h1><div class="sub">Solana · meme coins · Paper Trading</div></div>
+ <div><h1>SpiderBot <b>//</b> Resultados</h1><div class="sub">Solana · meme coins · Paper Trading</div></div>
  <span class="est" id="est"><i></i><span id="est-t">a ligar…</span></span>
 </header>
 <div class="aviso"><b>Simulação (Paper Trading).</b> Nenhuma operação usa dinheiro real. Os resultados são simulados com preços reais do mercado e custos estimados, e não garantem resultados futuros. Isto não é aconselhamento financeiro.</div>
