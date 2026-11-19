@@ -196,9 +196,10 @@ class PaperTradingLimitsTests(unittest.TestCase):
         limits = load_operational_config(self.write_config())
         self.assertEqual(limits["max_eur_per_operation"], Decimal("5.0"))
         self.assertEqual(limits["max_open_positions"], 1)
+        self.assertEqual(load_operational_config(self.write_config(max_open_positions=5))["max_open_positions"], 5)
         for override in (
             {"mode": "live"}, {"live_trading_enabled": True},
-            {"private_keys_in_application": True}, {"max_open_positions": 2},
+            {"private_keys_in_application": True}, {"max_open_positions": 6}, {"max_open_positions": 0},
             {"manual_confirmation_required": False},
             {"reject_duplicate_orders": False},
             {"require_cost_estimate_before_approval": False},
@@ -414,7 +415,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
         executor, state, cfg = executor_fixture(self.temp.name, capital=1000)
         path = Path(cfg["_operational_config_path"])
         safe = json.loads(path.read_text(encoding="utf-8"))
-        for key, value in (("live_trading_enabled", True), ("max_open_positions", 2),
+        for key, value in (("live_trading_enabled", True), ("max_open_positions", 6),
                            ("max_eur_per_operation", 5.01)):
             with self.subTest(key=key):
                 changed = dict(safe, **{key: value})

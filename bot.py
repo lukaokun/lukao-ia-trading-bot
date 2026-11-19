@@ -41,7 +41,9 @@ import shutil
 import socket
 import sys
 import tempfile
+import collections
 import threading
+import urllib.parse
 import time
 import uuid
 from dataclasses import dataclass
@@ -141,7 +143,12 @@ CONFIG = {
     "gravar_percursos": True,        # grava o percurso do preco de cada sinal (comprado ou nao)
     "percurso_minutos": 180,         # durante quantos minutos segue cada sinal
     "percursos_max_ativos": 26,      # quantos sinais segue ao mesmo tempo (26 + 4 posicoes = 1 pedido)
-    "percursos_controlo_max": 12,    # grupo de controlo: segue tambem tokens RECUSADOS, para ver se os filtros ajudam
+    "percursos_controlo_max": 12,
+    "percursos_manuais_max": 5,
+    "acompanhar_stop_alternativo_pct": -25,
+    "compra_manual": True,           # botao Comprar (Paper) nos tokens analisados a mao: cria uma PROPOSTA (confirmacao manual)
+    "recuperar_entrada_lucro_min_pct": 10,
+    "impacto_compra_manual_max_pct": 3.0,  # impacto Jupiter maximo nas TUAS compras manuais (nunca acima do slippage maximo)  # "Recuperar entrada" so com a posicao manual pelo menos X% acima da entrada (liquido)  # nos acompanhados, mostra tambem como correria com ESTE stop (so comparacao)      # tokens acompanhados a pedido (botao "Acompanhar"); nunca entram nas estatisticas    # grupo de controlo: segue tambem tokens RECUSADOS, para ver se os filtros ajudam
     "percursos_controlo_pontuacao_min": 50,  # ...so recusados com pontuacao calculada >= X (comparaveis)
     "ficheiro_percursos": "percursos.jsonl",
     # Pontos finos (SO GRAVACAO, nao decide nada): preco de VENDA real no Jupiter dos sinais seguidos, para o
@@ -171,6 +178,9 @@ CONFIG = {
     # ---------------- Telegram (opcional) ----------------
     "telegram_resumo_min": 60,       # envia um resumo de X em X minutos (0 = desligado)
     "telegram_botoes": True,         # botoes Aprovar/Recusar nas propostas (so o chat privado configurado)
+    "analise_manual": True,           # analisar um token qualquer a pedido (Telegram e dashboard); SO mostra, nunca compra
+    "analise_manual_intervalo_seg": 5,  # minimo entre duas analises manuais
+    "analise_manual_cache_seg": 60,     # o mesmo token pedido de novo dentro deste tempo devolve a mesma analise
     "telegram_venda_manual": True,   # botao "Vender agora" nas mensagens de compra (venda Paper, com confirmacao)
 
     # ---------------- Plataforma web (sinais em direto) ----------------
@@ -194,6 +204,7 @@ URL_GECKO_NOVAS_POOLS = "https://api.geckoterminal.com/api/v2/networks/solana/ne
 MINTS_BASE_IGNORADOS = {"So11111111111111111111111111111111111111112",  # SOL
                         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
                         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}  # USDT
+URL_PAR_DIRETO = DEX + "/latest/dex/pairs/solana/{}"   # analise manual: quando colam o endereco do PAR
 URL_RUGCHECK = "https://api.rugcheck.xyz/v1/tokens/{}/report/summary"
 MAX_ENDERECOS_POR_PEDIDO = 30
 
@@ -394,7 +405,9 @@ class TelegramDecisoes:
 
     ERROS_FATAIS = ("http_401", "http_404", "http_409")
 
-    def __init__(self, token, chat, decidir, pendente, avisar=None, post=None, vender=None, posicao_aberta=None):
+    def __init__(self, token, chat, decidir, pendente, avisar=None, post=None, vender=None, posicao_aberta=None,
+                 analisar=None, em_fundo=True, acompanhar=None, acompanhados=None, comprar=None,
+                 recuperar=None, pode_recuperar=None, deixar=None):
         self.token = str(token or "").strip()
         self.chat = str(chat or "").strip()
         self.decidir = decidir      # fn(proposal_id, "aprovar"|"recusar") -> (ok, mensagem)
@@ -402,6 +415,15 @@ class TelegramDecisoes:
         self.avisar = avisar        # fn(texto): aviso unico se os botoes tiverem de ser desligados
         self.vender = vender                  # fn(mint) -> (ok, mensagem): pede a venda manual ao ciclo principal
         self.posicao_aberta = posicao_aberta  # fn(mint) -> bool
+        self.analisar = analisar    # fn(texto) -> texto da resposta: analise manual de um token (so mostra)
+        self.em_fundo = em_fundo    # a analise corre numa thread propria (os cliques nunca esperam por ela)
+        self.acompanhar = acompanhar  # fn(mint) -> (ok, mensagem): segue o preco do token (so laboratorio)
+        self.acompanhados = acompanhados  # fn() -> texto: estado ao vivo dos tokens acompanhados
+        self.comprar = comprar            # fn(mint) -> (ok, msg): cria uma PROPOSTA Paper (confirmas a seguir)
+        self.recuperar = recuperar        # fn(mint) -> (ok, msg): pede a venda da parte que paga a entrada
+        self.pode_recuperar = pode_recuperar  # fn(mint) -> bool: posicao manual com a entrada por recuperar
+        self.deixar = deixar              # fn(mint) -> (ok, msg): deixa de acompanhar um token (so laboratorio)
+        self._a_analisar = threading.Event()
         self._post = post           # so nos testes
         # so chat privado: num grupo, outros membros poderiam carregar nos botoes
         self.ativo = bool(self.token) and re.fullmatch(r"\d{3,20}", self.chat) is not None
@@ -418,8 +440,23 @@ class TelegramDecisoes:
                  {"text": "❌ Recusar", "callback_data": "r:" + proposal_id}]]
 
     @staticmethod
-    def botoes_venda(mint):
-        return [[{"text": "🔴 Vender agora", "callback_data": "v:" + mint}]]
+    def botoes_venda(mint, recuperar=False):
+        linhas = [[{"text": "🔴 Vender agora", "callback_data": "v:" + mint}]]
+        if recuperar:
+            linhas.append([{"text": "💰 Recuperar entrada", "callback_data": "p:" + mint}])
+        return linhas
+
+    @staticmethod
+    def botoes_confirmar_recuperar(mint):
+        return [[{"text": "✅ Sim, recuperar", "callback_data": "z:" + mint},
+                 {"text": "↩️ Não", "callback_data": "k:" + mint}]]
+
+    def _botoes_posicao(self, mint):
+        try:
+            rec = callable(self.pode_recuperar) and bool(self.pode_recuperar(mint))
+        except Exception:
+            rec = False
+        return self.botoes_venda(mint, recuperar=rec)
 
     @staticmethod
     def botoes_confirmar_venda(mint):
@@ -495,7 +532,10 @@ class TelegramDecisoes:
                          name="telegram-fechar", daemon=True).start()
 
     def processar(self, update):
-        """Trata um clique. Devolve o que aconteceu (para o registo e para os testes)."""
+        """Trata um clique (ou uma mensagem de texto). Devolve o que aconteceu (para o registo e para os testes)."""
+        msg = update.get("message") if isinstance(update, dict) else None
+        if isinstance(msg, dict):
+            return self._processar_mensagem(msg)
         cq = update.get("callback_query") if isinstance(update, dict) else None
         if not isinstance(cq, dict):
             return None
@@ -508,7 +548,25 @@ class TelegramDecisoes:
             log.warning("Telegram: clique ignorado (nao veio do chat privado configurado)")
             return "nao_autorizado"
         dados = str(cq.get("data") or "")
-        mv = re.fullmatch(r"([vyk]):([A-Za-z0-9]{30,50})", dados)  # o mesmo formato que MINT_VALIDO
+        md = re.fullmatch(r"d:([A-Za-z0-9]{30,50})", dados)
+        if md:
+            if not callable(self.deixar):
+                self._responder(callback_id, "Indisponível.")
+                return "invalido"
+            try:
+                ok, mensagem = self.deixar(md.group(1))
+            except Exception:
+                log.exception("Falha ao deixar de acompanhar pelo Telegram")
+                ok, mensagem = False, "erro interno; nada foi alterado"
+            self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+            return "parar" if ok else "parar_recusado"
+        mw = re.fullmatch(r"w:([A-Za-z0-9]{30,50})", dados)
+        if mw:
+            return self._processar_acompanhar(mw.group(1), callback_id, message_id)
+        mc = re.fullmatch(r"c:([A-Za-z0-9]{30,50})", dados)
+        if mc:
+            return self._processar_comprar(mc.group(1), callback_id)
+        mv = re.fullmatch(r"([vykpz]):([A-Za-z0-9]{30,50})", dados)  # o mesmo formato que MINT_VALIDO
         if mv:
             return self._processar_venda(mv.group(1), mv.group(2), callback_id, message_id)
         m = re.fullmatch(r"([arsn]):([0-9a-f]{32})", dados)
@@ -545,18 +603,132 @@ class TelegramDecisoes:
                               else "❌ Recusada no Telegram.", message_id=message_id)
         return decisao
 
+    AJUDA = ("🔎 Análise manual [PAPER]\n"
+             "Cola aqui o endereço (contrato/mint) de um token de Solana, ou /analisar <endereço>. "
+             "Também serve um link do DexScreener ou do pump.fun.\n"
+             "Respondo com a pontuação que o Analista daria e porquê. Só mostra: o bot não compra por isto.\n"
+             "/acompanhados — estado ao vivo dos tokens que pediste para acompanhar.")
+
+    def _enviar(self, texto, botoes=None):
+        corpo = {"chat_id": self.chat, "text": str(texto)[:4000], "disable_web_page_preview": True}
+        if botoes:
+            corpo["reply_markup"] = {"inline_keyboard": botoes}
+        self._api("sendMessage", corpo)
+
+    @staticmethod
+    def botoes_acompanhar(mint):
+        return [[{"text": "👁 Acompanhar (só laboratório)", "callback_data": "w:" + mint}]]
+
+    def _processar_acompanhar(self, mint, callback_id, message_id):
+        if not callable(self.acompanhar):
+            self._responder(callback_id, "Acompanhamento desligado.")
+            return "invalido"
+        try:
+            ok, mensagem = self.acompanhar(mint)
+        except Exception:
+            log.exception("Falha ao pedir acompanhamento pelo Telegram")
+            ok, mensagem = False, "erro interno; nada foi alterado"
+        self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+        if ok:
+            self._mudar_botoes(message_id, None)
+        return "acompanhar" if ok else "acompanhar_recusado"
+
+    def _processar_mensagem(self, msg):
+        if not callable(self.analisar):  # sem analise manual, as mensagens de texto sao ignoradas como antes
+            return None
+        de = str(obter(msg, "from", "id", defeito=""))
+        chat = str(obter(msg, "chat", "id", defeito=""))
+        if de != self.chat or chat != self.chat:
+            log.warning("Telegram: mensagem ignorada (nao veio do chat privado configurado)")
+            return "nao_autorizado"
+        texto = str(msg.get("text") or "").strip()[:600]
+        if texto and texto.split()[0].lower().split("@")[0] in ("/acompanhados", "/ao_vivo") and callable(self.acompanhados):
+            try:
+                resposta = self.acompanhados()
+                lista = []
+                if isinstance(resposta, tuple):  # (texto, [(mint, simbolo), ...])
+                    resposta, lista = resposta
+                botoes = [[{"text": f"✖ Deixar de acompanhar ${str(s)[:14]}", "callback_data": "d:" + m}]
+                          for m, s in lista[:5] if isinstance(m, str) and re.fullmatch(r"[A-Za-z0-9]{30,50}", m)]
+                self._enviar(resposta, botoes if botoes and callable(self.deixar) else None)
+            except Exception:
+                log.exception("Erro no /acompanhados")
+                self._enviar("⚠️ Erro técnico; tenta outra vez.")
+            return "acompanhados"
+        if not texto or texto.split()[0].lower().split("@")[0] in ("/start", "/ajuda", "/help") \
+                or not MINT_EM_TEXTO.search(texto):
+            self._enviar(self.AJUDA)
+            return "ajuda"
+        if self._a_analisar.is_set():
+            self._enviar("⏳ Já estou a analisar outro token; tenta daqui a uns segundos.")
+            return "ocupado"
+        self._a_analisar.set()
+
+        def correr():
+            mint, sem_compra = None, False
+            try:
+                resposta = self.analisar(texto)
+                sem_compra = False
+                if isinstance(resposta, tuple):  # (texto, mint analisado ou None[, compra indisponivel])
+                    resposta, mint, *resto = resposta
+                    sem_compra = bool(resto and resto[0])
+            except Exception:
+                log.exception("Erro na analise manual pedida no Telegram")
+                resposta = "⚠️ Erro técnico na análise; nada foi alterado."
+            finally:
+                self._a_analisar.clear()
+            ok_mint = isinstance(mint, str) and re.fullmatch(r"[A-Za-z0-9]{30,50}", mint)
+            botoes = (self.botoes_acompanhar(mint) if ok_mint and callable(self.acompanhar) else []) + (
+                [[{"text": "🟢 Comprar (Paper, com confirmação)", "callback_data": "c:" + mint}]]
+                if ok_mint and callable(self.comprar) and not sem_compra else [])
+            self._enviar(resposta, botoes or None)
+        if self.em_fundo:
+            self._enviar("🔎 A analisar…")
+            threading.Thread(target=correr, name="analise-manual", daemon=True).start()
+        else:
+            correr()
+        return "analise"
+
+    def _processar_comprar(self, mint, callback_id):
+        if not callable(self.comprar):
+            self._responder(callback_id, "Compra manual desligada.")
+            return "invalido"
+        try:
+            ok, mensagem = self.comprar(mint)
+        except Exception:
+            log.exception("Falha ao pedir compra manual pelo Telegram")
+            ok, mensagem = False, "erro interno; nada foi feito"
+        self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+        return "comprar" if ok else "comprar_recusado"
+
     def _processar_venda(self, acao, mint, callback_id, message_id):
         aberta = callable(self.posicao_aberta) and callable(self.vender) and self.posicao_aberta(mint)
         if not aberta:
             self._responder(callback_id, "Esta posição já está fechada.", alerta=True)
             self._mudar_botoes(message_id, None)
             return "venda_fechada"
+        if acao in ("p", "z"):
+            if not callable(self.recuperar):
+                self._responder(callback_id, "Recuperar entrada indisponível.")
+                return "invalido"
+            if acao == "p":
+                self._mudar_botoes(message_id, self.botoes_confirmar_recuperar(mint))
+                self._responder(callback_id, "Vender só a parte que paga a entrada?")
+                return "confirmar_recuperar"
+            try:
+                ok, mensagem = self.recuperar(mint)
+            except Exception:
+                log.exception("Falha ao pedir recuperar entrada pelo Telegram")
+                ok, mensagem = False, "erro interno; nada foi vendido"
+            self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+            self._mudar_botoes(message_id, self._botoes_posicao(mint) if not ok else self.botoes_venda(mint))
+            return "recuperar" if ok else "recuperar_recusado"
         if acao == "v":
             self._mudar_botoes(message_id, self.botoes_confirmar_venda(mint))
             self._responder(callback_id, "Confirma a venda Paper agora?")
             return "confirmar_venda"
         if acao == "k":
-            self._mudar_botoes(message_id, self.botoes_venda(mint))
+            self._mudar_botoes(message_id, self._botoes_posicao(mint))
             self._responder(callback_id, "Cancelado: a posição continua aberta.")
             return "venda_cancelada"
         try:
@@ -566,7 +738,7 @@ class TelegramDecisoes:
             ok, mensagem = False, "erro interno; nada foi vendido"
         if not ok:
             self._responder(callback_id, f"Não foi possível: {mensagem}", alerta=True)
-            self._mudar_botoes(message_id, self.botoes_venda(mint))
+            self._mudar_botoes(message_id, self._botoes_posicao(mint))
             return "venda_recusada"
         log.info("Venda manual PAPER pedida no Telegram para %s", mint)
         self._responder(callback_id, "A vender em Paper; recebes a mensagem de venda em segundos.")
@@ -587,7 +759,7 @@ class TelegramDecisoes:
 
     def ciclo(self, timeout=25):
         """Um pedido getUpdates. Devolve o numero de cliques tratados, ou o erro."""
-        corpo = {"timeout": timeout, "allowed_updates": ["callback_query"]}
+        corpo = {"timeout": timeout, "allowed_updates": self._tipos()}
         if self.offset is not None:
             corpo["offset"] = self.offset
         resultado, erro = self._api("getUpdates", corpo, timeout=timeout + 10)
@@ -607,9 +779,12 @@ class TelegramDecisoes:
                 log.exception("Erro a tratar um clique do Telegram")
         return tratados
 
+    def _tipos(self):
+        return ["callback_query", "message"] if callable(self.analisar) else ["callback_query"]
+
     def descartar_antigos(self):
         """Ao arrancar, ignora cliques feitos enquanto o bot estava parado."""
-        resultado, erro = self._api("getUpdates", {"offset": -1, "timeout": 0, "allowed_updates": ["callback_query"]})
+        resultado, erro = self._api("getUpdates", {"offset": -1, "timeout": 0, "allowed_updates": self._tipos()})
         if erro:
             if erro in self.ERROS_FATAIS:
                 self._desligar(erro)
@@ -667,11 +842,12 @@ def motivo_legivel(motivo):
     return m or "—"
 
 
-def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90, com_botoes=False):
+def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90, com_botoes=False, manual=False):
     par = par if isinstance(par, dict) else {}
     minimo = cfg.get("pontuacao_minima")
-    L = [f"🔔 [PAPER] NOVA PROPOSTA — ${simbolo}",
-         f"Pontuação: {pontuacao}/100" + (f" (mínimo {num(minimo):.0f})" if minimo is not None else ""),
+    L = [f"🔔 [PAPER] {'PROPOSTA MANUAL (escolha tua)' if manual else 'NOVA PROPOSTA'} — ${simbolo}",
+         f"Pontuação: {pontuacao if pontuacao is not None else '—'}/100"
+         + (f" (mínimo {num(minimo):.0f})" if minimo is not None else ""),
          f"Valor a simular: ${num(valor_usd):.2f}", ""]
     liq, mcap = num(obter(par, "liquidity", "usd")), num(par.get("marketCap")) or num(par.get("fdv"))
     partes = ([f"Liquidez: ${liq:,.0f}"] if liq > 0 else []) + ([f"Market cap: ${mcap:,.0f}"] if mcap > 0 else [])
@@ -698,6 +874,60 @@ def texto_proposta(cfg, simbolo, mint, pontuacao, valor_usd, par, segundos=90, c
     return "\n".join(L + ([link] if link else []))
 
 
+MOTIVOS_PERCURSO = {"stop": "saía no stop-loss", "alvo": "saía no alvo", "trailing": "saía no trailing stop",
+                    "tempo": "saía no tempo máximo", "rug": "apanhado pelo rug", "desapareceu": "o token desapareceu",
+                    "fim": "ainda aberto no fim"}
+PONTOS_ANALISTA = (("liquidez", "Liquidez", 20), ("mcap/liq", "Market cap/liquidez", 10), ("idade", "Idade", 10),
+                   ("volume", "Volume", 20), ("compras", "Pressão compradora", 20), ("momento", "Momento", 5),
+                   ("acumulacao", "Acumulação", 5), ("rugcheck", "RugCheck", 10))
+_ICONE_CRITERIO = {"passed": "✅", "rejected": "❌", "pending_data": "⏸", "not_evaluated": "·"}
+
+
+def texto_analise_manual(r):
+    """Mensagem do Telegram para uma analise manual (r = AnaliseManual.analisar)."""
+    estado = {"approved": "✅ O Analista APROVARIA", "rejected": "❌ O Analista RECUSARIA",
+              "pending_data": "⏸ Dados incompletos", "technical_error": "⚠️ Erro técnico",
+              "no_pair": "❓ Sem par utilizável"}.get(r.get("status"), str(r.get("status")))
+    nome = f" · {r['nome']}" if r.get("nome") else ""
+    L = [f"🔎 [PAPER] ANÁLISE MANUAL — ${r.get('simbolo') or '?'}{nome}", r.get("mint", ""), ""]
+    L.append((f"Pontuação: {r['pontuacao']}/100 (mínimo {r['minimo']:.0f}) → " if r.get("pontuacao") is not None
+              else "Pontuação: — → ") + estado)
+    if r.get("status") != "approved" and r.get("bloqueio"):
+        L.append("Motivo: " + str(r["bloqueio"])[:300])
+    partes = [f"Liquidez ${r['liq']:,.0f}" if r.get("liq") else None,
+              f"MC ${r['mcap']:,.0f}" if r.get("mcap") else None,
+              (f"idade {r['idade_min']:.0f} min" if r["idade_min"] < 120 else f"idade {r['idade_min'] / 60:.1f} h")
+              if r.get("idade_min") is not None else None]
+    if any(partes):
+        L.append("💧 " + " · ".join(p for p in partes if p))
+    partes = [f"5 min {r['var_m5']:+.0f}%" if r.get("var_m5") is not None else None,
+              f"1 h {r['var_h1']:+.0f}%" if r.get("var_h1") is not None else None,
+              f"volume 1 h ${r['vol_h1']:,.0f}" if r.get("vol_h1") else None,
+              f"compras 1 h {r['compras_pct']:.0f}%" if r.get("compras_pct") is not None else None]
+    if any(partes):
+        L.append("📈 " + " · ".join(p for p in partes if p))
+    if r.get("pontos"):
+        L += ["", "Pontos: " + " · ".join(f"{p['nome']} {p['pontos']:.0f}/{p['max']}" for p in r["pontos"])]
+    h = r.get("historico")
+    if h:
+        L += ["", f"📚 Histórico ({h['n']} {h['grupo']}, regras atuais): acerto {h['acerto']:.0f}%, "
+                  f"média {h['media']:+.1f}% por trade; {h['a50']:.0f}% chegaram a +50%, {h['rug']:.0f}% acabaram em rug."
+              + (" Poucos dados: é sobretudo sorte." if h["n"] < 20 else "")]
+    criterios = [c for c in r.get("criterios") or [] if c.get("status") in ("rejected", "pending_data")
+                 and c.get("id") != "pontuacao_minima"]
+    for c in criterios[:3]:
+        L.append(f"{_ICONE_CRITERIO.get(c['status'], '·')} {c.get('nome')}: {c.get('motivo') or c.get('observado')}"[:200])
+    if not r.get("liquidez_visivel", True):
+        L += ["", ("⚠️ Ainda na curva do pump.fun: " if r.get("curva_pump") else "⚠️ ")
+              + "sem liquidez visível no DexScreener, por isso a compra Paper fica indisponível até o token graduar "
+              "(passar para uma pool normal). Podes acompanhá-lo entretanto."]
+    L += ["", "ℹ️ Só análise: o bot não compra nem cria proposta por isto. Nas compras reais há ainda filtros extra "
+          "e a tua confirmação."]
+    if r.get("link"):
+        L.append(r["link"])
+    return "\n".join(L)[:4000]
+
+
 def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquidez, com_botao=False):
     saidas = []
     if cfg.get("stop_loss_pct") is not None:
@@ -708,7 +938,7 @@ def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquid
         if cfg.get("tempo_maximo_min"):
             saidas.append(f"máximo {num(cfg['tempo_maximo_min']):.0f} min")
     L = [f"🟢 [PAPER] COMPRA — ${simbolo}",
-         f"Valor: ${num(valor_usd):.2f} · Pontuação: {pontuacao}/100",
+         f"Valor: ${num(valor_usd):.2f} · Pontuação: {pontuacao if pontuacao is not None else '—'}/100",
          f"Preço de entrada: ${preco_txt(preco_entrada)}"]
     if num(liquidez) > 0:
         L.append(f"Liquidez: ${num(liquidez):,.0f}")
@@ -718,6 +948,13 @@ def texto_compra(cfg, simbolo, mint, valor_usd, preco_entrada, pontuacao, liquid
         L.append("Para vender antes, usa o botão em baixo.")
     link = _link_dexscreener(mint)
     return "\n".join(L + ([link] if link else []))
+
+
+def texto_venda_parcial(simbolo, receita, custo, fracao, pnl_pct_posicao, carteira):
+    return "\n".join([f"💰 [PAPER] ENTRADA RECUPERADA — ${simbolo}",
+                      f"Vendidos {fracao * 100:.0f}% dos tokens por ${receita:.2f} (a entrada foi ${custo:.2f}).",
+                      f"A posição estava a {pnl_pct_posicao:+.1f}%. O resto continua aberto com o stop e o trailing.",
+                      f"Carteira: ${num(carteira):.2f}"])
 
 
 def texto_venda(simbolo, motivo, pnl, pnl_pct, duracao_min, carteira):
@@ -1280,6 +1517,165 @@ class Analista:
                                ) | {"acumulacao": acumulacao}
 
 
+MINT_EM_TEXTO = re.compile(r"(?<![A-Za-z0-9])([1-9A-HJ-NP-Za-km-z]{32,44})(?![A-Za-z0-9])")
+
+
+class AnaliseManual:
+    """Analisa UM token a pedido (endereco colado no Telegram ou no dashboard) com o mesmo Analista do bot.
+    So le dados publicos (DexScreener e RugCheck): nao mexe no estado, nao cria propostas, nao compra.
+    Uma analise de cada vez, com intervalo minimo e cache curta, para nao gastar os limites das APIs."""
+
+    def __init__(self, cfg, http):
+        self.cfg = cfg
+        self.http = http          # fn() -> cliente http
+        self._lock = threading.Lock()
+        self._ultimo = None
+        self._cache = {}
+        self.pares = {}           # mint -> (instante, par, analise): para o botao "Acompanhar"
+        self._hist = (None, [])   # (mtime do ficheiro de percursos, percursos lidos)
+
+    def analisar(self, texto):
+        """Devolve (True, resultado) ou (False, mensagem para o utilizador)."""
+        if not self.cfg.get("analise_manual", True):
+            return False, "a análise manual está desligada na configuração"
+        m = MINT_EM_TEXTO.search(str(texto or "")[:600])
+        if not m:
+            return False, "não encontrei um endereço de token (cola o endereço do contrato, o 'mint')"
+        endereco = m.group(1)
+        guardado = self._cache.get(endereco)
+        if guardado and agora() - guardado[0] < num(self.cfg.get("analise_manual_cache_seg"), 60):
+            return True, guardado[1]
+        if not self._lock.acquire(blocking=False):
+            return False, "já há uma análise em curso; tenta daqui a uns segundos"
+        try:
+            falta = (num(self.cfg.get("analise_manual_intervalo_seg"), 5) - (agora() - self._ultimo)
+                     if self._ultimo is not None else 0)
+            if falta > 0:
+                return False, f"espera {math.ceil(falta)} s entre análises"
+            self._ultimo = agora()
+            res = self._analisar(endereco)
+            if isinstance(res, dict):
+                self._cache[endereco] = self._cache[res["mint"]] = (agora(), res)
+                while len(self._cache) > 200:
+                    self._cache.pop(next(iter(self._cache)))
+                return True, res
+            return False, res
+        except Exception as exc:  # nunca deixa a analise manual afetar o bot
+            log.exception("Erro na analise manual de %s", endereco)
+            return False, f"erro técnico ({type(exc).__name__}); nada foi alterado"
+        finally:
+            self._lock.release()
+
+    def _analisar(self, endereco):
+        http = self.http()
+        pares = buscar_pares(http, [endereco])
+        if pares is None:
+            return "o DexScreener não respondeu; tenta daqui a pouco"
+        mint, lista = endereco, pares.get(endereco) or []
+        if not lista:  # talvez seja o endereco do PAR (o que aparece no link do DexScreener)
+            dados = http.get_json(URL_PAR_DIRETO.format(endereco), "pares")
+            for par in extrair_pares(dados) if dados is not None else []:
+                base = obter(par, "baseToken", "address")
+                if str(par.get("chainId", "solana")).lower() == "solana" and isinstance(base, str) \
+                        and MINT_VALIDO.fullmatch(base):
+                    mint = base
+                    lista = (buscar_pares(http, [mint]) or {}).get(mint) or [par]
+                    break
+        par = melhor_par(lista)
+        if par is None:
+            return "não encontrei nenhum par deste token em Solana no DexScreener"
+        analise = Analista(self.cfg, http).analisar(mint, par)
+        self.pares[mint] = (agora(), par, analise)
+        while len(self.pares) > 200:
+            self.pares.pop(next(iter(self.pares)))
+        res = self._resumo(mint, par, analise)
+        try:
+            res["historico"] = self.historico(analise.get("pontuacao"))
+        except Exception:  # o historico e so contexto: nunca estraga a analise
+            log.exception("Historico da analise manual indisponivel")
+            res["historico"] = None
+        return res
+
+    def analisar_agora(self, endereco, espera=15):
+        """Analise sem o intervalo minimo (para o ciclo principal, ex.: compra pedida depois de um reinicio)."""
+        if not self._lock.acquire(timeout=espera):
+            return False, "já há uma análise em curso; tenta outra vez"
+        try:
+            res = self._analisar(endereco)
+            return (True, res) if isinstance(res, dict) else (False, res)
+        except Exception as exc:
+            log.exception("Erro na analise manual de %s", endereco)
+            return False, f"erro técnico ({type(exc).__name__})"
+        finally:
+            self._lock.release()
+
+    def historico(self, pontuacao):
+        """O que aconteceu, com as regras atuais, aos percursos gravados com pontuacao parecida."""
+        caminho = self.cfg.get("ficheiro_percursos")
+        try:
+            mtime = os.path.getmtime(caminho)
+        except (OSError, TypeError):
+            return None
+        if self._hist[0] != mtime:
+            self._hist = (mtime, [pc for pc in ler_percursos(self.cfg) if pc.get("grupo") != "manual"])
+        todos = self._hist[1]
+        if pontuacao is None or not todos:
+            return None
+        p = num(pontuacao)
+        if p >= 70:
+            lo, hi = (70, 79) if p < 80 else (80, 89) if p < 90 else (90, 100)
+            grupo = [pc for pc in todos if pc.get("grupo", "sinal") == "sinal" and lo <= num(pc.get("pontuacao")) <= hi]
+            nome = f"sinais com {lo}–{hi} pontos"
+        else:
+            grupo = [pc for pc in todos if pc.get("grupo") == "controlo" and num(pc.get("pontuacao")) < 70]
+            nome = "recusados com menos de 70 pontos"
+        if not grupo:
+            return None
+        atual = (self.cfg["stop_loss_pct"], self.cfg["take_profit_pct"], self.cfg["trailing_ativar_pct"],
+                 self.cfg["trailing_distancia_pct"], self.cfg["tempo_maximo_min"])
+        media, acerto = _medir(grupo, atual, self.cfg)
+        n = len(grupo)
+        return {"grupo": nome, "n": n, "acerto": round(acerto, 1), "media": round(media, 2),
+                "rug": round(sum(1 for pc in grupo if pc.get("fim") != "tempo") / n * 100.0, 1),
+                "a50": round(sum(1 for pc in grupo if max(x[1] for x in pc["pts"]) >= 1.5) / n * 100.0, 1)}
+
+    def _resumo(self, mint, par, analise):
+        def n(*caminho):
+            v = Analista._numero_presente(obter(par, *caminho, defeito=None))[0]
+            return v
+        criado = n("pairCreatedAt")
+        compras, vendas = n("txns", "h1", "buys") or 0, n("txns", "h1", "sells") or 0
+        nome = obter(par, "baseToken", "name")
+        d = analise.get("detalhes") or {}
+        bloqueio = analise.get("blocking_criterion") or {}
+        motivo = analise.get("motivo") if analise.get("status") != "approved" else ""
+        if analise.get("status") == "rejected" and bloqueio.get("id") == "pontuacao_minima":
+            motivo = "pontuação abaixo do mínimo"
+        return {
+            "mint": mint, "simbolo": simbolo_limpo(par),
+            "nome": "".join(ch for ch in nome if ch.isprintable())[:60].strip() if isinstance(nome, str) else "",
+            "link": _link_dexscreener(mint), "preco": n("priceUsd"), "liq": n("liquidity", "usd"),
+            "liquidez_visivel": (n("liquidity", "usd") or 0) > 0,
+            "curva_pump": str(par.get("dexId") or "").lower() == "pumpfun" or (
+                not (n("liquidity", "usd") or 0) and mint.endswith("pump")),
+            "mcap": n("marketCap") or n("fdv"), "vol_h1": n("volume", "h1"),
+            "var_m5": n("priceChange", "m5"), "var_h1": n("priceChange", "h1"),
+            "idade_min": max(0.0, (agora() - criado / 1000.0) / 60.0) if criado else None,
+            "compras_pct": compras / (compras + vendas) * 100.0 if compras + vendas > 0 else None,
+            "status": analise.get("status"), "aprovado": analise.get("aprovado") is True,
+            "pontuacao": analise.get("pontuacao"), "minimo": num(self.cfg.get("pontuacao_minima")),
+            "bloqueio": motivo,
+            "pontos": [{"id": k, "nome": nome_c, "pontos": round(num(d[k]), 1), "max": mx}
+                       for k, nome_c, mx in PONTOS_ANALISTA if k in d],
+            "criterios": [{"id": c.get("id"), "nome": c.get("name"), "status": c.get("status"),
+                           "observado": c.get("observed") if isinstance(c.get("observed"), (int, float, str))
+                           else None, "limiar": c.get("threshold") if isinstance(c.get("threshold"), (int, float, str))
+                           else None, "motivo": c.get("reason")}
+                          for c in analise.get("criteria") or [] if isinstance(c, dict)],
+            "hora": hora_txt(),
+        }
+
+
 # ============================================================================
 # Carteira simulada: saldo, posicoes, ficheiros
 # ============================================================================
@@ -1474,6 +1870,12 @@ def _fechar_sinal_no_estado(estado, mint, pnl_pct, motivo):
 # ============================================================================
 # AGENTE 3 - EXECUTOR
 # ============================================================================
+def _limite_posicoes(cfg):
+    """Posicoes abertas permitidas: o valor da politica Paper (1 a MAX_OPEN_POSITIONS); em duvida, 1."""
+    v = cfg.get("max_posicoes_abertas") if isinstance(cfg, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= MAX_OPEN_POSITIONS else 1
+
+
 def _decimal_canonico(valor):
     """String decimal que round-trips para o mesmo valor numerico do Executor."""
     try:
@@ -2007,7 +2409,8 @@ class Executor:
 
     def capital(self):
         """Saldo livre + custo das posicoes abertas."""
-        return self.estado["saldo"] + sum(p["custo"] for p in self.estado["posicoes"].values())
+        return self.estado["saldo"] + sum(max(0.0, p["custo"] - num(p.get("recebido_parcial")))
+                                          for p in self.estado["posicoes"].values())
 
     def execution_conditions(self):
         return {
@@ -2040,9 +2443,10 @@ class Executor:
             positions_before = current_state.get("posicoes", {})
             positions_after = candidate_state.get("posicoes", {})
             new_mints = set(positions_after) - set(positions_before)
+            maximo = _limite_posicoes(self.cfg)
             if (debit > max_usd or debit != Decimal(_decimal_canonico(amount))
-                    or len(positions_before) >= MAX_OPEN_POSITIONS
-                    or len(positions_after) > MAX_OPEN_POSITIONS or len(new_mints) != 1):
+                    or len(positions_before) >= maximo
+                    or len(positions_after) > maximo or len(new_mints) != 1):
                 return False
             mint = next(iter(new_mints))
             fields = authorization.get("plan_fields")
@@ -2170,7 +2574,8 @@ class Executor:
                 or cfg.get("private_keys_in_application") is not False
                 or cfg.get("manual_confirmation_required") is not True):
             return 0.0, "modo Paper ou confirmacao manual obrigatoria indisponivel; compras bloqueadas"
-        if (cfg.get("max_posicoes_abertas") != MAX_OPEN_POSITIONS
+        mp = cfg.get("max_posicoes_abertas")
+        if (isinstance(mp, bool) or not isinstance(mp, int) or not 1 <= mp <= MAX_OPEN_POSITIONS
                 or cfg.get("max_eur_per_operation") is None
                 or Decimal(str(cfg["max_eur_per_operation"])) > MAX_OPERATION_EUR):
             return 0.0, "limites operacionais excedem a politica Paper; compras bloqueadas"
@@ -2181,8 +2586,8 @@ class Executor:
             return 0.0, "diario Paper pendente ou indisponivel; compras bloqueadas"
         if not getattr(self.bot, "_fx_rate_persisted", False):
             return 0.0, "taxa BCE ainda nao confirmada em estado.json; compras bloqueadas"
-        if len(e["posicoes"]) >= MAX_OPEN_POSITIONS:
-            return 0.0, f"maximo de {MAX_OPEN_POSITIONS} posicoes abertas"
+        if len(e["posicoes"]) >= _limite_posicoes(cfg):
+            return 0.0, f"maximo de {_limite_posicoes(cfg)} posicoes abertas"
         capital = self.capital()
         limite = cfg["parar_compras_se_perda_pct"]
         if limite and capital <= e["saldo_inicial"] * (1 - limite / 100.0):
@@ -2281,6 +2686,8 @@ class Executor:
                 "trailing": False, "aberta_em": agora(),
                 "pontuacao": analise["pontuacao"], "sem_dados": 0,
             }
+            if analise.get("origem") == "manual":
+                pos["origem"] = "manual"  # escolha do utilizador: resultados separados dos do bot
             candidato["posicoes"][mint] = pos
             linha = {
             "data_hora": data_txt(), "tipo": "COMPRA", "simbolo": simbolo, "mint": mint,
@@ -2288,7 +2695,8 @@ class Executor:
             "preco_efetivo": plan_fields["effective_price_usd"],
             "valor_usd": plan_fields["debit_total_usd"], "tokens": plan_fields["net_tokens"],
             "custos_usd": plan_fields["costs_usd"], "pnl_usd": "", "pnl_pct": "",
-            "motivo": "pontuacao", "pontuacao": analise["pontuacao"], "duracao_min": "",
+            "motivo": "manual" if analise.get("origem") == "manual" else "pontuacao",
+            "pontuacao": analise["pontuacao"] if analise["pontuacao"] is not None else "", "duracao_min": "",
             "saldo_depois": _decimal_canonico(candidato["saldo"]),
             "slippage_base_pct": plan_fields["slippage_base_pct"],
             "slippage_base_aplicado_pct": plan_fields["slippage_base_applied_pct"],
@@ -2323,7 +2731,7 @@ class Executor:
                 self.bot.telegram.enviar(
                     texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
                                  analise.get("pontuacao"), liq, com_botao=True),
-                    botoes=tgd.botoes_venda(mint),
+                    botoes=tgd.botoes_venda(mint, recuperar=analise.get("origem") == "manual"),
                     ao_enviar=lambda mid, texto, chave="pos:" + mint: tgd.registar_mensagem(chave, mid, texto))
             else:
                 self.bot.telegram.enviar(texto_compra(cfg, simbolo, mint, plan_fields["debit_total_usd"], preco_ef,
@@ -2341,7 +2749,7 @@ class Executor:
             pos = candidato["posicoes"].pop(mint, None)
             if pos is None:
                 return False
-            candidato["saldo"] += pos["custo"]
+            candidato["saldo"] += max(0.0, pos["custo"] - num(pos.get("recebido_parcial")))  # a parte ja recebida fica
             for sinal in reversed(candidato["sinais"]):
                 if sinal.get("mint") == mint and sinal.get("estado") == "comprado":
                     sinal["estado"], sinal["saida"] = "anulado", motivo
@@ -2368,14 +2776,15 @@ class Executor:
             else:
                 receita, preco_ef, custos = simular_venda(cfg, pos, preco, liquidez)
             candidato["saldo"] += receita
-            pnl = receita - pos["custo"]
+            pnl = receita + num(pos.get("recebido_parcial")) - pos["custo"]  # inclui a entrada ja recuperada
             pnl_pct = pnl / pos["custo"] * 100.0 if pos["custo"] else 0.0
             duracao = (agora() - pos["aberta_em"]) / 60.0
             st = candidato["stats"]
             st["fechados"] += 1
             st["ganhos" if pnl > 0 else "perdas"] += 1
             st["pnl_total"] += pnl
-            st["custos_total"] += custos + (pos["custo"] - pos["tokens"] * pos["preco_entrada"])
+            st["custos_total"] += (custos + num(pos.get("custos_parciais"))
+                                   + (pos["custo"] - num(pos.get("tokens_iniciais"), pos["tokens"]) * pos["preco_entrada"]))
             st["melhor"] = max(st["melhor"], pnl_pct)
             st["pior"] = min(st["pior"], pnl_pct)
             chave = motivo.split(" ")[0]
@@ -2388,7 +2797,8 @@ class Executor:
             "preco_mercado": preco_txt(preco), "preco_efetivo": preco_txt(preco_ef),
             "valor_usd": f"{receita:.4f}", "tokens": f"{pos['tokens']:.4f}",
             "custos_usd": f"{custos:.4f}", "pnl_usd": f"{pnl:.4f}", "pnl_pct": f"{pnl_pct:.2f}",
-            "motivo": motivo, "pontuacao": pos.get("pontuacao", ""), "duracao_min": f"{duracao:.1f}",
+            "motivo": motivo + (" [manual]" if pos.get("origem") == "manual" else ""),
+            "pontuacao": pos.get("pontuacao", ""), "duracao_min": f"{duracao:.1f}",
             "saldo_depois": f"{candidato['saldo']:.4f}",
             }
             self.bot.paper_operations.commit(e, candidato, linha, "SELL")
@@ -2398,6 +2808,59 @@ class Executor:
         except Exception:
             log.warning("Aviso de venda por Telegram falhou")
         return pnl
+
+
+    def vender_parcial(self, mint, preco, liquidez, motivo="PARCIAL recuperar entrada"):
+        """Vende so a parte que paga a entrada (posicoes MANUAIS em lucro). O resto continua aberto com as
+        mesmas regras (stop, trailing, tempo). Devolve (ok, mensagem)."""
+        cfg, e = self.cfg, self.estado
+        with self._purchase_lock:
+            pos0 = e["posicoes"].get(mint)
+            if pos0 is None:
+                return False, "a posição já está fechada"
+            if pos0.get("origem") != "manual":
+                return False, "só nas posições compradas por ti"
+            if pos0.get("entrada_recuperada"):
+                return False, "a entrada desta posição já foi recuperada"
+            custo = num(pos0.get("custo"))
+            total, _, _ = simular_venda(cfg, pos0, preco, liquidez)
+            minimo = 1 + num(cfg.get("recuperar_entrada_lucro_min_pct"), 10) / 100.0
+            if custo <= 0 or total < custo * minimo:
+                return False, (f"só com a posição pelo menos {(minimo - 1) * 100:.0f}% acima da entrada "
+                               f"(agora {(total / custo - 1) * 100 if custo > 0 else 0:+.1f}%)")
+            fracao = custo / total
+            for _ in range(3):  # vender menos tokens tem menos impacto: acerta a fracao para receber ~ a entrada
+                receita, _, _ = simular_venda(cfg, dict(pos0, tokens=pos0["tokens"] * fracao), preco, liquidez)
+                if receita <= 0:
+                    return False, "sem preço de venda válido"
+                fracao = min(0.95, fracao * custo / receita)
+            candidato = copy.deepcopy(e)
+            pos = candidato["posicoes"][mint]
+            tokens_v = pos["tokens"] * fracao
+            receita, preco_ef, custos = simular_venda(cfg, dict(pos, tokens=tokens_v), preco, liquidez)
+            candidato["saldo"] += receita
+            pos.setdefault("tokens_iniciais", pos["tokens"])
+            pos["tokens"] -= tokens_v
+            pos["recebido_parcial"] = round(num(pos.get("recebido_parcial")) + receita, 8)
+            pos["custos_parciais"] = round(num(pos.get("custos_parciais")) + custos, 8)
+            pos["entrada_recuperada"] = True
+            pos["recuperada_em"] = agora()
+            linha = {
+            "data_hora": data_txt(), "tipo": "VENDA", "simbolo": pos["simbolo"], "mint": mint,
+            "preco_mercado": preco_txt(preco), "preco_efetivo": preco_txt(preco_ef),
+            "valor_usd": f"{receita:.4f}", "tokens": f"{tokens_v:.4f}",
+            "custos_usd": f"{custos:.4f}", "pnl_usd": "", "pnl_pct": "",
+            "motivo": motivo + " [manual]", "pontuacao": pos.get("pontuacao", ""), "duracao_min": "",
+            "saldo_depois": f"{candidato['saldo']:.4f}",
+            }
+            self.bot.paper_operations.commit(e, candidato, linha, "SELL")
+        pnl_pct_pos = (total / custo - 1) * 100
+        self.bot.acao(f"VENDA PARCIAL {pos['simbolo']} [recuperar entrada] ${receita:.2f} ({fracao * 100:.0f}% dos tokens)")
+        try:
+            self.bot.telegram.enviar(texto_venda_parcial(pos["simbolo"], receita, custo, fracao, pnl_pct_pos, e["saldo"]))
+        except Exception:
+            log.warning("Aviso de venda parcial por Telegram falhou")
+        return True, f"vendidos {fracao * 100:.0f}% por ${receita:.2f}; o resto continua aberto"
 
 
 # ============================================================================
@@ -3433,9 +3896,6 @@ def _pagina_neural():
     return pagina if pagina.startswith("<!DOCTYPE html>") and "/api/estado" in pagina else None
 
 
-IMAGENS_ASSETS = ("/assets/mascote_oficial.png", "/assets/mascote_chifres.png")  # a 2.a e a do tema "Chifres"
-
-
 class _ServidorWeb(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = os.name != "nt"  # no Windows, reutilizar deixava dois bots abrir a mesma porta
@@ -3456,8 +3916,24 @@ class _PedidoWeb(BaseHTTPRequestHandler):
             corpo, tipo = PAGINA_HTML.encode("utf-8"), "text/html; charset=utf-8"
         elif caminho == "/api/estado":
             corpo, tipo = self.server.bot.snapshot.encode("utf-8"), "application/json; charset=utf-8"
-        elif caminho in IMAGENS_ASSETS:  # so imagens desta lista fixa; nenhum outro ficheiro da pasta e servido
-            caminho_mascote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", caminho.rsplit("/", 1)[1])
+        elif caminho in ("/api/analisar", "/api/acompanhados"):
+            try:
+                codigo, resposta = (_analise_dashboard(self) if caminho == "/api/analisar"
+                                    else _acompanhados_dashboard(self))
+            except Exception:
+                log.exception("Falha na analise manual do dashboard; nada foi alterado")
+                codigo, resposta = 500, {"ok": False, "mensagem": "erro interno; nada foi alterado"}
+            corpo = json.dumps(resposta, ensure_ascii=False).encode("utf-8")
+            self.send_response(codigo)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(corpo)
+            return
+        elif caminho == "/assets/mascote_oficial.png":
+            caminho_mascote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "mascote_oficial.png")
             try:
                 with open(caminho_mascote, "rb") as ficheiro:
                     corpo = ficheiro.read()
@@ -3477,12 +3953,16 @@ class _PedidoWeb(BaseHTTPRequestHandler):
         self.wfile.write(corpo)
 
     def do_POST(self):
-        """Unico endpoint de escrita: aprovar/recusar uma proposta Paper JA criada pelo bot."""
-        if self.path.split("?", 1)[0] != "/api/proposta/decisao":
+        """Escritas: aprovar/recusar uma proposta Paper JA criada pelo bot; e pedir para ACOMPANHAR um token
+        analisado a mao (so laboratorio: segue o preco, nunca compra)."""
+        caminho = self.path.split("?", 1)[0]
+        if caminho not in ("/api/proposta/decisao", "/api/acompanhar", "/api/manual"):
             self.send_error(404)
             return
         try:
-            codigo, resposta = _decisao_dashboard(self)
+            codigo, resposta = (_decisao_dashboard(self) if caminho == "/api/proposta/decisao"
+                                else _acompanhar_dashboard(self) if caminho == "/api/acompanhar"
+                                else _manual_dashboard(self))
         except Exception:
             log.exception("Falha ao processar decisao do dashboard; nada foi executado")
             codigo, resposta = 500, {"ok": False, "mensagem": "erro interno; nada foi executado"}
@@ -3500,6 +3980,138 @@ class _PedidoWeb(BaseHTTPRequestHandler):
 
 
 DECISAO_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _ler_pedido_local(pedido, maximo=512):
+    """Valida endereco, origem, chave da sessao e JSON. Devolve (dados, None) ou (None, (codigo, resposta))."""
+    bot = pedido.server.bot
+    recusa = lambda codigo, msg: (None, (codigo, {"ok": False, "mensagem": msg}))
+    token = getattr(bot, "dashboard_token", None)
+    porta = pedido.server.server_address[1]
+    locais = (f"127.0.0.1:{porta}", f"localhost:{porta}")
+    if pedido.headers.get("Host", "") not in locais:
+        return recusa(403, "endereco nao permitido")
+    if pedido.headers.get("Origin", "") not in tuple("http://" + h for h in locais):
+        return recusa(403, "origem nao permitida")
+    if not token or not hmac.compare_digest(str(pedido.headers.get("X-MemeBot-Token", "")), token):
+        return recusa(403, "chave da sessao invalida; recarrega o dashboard")
+    if not str(pedido.headers.get("Content-Type", "")).startswith("application/json"):
+        return recusa(415, "formato invalido")
+    try:
+        tamanho = int(pedido.headers.get("Content-Length", "0"))
+    except ValueError:
+        tamanho = -1
+    if not 0 < tamanho <= maximo:
+        return recusa(400, "pedido invalido")
+    try:
+        dados = json.loads(pedido.rfile.read(tamanho).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return recusa(400, "JSON invalido")
+    if not isinstance(dados, dict):
+        return recusa(400, "pedido invalido")
+    return dados, None
+
+
+def _manual_dashboard(pedido):
+    """Comprar (cria PROPOSTA), vender ou recuperar a entrada, pedidos no dashboard privado. Paper apenas."""
+    dados, erro = _ler_pedido_local(pedido)
+    if erro:
+        return erro
+    bot = pedido.server.bot
+    acao, mint = dados.get("acao"), dados.get("mint")
+    if acao == "comprar":
+        f = getattr(bot, "pedir_compra_manual", None)
+        ok, msg = f(mint, "dashboard") if callable(f) else (False, "compra manual indisponivel")
+    elif acao == "parar":
+        f = getattr(bot, "pedir_parar_acompanhamento", None)
+        ok, msg = f(mint, "dashboard") if callable(f) else (False, "indisponivel")
+    elif acao in ("vender", "recuperar"):
+        f = getattr(bot, "pedir_venda", None)
+        ok, msg = f(mint, "dashboard", parcial=acao == "recuperar") if callable(f) else (False, "venda indisponivel")
+    else:
+        return 400, {"ok": False, "mensagem": "acao invalida"}
+    return (200 if ok else 409), {"ok": ok, "mensagem": msg}
+
+
+def _acompanhar_dashboard(pedido):
+    """Pedido do dashboard para acompanhar um token (laboratorio). Mesmas protecoes que as decisoes."""
+    bot = pedido.server.bot
+    recusa = lambda codigo, msg: (codigo, {"ok": False, "mensagem": msg})
+    token = getattr(bot, "dashboard_token", None)
+    porta = pedido.server.server_address[1]
+    locais = (f"127.0.0.1:{porta}", f"localhost:{porta}")
+    if pedido.headers.get("Host", "") not in locais:
+        return recusa(403, "endereco nao permitido")
+    if pedido.headers.get("Origin", "") not in tuple("http://" + h for h in locais):
+        return recusa(403, "origem nao permitida")
+    if not token or not hmac.compare_digest(str(pedido.headers.get("X-MemeBot-Token", "")), token):
+        return recusa(403, "chave da sessao invalida; recarrega o dashboard")
+    if not str(pedido.headers.get("Content-Type", "")).startswith("application/json"):
+        return recusa(415, "formato invalido")
+    try:
+        tamanho = int(pedido.headers.get("Content-Length", "0"))
+    except ValueError:
+        tamanho = -1
+    if not 0 < tamanho <= 512:
+        return recusa(400, "pedido invalido")
+    try:
+        dados = json.loads(pedido.rfile.read(tamanho).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return recusa(400, "JSON invalido")
+    mint = dados.get("mint") if isinstance(dados, dict) else None
+    pedir = getattr(bot, "pedir_acompanhamento", None)
+    if not callable(pedir):
+        return recusa(409, "acompanhamento indisponivel")
+    ok, mensagem = pedir(mint, "dashboard")
+    return (200 if ok else 409), {"ok": ok, "mensagem": mensagem}
+
+
+def _acompanhados_dashboard(pedido):
+    """Estado ao vivo dos tokens acompanhados a mao. So leitura; endereco local e chave da sessao."""
+    bot = pedido.server.bot
+    token = getattr(bot, "dashboard_token", None)
+    porta = pedido.server.server_address[1]
+    if pedido.headers.get("Host", "") not in (f"127.0.0.1:{porta}", f"localhost:{porta}"):
+        return 403, {"ok": False, "mensagem": "endereco nao permitido"}
+    if not token or not hmac.compare_digest(str(pedido.headers.get("X-MemeBot-Token", "")), token):
+        return 403, {"ok": False, "mensagem": "chave da sessao invalida; recarrega o dashboard"}
+    cfg = getattr(bot, "cfg", {}) or {}
+    posicoes = []
+    try:
+        for m, p in list((getattr(bot, "estado", {}) or {}).get("posicoes", {}).items()):
+            if isinstance(p, dict):
+                custo = num(p.get("custo"))
+                valor = num(p.get("tokens")) * num(p.get("preco_atual")) + num(p.get("recebido_parcial"))
+                posicoes.append({"mint": m, "simbolo": p.get("simbolo"), "origem": p.get("origem") or "bot",
+                                 "custo": round(custo, 4), "pnl_pct": round((valor / custo - 1) * 100, 2) if custo else None,
+                                 "entrada_recuperada": bool(p.get("entrada_recuperada")),
+                                 "recebido": round(num(p.get("recebido_parcial")), 4)})
+    except Exception:
+        log.exception("Posicoes para o painel indisponiveis")
+    return 200, {"ok": True, "ativos": list(getattr(bot, "info_acompanhados", []) or []), "posicoes": posicoes,
+                 "terminados": list(getattr(bot, "manuais_terminados", []) or []),
+                 "maximo": int(num(cfg.get("percursos_manuais_max"), 5)), "hora": hora_txt()}
+
+
+def _analise_dashboard(pedido):
+    """Analise manual pedida no dashboard privado. So leitura: nao cria propostas nem compra.
+    Exige o endereco local e a chave da sessao (outro site nao consegue gastar os limites das APIs)."""
+    bot = pedido.server.bot
+    token = getattr(bot, "dashboard_token", None)
+    porta = pedido.server.server_address[1]
+    if pedido.headers.get("Host", "") not in (f"127.0.0.1:{porta}", f"localhost:{porta}"):
+        return 403, {"ok": False, "mensagem": "endereco nao permitido"}
+    if not token or not hmac.compare_digest(str(pedido.headers.get("X-MemeBot-Token", "")), token):
+        return 403, {"ok": False, "mensagem": "chave da sessao invalida; recarrega o dashboard"}
+    gestor = getattr(bot, "analise_manual", None)
+    if not isinstance(gestor, AnaliseManual):
+        return 409, {"ok": False, "mensagem": "analise manual indisponivel"}
+    q = urllib.parse.parse_qs(pedido.path.split("?", 1)[1] if "?" in pedido.path else "").get("q", [""])[0]
+    ok, r = gestor.analisar(q[:600])
+    if not ok:
+        return 429 if "espera" in str(r) or "em curso" in str(r) else 400, {"ok": False, "mensagem": str(r)}
+    log.info("Analise manual (dashboard) %s (%s): %s", r["simbolo"], r["mint"], r.get("status"))
+    return 200, {"ok": True, "resultado": r}
 
 
 def _decisao_dashboard(pedido):
@@ -3708,6 +4320,9 @@ class Bot:
         self.scanner = Scanner(self.cfg, self.http)
         self.scanner.entre_pedidos = self._vigiar_posicao_no_scanner
         self.analista = Analista(self.cfg, self.http)
+        # Analise manual: cliente http proprio (nao mexe nos limites do scanner); na demo usa o mercado inventado.
+        self._http_manual = None
+        self.analise_manual = AnaliseManual(self.cfg, self._cliente_analise_manual)
         self.executor = Executor(self.cfg, self.estado, self)
         self.risco = Risco(self.cfg, self.estado, self.http, self.executor)
         # Preco rapido (Jupiter, so leitura). Inativo por defeito; main() ativa-o no modo Paper com mercado real.
@@ -3721,6 +4336,12 @@ class Bot:
         self._fino_ultimo = {}           # mint -> hora da ultima cotacao fina (para rodar pelos sinais)
         self._fino_pausa_ate = 0.0       # depois de uma falha de rede/Jupiter, nao insiste ate esta hora
         self.tg_decisoes = None          # botoes Aprovar/Recusar no Telegram (correr() liga-os)
+        self._acompanhar_fila = queue.Queue()  # (mint, origem): o ciclo principal e que comeca a seguir
+        self._compras_manuais = queue.Queue()  # (mint, origem): o ciclo principal cria a PROPOSTA (nunca compra direto)
+        self._parar_fila = queue.Queue()       # (mint, origem): deixar de acompanhar (feito no ciclo principal)
+        self._propostas_manuais = {}           # mint -> ate quando (as cotacoes destes tambem se atualizam no Risco)
+        self.info_acompanhados = []            # lista pronta para o painel / Telegram (feita no ciclo principal)
+        self.manuais_terminados = collections.deque(maxlen=10)
         self._vendas_manuais = queue.Queue()  # mints com venda manual pedida (o ciclo principal e que vende)
         self._ultimo_motivo_log = {}
         self.analisados = 0
@@ -4374,15 +4995,17 @@ class Bot:
                 "preco_atual": pos.get("preco_atual"), "tokens": pos.get("tokens"),
                 "aberta_em": pos.get("aberta_em"), "estado": "aberta",
                 "var": (num(pos.get("preco_atual")) / pe - 1) * 100,
-                "liquido": (receita / pos["custo"] - 1) * 100 if pos["custo"] else 0.0,
+                "liquido": ((receita + num(pos.get("recebido_parcial"))) / pos["custo"] - 1) * 100 if pos["custo"] else 0.0,
                 "min": (agora() - pos["aberta_em"]) / 60, "trailing": bool(pos.get("trailing")),
+                "origem": pos.get("origem") or "bot", "entrada_recuperada": bool(pos.get("entrada_recuperada")),
+                "recebido_parcial": num(pos.get("recebido_parcial")),
                 "hist": [num(v) for v in pos.get("hist", [])][-600:],
                 "hist_t": [num(v) for v in pos.get("hist_t", [])][-600:]
                 if len(pos.get("hist_t") or []) == len(pos.get("hist") or []) else [],
                 "fonte_preco": pos.get("fonte_preco") or "dexscreener",
                 # Grafico "Posicao ao vivo" (so leitura): par, pico, liquidez e regras de saida do Risco.
                 "par": str(pos.get("par") or ""), "pico": num(pos.get("pico")), "liq_atual": num(pos.get("liq_atual")),
-                "valor_atual_usd": receita, "pnl_usd": receita - num(pos.get("custo")),
+                "valor_atual_usd": receita, "pnl_usd": receita + num(pos.get("recebido_parcial")) - num(pos.get("custo")),
                 "intervalo_seg": (cfg.get("intervalo_preco_rapido_seg", 3) if pos.get("fonte_preco") == "jupiter"
                                   else cfg.get("intervalo_risco_com_posicao_seg", cfg["intervalo_risco_seg"])),
                 "regras_saida": {k: cfg.get(k) for k in ("stop_loss_pct", "take_profit_pct", "trailing_ativar_pct",
@@ -4445,7 +5068,7 @@ class Bot:
                 "eligible_for_proposal": valor_pre_proposta > 0,
                 "status": pre_proposta_status,
                 "manual_confirmation_required": True,
-                "max_open_positions": MAX_OPEN_POSITIONS,
+                "max_open_positions": _limite_posicoes(cfg),
                 "max_eur_per_operation": (_decimal_canonico(cfg["max_eur_per_operation"])
                                           if cfg.get("max_eur_per_operation") is not None
                                           else "Indisponível"),
@@ -4922,6 +5545,11 @@ class Bot:
     def ciclo_risco(self):
         e = self.estado
         mints = list(e["posicoes"]) + [m for m in e["percursos"] if m not in e["posicoes"]]
+        for m, ate in list(getattr(self, "_propostas_manuais", {}).items()):  # propostas manuais: cotacao fresca
+            if ate < agora():
+                self._propostas_manuais.pop(m, None)  # noqa
+            elif m not in mints:
+                mints.append(m)
         if not mints:
             return 0
         pares = buscar_pares(self.http, mints)
@@ -4941,7 +5569,14 @@ class Bot:
             self.atualizar_percursos(pares)
         except Exception:
             log.exception("Erro a gravar percursos")
+        self._atualizar_info_acompanhados()
         return vendas
+
+    def _intervalo_rapido(self):
+        """3 s com uma posicao; com varias, cada ciclo cota todas: abranda (1,5 s por posicao) para ficar
+        abaixo de ~60 pedidos/min ao Jupiter, contando tambem com os pontos finos do laboratorio."""
+        base = num(self.cfg.get("intervalo_preco_rapido_seg"), 3)
+        return max(base, 1.5 * len(self.estado.get("posicoes") or {}))
 
     def ciclo_rapido(self):
         """Preco de VENDA real (cotacao Jupiter) da posicao aberta, de poucos em poucos segundos.
@@ -5027,7 +5662,7 @@ class Bot:
                 log.exception("Erro na venda manual (durante o scanner)")
         if not self.estado["posicoes"] or self.preco_rapido is None or not self.cfg.get("preco_rapido"):
             return 0
-        if agora() - self._ultimo_ciclo_rapido < num(self.cfg.get("intervalo_preco_rapido_seg"), 3):
+        if agora() - self._ultimo_ciclo_rapido < self._intervalo_rapido():
             return 0
         try:
             return self.ciclo_rapido()
@@ -5075,7 +5710,7 @@ class Bot:
                     and agora() - num(pc.get("ts")) - num(finos[-1][0]) < minimo)
 
         ativos = [m for m, pc in e["percursos"].items()
-                  if isinstance(pc, dict) and pc.get("grupo", "sinal") != "controlo" and m not in e["posicoes"]
+                  if isinstance(pc, dict) and pc.get("grupo", "sinal") == "sinal" and m not in e["posicoes"]
                   and num(pc.get("preco0")) > 0 and 0 <= agora() - num(pc.get("ts")) <= limite
                   and not recente(pc)]
         for antigo in [m for m in self._fino_ultimo if m not in e["percursos"]]:
@@ -5101,24 +5736,269 @@ class Bot:
     def _posicao_aberta(self, mint):
         return mint in self.estado.get("posicoes", {})
 
+    def _cliente_analise_manual(self):
+        if not isinstance(self.http, ClienteHTTP):
+            return self.http
+        if self._http_manual is None:
+            self._http_manual = ClienteHTTP(self.cfg)
+        return self._http_manual
+
+    def _analise_manual_telegram(self, texto):
+        ok, r = self.analise_manual.analisar(texto)
+        if not ok:
+            return "🔎 " + str(r)[:300], None
+        log.info("Analise manual (Telegram) %s (%s): %s", r["simbolo"], r["mint"], r.get("status"))
+        return texto_analise_manual(r), r["mint"], not r.get("liquidez_visivel", True)
+
+    def _atualizar_info_acompanhados(self):
+        """Corre no ciclo principal: troca a lista inteira de uma vez (leitura segura nas outras threads)."""
+        try:
+            self.info_acompanhados = [resumo_acompanhado(pc, self.cfg, mint)
+                                      for mint, pc in list(self.estado["percursos"].items())
+                                      if isinstance(pc, dict) and pc.get("grupo") == "manual"]
+        except Exception:
+            log.exception("Erro a preparar a lista de acompanhados")
+
+    def acompanhados_texto(self):
+        return texto_acompanhados(list(self.info_acompanhados), list(self.manuais_terminados))
+
+    def acompanhados_texto_botoes(self):
+        lista = list(self.info_acompanhados)
+        return (texto_acompanhados(lista, list(self.manuais_terminados)),
+                [(a.get("mint"), a.get("simbolo")) for a in lista])
+
+    def pedir_parar_acompanhamento(self, mint, origem="telegram"):
+        """Deixa de acompanhar um token pedido a mao. So laboratorio: nao vende nem mexe em posicoes."""
+        if not isinstance(mint, str) or not MINT_VALIDO.fullmatch(mint):
+            return False, "token inválido"
+        pc = self.estado["percursos"].get(mint)
+        if not isinstance(pc, dict) or pc.get("grupo") != "manual":
+            return False, "este token não está a ser acompanhado por ti"
+        self._parar_fila.put((mint, origem))
+        return True, f"Deixei de acompanhar ${pc.get('simbolo')}."
+
+    def _processar_paragens(self):
+        feitas = 0
+        while True:
+            try:
+                mint, origem = self._parar_fila.get_nowait()
+            except queue.Empty:
+                break
+            pc = self.estado["percursos"].get(mint)
+            if isinstance(pc, dict) and pc.get("grupo") == "manual":
+                self.estado["percursos"].pop(mint, None)  # descartado: nao entra no laboratorio
+                feitas += 1
+                log.info("Acompanhamento manual parado (%s): %s (%s)", origem, pc.get("simbolo"), mint)
+        if feitas:
+            self._atualizar_info_acompanhados()
+        return feitas
+
+    def _manuais_ativos(self):
+        return sum(1 for v in self.estado["percursos"].values() if isinstance(v, dict) and v.get("grupo") == "manual")
+
+    def pedir_acompanhamento(self, mint, origem="telegram"):
+        """Pede para seguir o preco de um token analisado a mao (laboratorio). Nunca compra. Thread-safe:
+        so poe o pedido na fila; quem comeca o percurso e o ciclo principal."""
+        if not isinstance(mint, str) or not MINT_VALIDO.fullmatch(mint):
+            return False, "token inválido"
+        if not self.cfg.get("gravar_percursos"):
+            return False, "a gravação de percursos está desligada"
+        guardado = self.analise_manual.pares.get(mint)
+        if not guardado or agora() - guardado[0] > 1800:
+            return False, "analisa o token primeiro (a análise vale 30 min)"
+        if mint in self.estado["percursos"]:
+            atual = self.estado["percursos"][mint].get("grupo", "sinal")
+            return False, ("já estou a acompanhar este token" if atual == "manual"
+                           else "o bot já segue este token no laboratório")
+        if self._manuais_ativos() + self._acompanhar_fila.qsize() >= int(num(self.cfg.get("percursos_manuais_max"), 5)):
+            return False, f"já há {int(num(self.cfg.get('percursos_manuais_max'), 5))} tokens a ser acompanhados"
+        self._acompanhar_fila.put((mint, origem))
+        minutos = num(self.cfg.get("percurso_minutos"), 180)
+        dur = f"{minutos / 60:.0f} h" if minutos % 60 == 0 else f"{minutos:.0f} min"
+        return True, (f"Vou acompanhar durante {dur} e aviso-te no Telegram no fim. Não compra nada. "
+                      "Ao vivo: /acompanhados no Telegram ou 👁 Acompanhados no dashboard.")
+
+    def _processar_acompanhamentos(self):
+        """Comeca os percursos pedidos (preco atual, nao o da analise). So laboratorio: nao compra nada."""
+        feitos = 0
+        while True:
+            try:
+                mint, origem = self._acompanhar_fila.get_nowait()
+            except queue.Empty:
+                return feitos
+            guardado = self.analise_manual.pares.get(mint)
+            if not guardado or mint in self.estado["percursos"]:
+                continue
+            pares = buscar_pares(self.http, [mint])
+            par = melhor_par((pares or {}).get(mint) or [])
+            if par is None:
+                self.telegram.enviar(f"👁 [PAPER] Não consegui começar a acompanhar {mint[:8]}…: sem preço agora.")
+                continue
+            analise = dict(guardado[2])
+            self.iniciar_percurso(mint, par, analise, grupo="manual")
+            if mint in self.estado["percursos"]:
+                self.estado["percursos"][mint]["origem"] = origem
+                feitos += 1
+                self._atualizar_info_acompanhados()
+                log.info("Acompanhamento manual (%s) iniciado: %s (%s)", origem, simbolo_limpo(par), mint)
+
+    def _aviso_fim_manual(self, linha):  # noqa: C901
+        cfg = self.cfg
+        atual = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
+                 cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
+        res, motivo = repetir_percurso(linha, atual, cfg)
+        pico = (max(p[1] for p in linha["pts"]) - 1) * 100
+        minimo = (min(p[1] for p in linha["pts"]) - 1) * 100
+        fim = {"tempo": "chegou ao fim do tempo", "rug": "acabou em RUG (liquidez caiu)",
+               "desapareceu": "desapareceu (sem dados)"}.get(linha["fim"], linha["fim"])
+        minutos = linha["pts"][-1][0] / 60
+        txt = [f"👁 [PAPER] ACOMPANHAMENTO TERMINOU — ${linha['simbolo']}",
+               f"Seguido {minutos:.0f} min; {fim}.",
+               f"Pico {pico:+.0f}% · mínimo {minimo:+.0f}% · no fim {(linha['pts'][-1][1] - 1) * 100:+.0f}%",
+               f"Com as regras atuais teria dado {res:+.1f}% ({MOTIVOS_PERCURSO.get(motivo, motivo or '—')}).",
+               "Com stop {:.0f}% teria dado {:+.1f}% ({}).".format(regra_alternativa(cfg)[0], *(
+                   lambda r: (r[0], MOTIVOS_PERCURSO.get(r[1], r[1] or "—")))(repetir_percurso(linha, regra_alternativa(cfg), cfg))),
+               "Só laboratório: não houve compra nenhuma.", _link_dexscreener(linha["mint"])]
+        try:
+            self.telegram.enviar("\n".join(x for x in txt if x))
+        except Exception:
+            log.warning("Aviso de fim de acompanhamento por Telegram falhou")
+
     def _pedido_venda_telegram(self, mint):
-        """Regista o pedido; a venda e feita pelo ciclo principal (nunca a partir da thread do Telegram)."""
+        return self.pedir_venda(mint, "telegram")
+
+    def pedir_venda(self, mint, origem="telegram", parcial=False):
+        """Regista o pedido; a venda e feita pelo ciclo principal (nunca a partir da thread do Telegram/dashboard)."""
         cfg = self.cfg
         if cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False:
             return False, "modo Paper indisponivel; nada foi feito"
-        if not self._posicao_aberta(mint):
+        if not isinstance(mint, str) or not self._posicao_aberta(mint):
             return False, "a posicao ja esta fechada"
-        self._vendas_manuais.put(mint)
-        return True, "pedido registado"
+        if parcial:
+            pos = self.estado["posicoes"].get(mint) or {}
+            if pos.get("origem") != "manual":
+                return False, "só nas posições compradas por ti"
+            if pos.get("entrada_recuperada"):
+                return False, "a entrada desta posição já foi recuperada"
+        self._vendas_manuais.put((mint, origem, bool(parcial)))
+        return True, ("pedido registado: vou vender só a parte que paga a entrada" if parcial else "pedido registado")
+
+    def _pode_recuperar(self, mint):
+        pos = self.estado["posicoes"].get(mint) or {}
+        return pos.get("origem") == "manual" and not pos.get("entrada_recuperada")
+
+    def pedir_compra_manual(self, mint, origem="telegram"):
+        """Pede uma PROPOSTA de compra Paper para um token analisado a mao. Nunca compra direto: a proposta
+        segue o caminho normal (confirmacao manual, revalidacao do Executor, 5 EUR, 1 posicao, slippage)."""
+        cfg = self.cfg
+        if not cfg.get("compra_manual", True):
+            return False, "a compra manual está desligada na configuração"
+        if (cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False
+                or cfg.get("manual_confirmation_required") is not True):
+            return False, "modo Paper com confirmação manual indisponível; nada foi feito"
+        if not isinstance(mint, str) or not MINT_VALIDO.fullmatch(mint):
+            return False, "token inválido"
+        if mint in self.estado["posicoes"]:
+            return False, "já tens este token comprado"
+        recente = self.analise_manual.pares.get(mint)
+        if recente and agora() - recente[0] < 120 and not num(obter(recente[1], "liquidity", "usd")):
+            return False, ("ainda na curva do pump.fun: sem liquidez visível, compra indisponível até graduar"
+                           if mint.endswith("pump") else "sem liquidez visível; compra indisponível")
+        if len(self.estado["posicoes"]) >= _limite_posicoes(cfg):
+            return False, f"já tens {len(self.estado['posicoes'])} posições abertas (máximo {_limite_posicoes(cfg)}); vende uma primeiro"
+        if self._emergency_stop_is_active():
+            return False, "paragem de emergência ativa; compras bloqueadas"
+        self._compras_manuais.put((mint, origem))
+        return True, "A analisar e a preparar a proposta: confirma-a nos próximos 90 s (Telegram ou dashboard)."
+
+    def _processar_compras_manuais(self):
+        """Cria as propostas pedidas (preco atual). A compra so acontece se a confirmares; o resto do caminho
+        e o mesmo das propostas do bot (_processar_respostas_aprovacao)."""
+        feitas = 0
+        while True:
+            try:
+                mint, origem = self._compras_manuais.get_nowait()
+            except queue.Empty:
+                return feitas
+            def recusa(motivo, par=None):
+                simbolo = simbolo_limpo(par) if isinstance(par, dict) else mint[:8] + "…"
+                self.acao(f"{simbolo}: compra manual sem proposta - {motivo}")
+                try:
+                    self.telegram.enviar(f"🟢 [PAPER] Compra manual de ${simbolo} sem proposta: {motivo}.")
+                except Exception:
+                    pass
+            guardado = self.analise_manual.pares.get(mint)
+            if not guardado or agora() - guardado[0] > 300:  # analise com mais de 5 min (ou perdida num reinicio): refaz
+                ok, res = self.analise_manual.analisar_agora(mint)
+                guardado = self.analise_manual.pares.get(mint) if ok else None
+                if not guardado:
+                    recusa(res if not ok else "análise indisponível")
+                    continue
+            pares = buscar_pares(self.http, [mint])
+            par = melhor_par((pares or {}).get(mint) or [])
+            if par is None:
+                recusa("sem preço agora")
+                continue
+            self._guardar_cotacoes_recentes({mint: (pares or {}).get(mint)})
+            self._propostas_manuais[mint] = agora() + 150
+            analise = dict(guardado[2], origem="manual")
+            valor, motivo = self.executor.pode_comprar()
+            if valor <= 0:
+                recusa(motivo, par)
+                continue
+            bloqueio_rota = self._bloqueio_rota_compra(mint, valor, manual=True)
+            if bloqueio_rota:
+                recusa(bloqueio_rota, par)
+                continue
+            try:
+                execution_plan = self.executor.preparar_execucao(mint, par, valor)
+            except (TypeError, ValueError, InvalidOperation):
+                recusa("plano financeiro indisponível", par)
+                continue
+            plan_block = self.executor.bloqueio_plano_financeiro(execution_plan)
+            if plan_block:
+                recusa(plan_block, par)
+                continue
+            try:
+                if isinstance(self.manual_approvals, ManualApprovalManager):
+                    proposta = self.manual_approvals.propose(mint, par, analise, valor, execution_plan)
+                else:
+                    proposta = self.manual_approvals.propose(mint, par, analise, valor)
+            except ValueError as exc:
+                recusa(f"proposta inválida ({exc})", par)
+                continue
+            log.info("PROPOSTA PAPER MANUAL (%s) %s %s valor=$%.4f expira em 90s",
+                     origem, proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"])
+            if not self._registar_auditoria_aprovacao("proposed", proposta):
+                cancel = getattr(self.manual_approvals, "cancel", None)
+                if callable(cancel):
+                    cancel(proposta["proposal_id"], "diário de auditoria indisponível")
+                recusa("diário de auditoria indisponível", par)
+                continue
+            feitas += 1
+            try:
+                tgd = getattr(self, "tg_decisoes", None)
+                pid = proposta["proposal_id"]
+                texto = texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"], proposta["amount_usd"],
+                                       par, com_botoes=tgd is not None and tgd.ativo, manual=True)
+                if tgd is not None and tgd.ativo and isinstance(pid, str):
+                    self.telegram.enviar(texto, botoes=tgd.botoes_proposta(pid),
+                                         ao_enviar=lambda mid, txt, pid=pid: tgd.registar_mensagem(pid, mid, txt))
+                else:
+                    self.telegram.enviar(texto)
+            except Exception:
+                log.warning("Aviso de proposta manual por Telegram falhou")
+            self.atualizar_snapshot()
 
     def _processar_vendas_manuais(self):
         """Vende em Paper as posicoes pedidas no Telegram, ao preco mais recente conhecido."""
         vendas = 0
         while True:
             try:
-                mint = self._vendas_manuais.get_nowait()
+                pedido = self._vendas_manuais.get_nowait()
             except queue.Empty:
                 return vendas
+            mint, origem, parcial = pedido if isinstance(pedido, tuple) else (pedido, "telegram", False)
             pos = self.estado["posicoes"].get(mint)
             if pos is None:
                 continue
@@ -5127,10 +6007,21 @@ class Bot:
             liq = num(pos.get("liq_atual")) or num(pos.get("liq_entrada"))
             if preco <= 0:
                 log.warning("Venda manual de %s adiada: sem preco valido", pos.get("simbolo"))
-                self._vendas_manuais.put(mint)
+                self._vendas_manuais.put((mint, origem, parcial))
                 return vendas
             try:
-                if self.executor.vender(mint, preco, liq, "MANUAL (Telegram)") is not None:
+                if parcial:
+                    ok, msg = self.executor.vender_parcial(mint, preco, liq)
+                    if ok:
+                        vendas += 1
+                    else:
+                        self.acao(f"Recuperar entrada de {pos.get('simbolo')} recusado - {msg}")
+                        try:
+                            self.telegram.enviar(f"💰 [PAPER] Não recuperei a entrada de ${pos.get('simbolo')}: {msg}.")
+                        except Exception:
+                            pass
+                elif self.executor.vender(mint, preco, liq,
+                                          "MANUAL (" + ("dashboard" if origem == "dashboard" else "Telegram") + ")") is not None:
                     vendas += 1
             except (PaperOperationError, PaperOperationAuthorizationError):
                 log.exception("Venda manual de %s recusada na persistencia Paper", pos.get("simbolo"))
@@ -5152,7 +6043,7 @@ class Bot:
             return False, "gestor de propostas indisponivel"
         return gestor.decidir_dashboard(proposal_id, decisao, origem="telegram")
 
-    def _bloqueio_rota_compra(self, mint, valor_usd):
+    def _bloqueio_rota_compra(self, mint, valor_usd, manual=False):
         """Confirma no Jupiter (so leitura) que ha rota de compra e que o impacto real e aceitavel.
 
         Devolve o motivo do bloqueio ou None. Se o Jupiter nao responder, NAO bloqueia (fica no registo)."""
@@ -5166,6 +6057,9 @@ class Bot:
             return None
         impacto = r.get("impacto_pct")
         maximo = num(self.cfg.get("impacto_compra_jupiter_max_pct"), 1.5)
+        if manual:  # escolha do utilizador: limite proprio, mas nunca acima do slippage maximo da politica Paper
+            maximo = min(num(self.cfg.get("impacto_compra_manual_max_pct"), maximo),
+                         num(self.cfg.get("max_slippage_pct"), 3.0))
         if impacto is not None and impacto > maximo:
             return f"impacto real Jupiter {impacto:.2f}% acima do maximo {maximo:g}%"
         return None
@@ -5203,19 +6097,25 @@ class Bot:
         preco = num(par.get("priceUsd"))
         if not cfg["gravar_percursos"] or mint in pc or preco <= 0 or not MINT_VALIDO.fullmatch(mint):
             return
-        if analise.get("pontuacao") is None:
+        if analise.get("pontuacao") is None and grupo != "manual":
             return
         controlo = sum(1 for v in pc.values() if v.get("grupo") == "controlo")
+        manuais = sum(1 for v in pc.values() if v.get("grupo") == "manual")
         if grupo == "controlo":
             if controlo >= int(num(cfg.get("percursos_controlo_max"), 0)):
                 return
-        elif len(pc) - controlo >= cfg["percursos_max_ativos"]:
+        elif grupo == "manual":
+            if manuais >= int(num(cfg.get("percursos_manuais_max"), 5)):
+                return
+        elif len(pc) - controlo - manuais >= cfg["percursos_max_ativos"]:
             return
-        pc[mint] = {"simbolo": simbolo_limpo(par), "pontuacao": int(analise["pontuacao"]), "ts": int(agora()),
+        pc[mint] = {"simbolo": simbolo_limpo(par),
+                    "pontuacao": int(analise["pontuacao"]) if analise.get("pontuacao") is not None else None,
+                    "ts": int(agora()),
                     "preco0": preco, "liq0": num(obter(par, "liquidity", "usd")),
                     "par": str(par.get("pairAddress", "")), "pts": [[0, 1.0]], "sem_dados": 0,
                     "fonte": "geckoterminal" if mint in getattr(self.scanner, "origem_gecko", ()) else "dexscreener",
-                    "grupo": "controlo" if grupo == "controlo" else "sinal",
+                    "grupo": grupo if grupo in ("controlo", "manual") else "sinal",
                     "feat": self._caracteristicas_entrada(par),
                     "comp": {k: round(num(v), 2) for k, v in (analise.get("detalhes") or {}).items()
                              if isinstance(k, str)}}
@@ -5246,6 +6146,14 @@ class Bot:
             self.estado["n_percursos"] = int(num(self.estado.get("n_percursos"))) + 1
         except OSError as erro:
             log.error("Nao consegui gravar o percurso: %s", erro)
+        if pc.get("grupo") == "manual":
+            try:
+                self.manuais_terminados.appendleft(resumo_acompanhado(dict(linha, origem=pc.get("origem")), self.cfg,
+                                                                      mint, terminado=linha["fim"]))
+            except Exception:
+                log.exception("Erro a guardar o resumo do acompanhamento")
+            self._aviso_fim_manual(linha)
+            self._atualizar_info_acompanhados()
 
     def atualizar_percursos(self, pares):
         cfg = self.cfg
@@ -5265,13 +6173,26 @@ class Bot:
                 continue
             pc["sem_dados"] = 0
             rel = round(num(par.get("priceUsd")) / pc["preco0"], 5)
-            liq = num(obter(par, "liquidity", "usd"))
+            liq_lida = Analista._numero_presente(obter(par, "liquidity", "usd", defeito=None))[0]
+            liq = num(liq_lida)
             ultimo = pc["pts"][-1]
-            rug = liq < cfg["rug_liquidez_minima_usd"] or (
-                pc["liq0"] > 0 and liq < pc["liq0"] * (1 - cfg["rug_queda_liquidez_pct"] / 100.0))
+            # liquidez em falta (ex.: pump.fun na curva de vinculacao) NAO e rug: so se mede o que a API mostra
+            piso = cfg["rug_liquidez_minima_usd"]
+            if pc.get("grupo") == "manual" and pc["liq0"] > 0:  # tokens pequenos (pump.fun): o piso acompanha a pool
+                piso = min(piso, pc["liq0"] * 0.5)
+            rug = liq_lida is not None and (liq < piso or (
+                pc["liq0"] > 0 and liq < pc["liq0"] * (1 - cfg["rug_queda_liquidez_pct"] / 100.0)))
             acabou = seg >= cfg["percurso_minutos"] * 60
             if rug or acabou or seg - ultimo[0] >= 60 or (ultimo[1] > 0 and abs(rel / ultimo[1] - 1) >= 0.004):
                 pc["pts"].append([seg, rel])
+            if pc.get("grupo") == "manual":  # o painel "Acompanhados" mostra os numeros atuais do par
+                def n(*c):
+                    return Analista._numero_presente(obter(par, *c, defeito=None))[0]
+                cb, vd = n("txns", "h1", "buys") or 0, n("txns", "h1", "sells") or 0
+                pc["ult"] = {"rel": rel, "seg": seg, "liq": liq_lida, "vol_h1": n("volume", "h1"),
+                             "var_m5": n("priceChange", "m5"),
+                             "mcap": n("marketCap") or n("fdv"),
+                             "compras_pct": round(cb / (cb + vd) * 100, 1) if cb + vd > 0 else None}
             if rug:
                 self._fechar_percurso(mint, "rug", liq)
             elif acabou:
@@ -5316,7 +6237,7 @@ class Bot:
                 var = (num(pos.get("preco_atual")) / pe - 1) * 100
                 pico = (num(pos.get("pico")) / pe - 1) * 100
                 receita, _, _ = simular_venda(cfg, pos, num(pos.get("preco_atual")), num(pos.get("liq_atual")))
-                liquido = (receita / pos["custo"] - 1) * 100 if pos["custo"] else 0.0
+                liquido = ((receita + num(pos.get("recebido_parcial"))) / pos["custo"] - 1) * 100 if pos["custo"] else 0.0
                 minutos = (agora() - pos["aberta_em"]) / 60
                 estado_txt = "trailing ativo" if pos.get("trailing") else ""
                 if pos.get("sem_dados"):
@@ -5434,7 +6355,20 @@ class Bot:
                 self.tg_decisoes = TelegramDecisoes(self.telegram.token, self.telegram.chat, self._decisao_telegram,
                                                     self._proposta_pendente, avisar=self.telegram.enviar,
                                                     vender=self._pedido_venda_telegram if manual else None,
-                                                    posicao_aberta=self._posicao_aberta if manual else None)
+                                                    posicao_aberta=self._posicao_aberta if manual else None,
+                                                    analisar=(self._analise_manual_telegram
+                                                              if cfg.get("analise_manual", True) else None),
+                                                    acompanhar=(lambda m: self.pedir_acompanhamento(m, "telegram"))
+                                                    if cfg.get("analise_manual", True) else None,
+                                                    deixar=(lambda m: self.pedir_parar_acompanhamento(m, "telegram"))
+                                                    if cfg.get("analise_manual", True) else None,
+                                                    acompanhados=self.acompanhados_texto_botoes
+                                                    if cfg.get("analise_manual", True) else None,
+                                                    comprar=(lambda m: self.pedir_compra_manual(m, "telegram"))
+                                                    if cfg.get("compra_manual", True) else None,
+                                                    recuperar=(lambda m: self.pedir_venda(m, "telegram", parcial=True))
+                                                    if manual else None,
+                                                    pode_recuperar=self._pode_recuperar)
                 if self.tg_decisoes.ativo:
                     self.tg_decisoes.iniciar()
                 log.info("Botoes Aprovar/Recusar no Telegram: %s", "ligados" if self.tg_decisoes.ativo
@@ -5460,6 +6394,21 @@ class Bot:
                         mexeu = True
                 except Exception:
                     log.exception("Erro na venda manual")
+                try:
+                    if not self._acompanhar_fila.empty() and self._processar_acompanhamentos():
+                        mexeu = True
+                except Exception:
+                    log.exception("Erro ao comecar um acompanhamento manual")
+                try:
+                    if not self._parar_fila.empty() and self._processar_paragens():
+                        mexeu = True
+                except Exception:
+                    log.exception("Erro ao parar um acompanhamento manual")
+                try:
+                    if not self._compras_manuais.empty() and self._processar_compras_manuais():
+                        mexeu = True
+                except Exception:
+                    log.exception("Erro ao criar uma proposta manual")
                 if self.tg_decisoes is not None:
                     self.tg_decisoes.fechar_posicoes(set(self.estado["posicoes"]))
                 self._atualizar_taxa_bce()
@@ -5473,13 +6422,12 @@ class Bot:
                                             if self.estado["posicoes"] else cfg["intervalo_risco_seg"])
                     mexeu = True
                 if (cfg.get("preco_rapido") and self.preco_rapido is not None and self.estado["posicoes"]
-                        and agora() >= max(prox_rapido, self._ultimo_ciclo_rapido
-                                           + num(cfg.get("intervalo_preco_rapido_seg"), 3))):
+                        and agora() >= max(prox_rapido, self._ultimo_ciclo_rapido + self._intervalo_rapido())):
                     try:
                         self.ciclo_rapido()
                     except Exception:
                         log.exception("Erro no ciclo de preco rapido")
-                    prox_rapido = agora() + cfg.get("intervalo_preco_rapido_seg", 3)
+                    prox_rapido = agora() + self._intervalo_rapido()
                     mexeu = True
                 if cfg.get("percursos_finos") and self.preco_fino is not None and agora() >= prox_fino:
                     try:
@@ -5590,6 +6538,155 @@ def repetir_percurso(pc, regra, cfg, valor_usd=12.0):
     return (liquido - 1) * 100.0, motivo
 
 
+def saida_simulada(pts, regra, rug_no_fim=False):
+    """Em que ponto as regras teriam saido: (segundos, motivo) ou (None, "aberta")."""
+    stop, alvo, ativar, dist, minutos = regra
+    pico, trailing = 1.0, False
+    for i, (seg, preco) in enumerate(pts[1:], 1):
+        pico = max(pico, preco)
+        v = (preco - 1) * 100
+        if preco <= 0:
+            return seg, "desapareceu"
+        if rug_no_fim and i == len(pts) - 1:
+            return seg, "rug"
+        if v <= stop:
+            return seg, "stop"
+        if alvo and v >= alvo:
+            return seg, "alvo"
+        if ativar and (pico - 1) * 100 >= ativar:
+            trailing = True
+        if trailing and preco <= pico * (1 - dist / 100.0):
+            return seg, "trailing"
+        if seg >= minutos * 60:
+            return seg, "tempo"
+    return None, "aberta"
+
+
+def regra_atual(cfg):
+    return (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
+            cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
+
+
+def regra_alternativa(cfg):
+    """As regras atuais com outro stop (so para comparar nos tokens acompanhados; o bot nao a usa)."""
+    r = regra_atual(cfg)
+    return (num(cfg.get("acompanhar_stop_alternativo_pct"), -25),) + r[1:]
+
+
+def _simular(pts, regra, fim, liq_fim, cfg):
+    seg_fim, motivo = saida_simulada(pts, regra, rug_no_fim=fim == "rug")
+    res, _ = repetir_percurso({"pts": pts, "fim": fim if fim == "rug" else "tempo", "liq_fim": liq_fim}, regra, cfg)
+    return {"estado": "aberta" if seg_fim is None else "saiu", "motivo": motivo,
+            "min": None if seg_fim is None else round(seg_fim / 60.0, 1), "pct": round(res, 2), "stop": regra[0]}
+
+
+def _simular_recuperar(pts, regra, fim, liq_fim, cfg, multiplo=2.0):
+    """Regras atuais, mas ao chegar a 2x vende so a parte que paga a entrada e deixa o resto correr
+    (stop, trailing e tempo; sem alvo). Resultado liquido aproximado (mesmos custos simulados)."""
+    stop, alvo, ativar, dist, minutos = regra
+    s, taxa = cfg["slippage_pct"] / 100.0, cfg["taxa_pct"] / 100.0
+    k = (1 - taxa) / (1 + s) * (1 - s) * (1 - taxa)
+    pico, trailing, fr, r0, seg_rec = 1.0, False, 0.0, None, None
+    saida, motivo, seg_fim = pts[-1][1], "aberta", None
+    for i, (seg, preco) in enumerate(pts[1:], 1):
+        pico = max(pico, preco)
+        v = (preco - 1) * 100
+        if preco <= 0:
+            saida, motivo, seg_fim = 0.0, "desapareceu", seg
+            break
+        if fim == "rug" and i == len(pts) - 1:
+            saida, motivo, seg_fim = preco, "rug", seg
+            break
+        if r0 is None and preco >= multiplo:
+            r0, fr, seg_rec = preco, 1.0 / (preco * k), seg  # vende a parte que, liquida, devolve a entrada
+            continue
+        if v <= stop:
+            saida, motivo, seg_fim = preco, "stop", seg
+            break
+        if r0 is None and alvo and v >= alvo:
+            saida, motivo, seg_fim = preco, "alvo", seg
+            break
+        if ativar and (pico - 1) * 100 >= ativar:
+            trailing = True
+        if trailing and preco <= pico * (1 - dist / 100.0):
+            saida, motivo, seg_fim = preco, "trailing", seg
+            break
+        if seg >= minutos * 60:
+            saida, motivo, seg_fim = preco, "tempo", seg
+            break
+    fr = min(fr, 1.0)
+    k_saida = k
+    if motivo == "rug":
+        k_saida = (1 - taxa) / (1 + s) * (1 - min(0.95, s + (12.0 / (num(liq_fim) / 2.0) if num(liq_fim) > 0 else 1.0))) * (1 - taxa)
+    res = ((fr * r0 * k if r0 else 0.0) + (1 - fr) * saida * k_saida - 1) * 100
+    return {"estado": "aberta" if seg_fim is None else "saiu", "motivo": motivo,
+            "min": None if seg_fim is None else round(seg_fim / 60.0, 1), "pct": round(res, 2),
+            "recuperou_min": None if seg_rec is None else round(seg_rec / 60.0, 1), "multiplo": multiplo}
+
+
+def resumo_acompanhado(pc, cfg, mint=None, terminado=None):
+    """Estado de um token acompanhado a mao (a decorrer ou terminado), para o dashboard e o Telegram."""
+    regra = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
+             cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
+    pts = [[num(p[0]), num(p[1])] for p in pc.get("pts") or [] if isinstance(p, (list, tuple)) and len(p) == 2]
+    if not pts:
+        pts = [[0, 1.0]]
+    fim = terminado or pc.get("fim")
+    vivo = pc.get("ult") if isinstance(pc.get("ult"), dict) else {}
+    if not fim and num(vivo.get("rel")) > 0 and num(vivo.get("seg")) > pts[-1][0]:
+        pts.append([num(vivo["seg"]), num(vivo["rel"])])  # leitura mais recente (~10 s), ainda nao gravada
+    decorrido = (pts[-1][0] if fim else max(pts[-1][0], agora() - num(pc.get("ts")))) / 60.0
+    passo = max(1, len(pts) // 150)
+    serie = pts[::passo] + ([pts[-1]] if (len(pts) - 1) % passo else [])
+    ult = pc.get("ult") if isinstance(pc.get("ult"), dict) else {}
+    return {
+        "mint": mint or pc.get("mint"), "simbolo": pc.get("simbolo"), "pontuacao": pc.get("pontuacao"),
+        "origem": pc.get("origem"), "inicio": int(num(pc.get("ts"))), "decorrido_min": round(decorrido, 1),
+        "falta_min": None if fim else round(max(0.0, num(cfg.get("percurso_minutos"), 180) - decorrido), 1),
+        "agora_pct": round((pts[-1][1] - 1) * 100, 2), "pico_pct": round((max(p[1] for p in pts) - 1) * 100, 2),
+        "min_pct": round((min(p[1] for p in pts) - 1) * 100, 2),
+        "pts": [[int(s), round((r - 1) * 100, 2)] for s, r in serie],
+        "liq0": num(pc.get("liq0")), "liq": ult.get("liq"), "vol_h1": ult.get("vol_h1"),
+        "compras_pct": ult.get("compras_pct"), "var_m5": ult.get("var_m5"), "mcap": ult.get("mcap"),
+        "sim": _simular(pts, regra, fim, pc.get("liq_fim"), cfg),
+        "sim_alt": _simular(pts, regra_alternativa(cfg), fim, pc.get("liq_fim"), cfg),
+        "sim_rec": _simular_recuperar(pts, regra, fim, pc.get("liq_fim"), cfg),
+        "regra": {"stop": regra[0], "alvo": regra[1], "stop_alt": regra_alternativa(cfg)[0]},
+        "fim": fim, "terminado": bool(fim), "link": _link_dexscreener(mint or pc.get("mint")),
+    }
+
+
+def texto_acompanhados(lista, terminados=()):
+    """Resposta ao /acompanhados no Telegram."""
+    if not lista and not terminados:
+        return ("👁 [PAPER] Não há tokens a ser acompanhados.\n"
+                "Analisa um (cola o endereço aqui) e carrega em 👁 Acompanhar.")
+    L = [f"👁 [PAPER] A ACOMPANHAR ({len(lista)})" if lista else "👁 [PAPER] Nenhum token a ser acompanhado agora."]
+    for a in lista:
+        L += ["", f"${a['simbolo']} — há {a['decorrido_min']:.0f} min (faltam {a['falta_min']:.0f})",
+              f"Agora {a['agora_pct']:+.1f}% · pico {a['pico_pct']:+.1f}% · mínimo {a['min_pct']:+.1f}%"]
+        partes = [f"liquidez ${a['liq']:,.0f}" if a.get("liq") else None,
+                  f"compras 1 h {a['compras_pct']:.0f}%" if a.get("compras_pct") is not None else None,
+                  f"5 min {a['var_m5']:+.0f}%" if a.get("var_m5") is not None else None]
+        if any(partes):
+            L.append(" · ".join(p for p in partes if p))
+        for nome, s in ((f"Regras do bot (stop {a['sim'].get('stop', -12):.0f}%)", a["sim"]),
+                        (f"Com stop {a.get('sim_alt', {}).get('stop', -25):.0f}%", a.get("sim_alt")),
+                        ("Recuperar entrada a 2×", a.get("sim_rec"))):
+            if not s:
+                continue
+            L.append(f"{nome}: ainda dentro ({s['pct']:+.1f}% se vendesse agora)" if s["estado"] == "aberta" else
+                     f"{nome}: {MOTIVOS_PERCURSO.get(s['motivo'], s['motivo'])} aos {s['min']:.0f} min ({s['pct']:+.1f}%)")
+    if terminados:
+        L += ["", "Terminados há pouco:"]
+        for a in list(terminados)[:3]:
+            alt = a.get("sim_alt") or {}
+            L.append(f"${a['simbolo']}: pico {a['pico_pct']:+.0f}% · fim {a['agora_pct']:+.0f}% · regras {a['sim']['pct']:+.1f}%"
+                     + (f" · stop {alt['stop']:.0f}%: {alt['pct']:+.1f}%" if alt else ""))
+    L += ["", "Só laboratório: nenhum destes tokens foi comprado."]
+    return "\n".join(L)[:4000]
+
+
 def _serie_fina(pc):
     """Serie de precos tal como o bot a ve: pontos finos (preco de venda Jupiter) onde existem e pontos
     normais (DexScreener) no resto. Devolve [(seg, rel, e_fino), ...]. O ultimo ponto e sempre o ultimo
@@ -5664,6 +6761,124 @@ def _mediana(valores):
     return v[len(v) // 2] if v else None
 
 
+# Hipoteses escritas a 17/11/2026 com os primeiros 36 sinais (analise do Grok + laboratorio). NAO se mudam:
+# so se medem nos sinais que vieram depois. Se falharem, deitam-se fora (nao se escolhe outra com os mesmos sinais).
+HIPOTESES_CONGELADAS = {
+    "data": "17/11/2026",
+    "desde_sinal": 37,                 # o 37.o sinal (por ordem de tempo) e o primeiro que nenhuma regra viu
+    "saida": (-20, 50, 0, 0, 30),      # A) stop -20%, alvo +50%, sem trailing, 30 min
+    "pontuacao_max": 79,               # B) recusar pontuacao 80 ou mais (saida = regras atuais)
+    "minimo": 30,                      # sinais novos para poder decidir
+}
+
+
+def _secao_hipoteses_congeladas(percursos, atual, cfg, h=None):
+    """Mede as hipoteses congeladas SO nos sinais que chegaram depois de elas serem escritas."""
+    h = h or HIPOTESES_CONGELADAS
+    novos = percursos[h["desde_sinal"] - 1:]
+    L = ["", f"  HIPOTESES CONGELADAS (escritas a {h['data']} com os primeiros {h['desde_sinal'] - 1} sinais; "
+         "medidas SO nos sinais seguintes)"]
+    if not novos:
+        return L + [f"    Ainda nao ha sinais novos (comecam no {h['desde_sinal']}.o)."]
+    saida, pmax = h["saida"], h["pontuacao_max"]
+    L.append(f"    Sinais novos: {len(novos)} (do {h['desde_sinal']}.o em diante)")
+    m0, a0 = _medir(novos, atual, cfg)
+    L.append(f"    {'regras atuais (referencia)':<36}{len(novos):>3} trades   acerto {a0:5.1f}%   media {m0:+7.2f}%")
+    mA, aA = _medir(novos, saida, cfg)
+    melhorA = sum(1 for pc in novos if repetir_percurso(pc, saida, cfg)[0] > repetir_percurso(pc, atual, cfg)[0])
+    L.append(f"    {'A) saida -20% / +50% / 30 min':<36}{len(novos):>3} trades   acerto {aA:5.1f}%   media {mA:+7.2f}%"
+             f"   | melhor do que as atuais em {melhorA} de {len(novos)}")
+    ficam = [pc for pc in novos if num(pc.get("pontuacao")) <= pmax]
+    saem = [pc for pc in novos if num(pc.get("pontuacao")) > pmax]
+    linha = f"    {'B) recusar pontuacao %d+' % (pmax + 1):<36}"
+    if ficam:
+        mB, aB = _medir(ficam, atual, cfg)
+        linha += f"{len(ficam):>3} trades   acerto {aB:5.1f}%   media {mB:+7.2f}%"
+    else:
+        linha += "  0 trades"
+    if saem:
+        linha += f"   | recusados {len(saem)}: media {_medir(saem, atual, cfg)[0]:+.2f}% (com as regras atuais)"
+    L.append(linha)
+    com = [pc for pc in novos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    if com:
+        valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
+
+        def fr(grupo, regra):
+            r = [repetir_serie(pc, _serie_fina(pc), regra, cfg, valor_usd=valor, custos="reais")[0] for pc in grupo]
+            return f"{sum(r) / len(r):+7.2f}% ({len(r)})" if r else "    sem dados"
+        L.append(f"    Com pontos finos e custos reais ({len(com)} dos {len(novos)} novos):")
+        L.append(f"      atuais {fr(com, atual)}   A) {fr(com, saida)}   "
+                 f"B) {fr([pc for pc in com if num(pc.get('pontuacao')) <= pmax], atual)}")
+    falta = h["minimo"] - len(novos)
+    L += [f"    Decisao: so com {h['minimo']} ou mais sinais novos" + (f" (faltam {falta})." if falta > 0 else " (ja ha)."),
+          "    Uma hipotese so passa se ganhar as regras atuais aqui E com pontos finos e custos reais.",
+          "    As hipoteses nao se mudam: se falharem, deitam-se fora (nao se escolhe outra com os mesmos sinais)."]
+    return L
+
+
+# 2.o conjunto (18/11/2026, com os primeiros 77 sinais): A e B falharam; o problema esta nas ENTRADAS.
+# Duas hipoteses de entrada que se repetiram em todas as leituras. NAO se mudam; medem-se do 78.o sinal em diante.
+HIPOTESES_ENTRADA = {
+    "data": "18/11/2026",
+    "desde_sinal": 78,
+    "idade_min": 30,          # C) so entrar em tokens com 30 min ou mais
+    "queda": (15, 35),        # D) depois do sinal, esperar um recuo de 15-35% e so entao entrar
+    "minimo": 30,
+}
+
+
+def _secao_hipoteses_entrada(percursos, cfg, h=None):
+    """Hipoteses de ENTRADA congeladas (C e D), medidas so nos sinais que chegaram depois de escritas."""
+    h = h or HIPOTESES_ENTRADA
+    novos = percursos[h["desde_sinal"] - 1:]
+    L = ["", f"  HIPOTESES DE ENTRADA CONGELADAS (escritas a {h['data']} com os primeiros {h['desde_sinal'] - 1} sinais;"
+         " medidas SO nos sinais seguintes)",
+         "    (A e B, as de 17/11, falharam com 41 sinais novos e foram postas de parte.)"]
+    if not novos:
+        return L + [f"    Ainda nao ha sinais novos (comecam no {h['desde_sinal']}.o)."]
+    atual = dict(stop=cfg["stop_loss_pct"], parcial_2x=False, trail_dist=cfg["trailing_distancia_pct"],
+                 trail_ativar=cfg["trailing_ativar_pct"] or None, alvo=cfg["take_profit_pct"] or None,
+                 minutos=cfg["tempo_maximo_min"])
+    L.append(f"    Sinais novos: {len(novos)} (do {h['desde_sinal']}.o em diante)")
+    n0, m0, a0 = _medir_avancado(novos, cfg, **atual)
+    if n0:
+        L.append(f"    {'regras atuais (referencia)':<36}{n0:>3} trades   acerto {a0:5.1f}%   media {m0:+7.2f}%")
+    idade = lambda pc: num(obter(pc, "feat", "idade_min", defeito=None), -1)
+    ficam = [pc for pc in novos if idade(pc) >= h["idade_min"]]
+    saem = [pc for pc in novos if 0 <= idade(pc) < h["idade_min"]]
+    sem_dado = len(novos) - len(ficam) - len(saem)
+    linha = f"    {'C) so tokens com %d min ou mais' % h['idade_min']:<36}"
+    nc, mc, ac = _medir_avancado(ficam, cfg, **atual) if ficam else (0, None, None)
+    linha += f"{nc:>3} trades   acerto {ac:5.1f}%   media {mc:+7.2f}%" if nc else "  0 trades"
+    if saem:
+        linha += f"   | saem {len(saem)}: media {_medir_avancado(saem, cfg, **atual)[1]:+.2f}%"
+    if sem_dado:
+        linha += f"   | sem idade: {sem_dado}"
+    L.append(linha)
+    nd, md, ad = _medir_avancado(novos, cfg, **dict(atual, queda=h["queda"]))
+    q0, q1 = h["queda"]
+    L.append(f"    {'D) entrar na queda de %d-%d%%' % (q0, q1):<36}" +
+             (f"{nd:>3} trades   acerto {ad:5.1f}%   media {md:+7.2f}%   | sem entrada (nao caiu): {len(novos) - nd}"
+              if nd else "  0 trades (nenhum recuou o suficiente)"))
+    com = [pc for pc in ficam if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    todos_f = [pc for pc in novos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    if todos_f:
+        valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
+        regra = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
+                 cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
+
+        def fr(grupo):
+            r = [repetir_serie(pc, _serie_fina(pc), regra, cfg, valor_usd=valor, custos="reais")[0] for pc in grupo]
+            return f"{sum(r) / len(r):+7.2f}% ({len(r)})" if r else "    sem dados"
+        L.append(f"    Com pontos finos e custos reais: atuais {fr(todos_f)}   C) {fr(com)}   "
+                 "(D usa os pontos normais)")
+    falta = h["minimo"] - len(novos)
+    L += [f"    Decisao: so com {h['minimo']} ou mais sinais novos" + (f" (faltam {falta})." if falta > 0 else " (ja ha)."),
+          "    Uma hipotese de entrada so passa se ganhar as regras atuais com margem clara E nao deixar quase tudo de fora.",
+          "    As hipoteses nao se mudam: se falharem, deitam-se fora."]
+    return L
+
+
 def _secao_pontos_finos(percursos, melhores, atual, cfg):
     """As mesmas regras, nos mesmos percursos, com pontos normais e com pontos finos, e com os dois custos."""
     com = [pc for pc in percursos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
@@ -5717,20 +6932,28 @@ def _secao_por_dia(cfg):
     """Operacoes Paper fechadas, por dia (resultado real registado pelo bot, nao o do laboratorio)."""
     L = ["", "  OPERACOES PAPER FECHADAS, POR DIA (o que o bot registou mesmo, nao o laboratorio)"]
     try:
-        vendas = [t for t in (ler_trades_paper(cfg) or []) if t.get("tipo") == "VENDA" and t.get("pnl_usd") is not None]
+        todas = [t for t in (ler_trades_paper(cfg) or []) if t.get("tipo") == "VENDA" and t.get("pnl_usd") is not None]
     except Exception:
-        vendas = []
-    if not vendas:
+        todas = []
+    manuais = [t for t in todas if "[manual]" in str(t.get("motivo") or "")]
+    vendas = [t for t in todas if "[manual]" not in str(t.get("motivo") or "")]
+    if not todas:
         return L + ["    Ainda sem operacoes fechadas (ou trades.csv indisponivel)."]
-    dias = {}
-    for t in vendas:
-        dias.setdefault(str(t.get("data_hora") or "")[:10], []).append(t)
-    for dia in sorted(dias):
-        g = dias[dia]
-        pnl = sum(num(t["pnl_usd"]) for t in g)
-        ganhas = sum(1 for t in g if num(t["pnl_usd"]) > 0)
-        media = sum(num(t.get("pnl_pct")) for t in g) / len(g)
-        L.append(f"    {dia}   {len(g):>3} fechadas   {ganhas:>2} ganhas   resultado ${pnl:+7.2f}   media {media:+6.2f}% por operacao")
+
+    def por_dia(grupo):
+        dias = {}
+        for t in grupo:
+            dias.setdefault(str(t.get("data_hora") or "")[:10], []).append(t)
+        for dia in sorted(dias):
+            g = dias[dia]
+            pnl = sum(num(t["pnl_usd"]) for t in g)
+            ganhas = sum(1 for t in g if num(t["pnl_usd"]) > 0)
+            media = sum(num(t.get("pnl_pct")) for t in g) / len(g)
+            L.append(f"    {dia}   {len(g):>3} fechadas   {ganhas:>2} ganhas   resultado ${pnl:+7.2f}   media {media:+6.2f}% por operacao")
+    por_dia(vendas)
+    if manuais:
+        L.append("  COMPRAS MANUAIS (escolhas tuas; nao contam acima)")
+        por_dia(manuais)
     L += ["    As regras do bot mudaram pelo caminho (confirmacao manual e limite de 5 EUR desde 14/11, preco rapido",
           "    desde 15/11): compara dias com as mesmas regras, nao o total."]
     return L
@@ -5872,7 +7095,9 @@ def _regra_txt(regra):
 
 def analisar(cfg):
     """Devolve o texto do relatorio do laboratorio."""
-    todos = ler_percursos(cfg)
+    lidos = ler_percursos(cfg)
+    manuais = [pc for pc in lidos if pc.get("grupo") == "manual"]
+    todos = [pc for pc in lidos if pc.get("grupo") != "manual"]
     percursos = [pc for pc in todos if pc.get("grupo", "sinal") != "controlo"]
     controlo = [pc for pc in todos if pc.get("grupo") == "controlo"]
     n = len(percursos)
@@ -5887,6 +7112,7 @@ def analisar(cfg):
             L += _secao_controlo(percursos, controlo, atual, cfg)
             L += _secao_caracteristicas(todos, atual, cfg)
             L += _secao_estrategia_post(percursos, todos, cfg)
+        L += _secao_manuais(manuais, regra_atual(cfg), cfg)
         return "\n".join(L)
     dias = (num(percursos[-1].get("ts")) - num(percursos[0].get("ts"))) / 86400.0
     L.append(f"  Sinais analisados: {n}   (ao longo de {dias:.1f} dias)")
@@ -5923,10 +7149,17 @@ def analisar(cfg):
         melhor = max(grelha, key=lambda r: _medir(a, r, cfg)[0])
         m_a, _ = _medir(a, melhor, cfg)
         m_b, ac_b = _medir(b, melhor, cfg)
+        m_at, ac_at = _medir(b, atual, cfg)
+        dif = m_b - m_at
         L += ["", "  PROVA DOS NOVE (a melhor regra da 1.a metade dos sinais, testada na 2.a metade)",
               f"    {_regra_txt(melhor)}",
               f"    1.a metade: {m_a:+6.2f}% por trade     2.a metade: {m_b:+6.2f}% por trade (acerto {ac_b:.1f}%)",
+              f"    regras atuais na mesma 2.a metade ({len(b)} sinais): {m_at:+6.2f}% por trade (acerto {ac_at:.1f}%)",
+              f"    -> na 2.a metade a regra escolhida fica {abs(dif):.2f} pontos "
+              + ("ACIMA" if dif > 0 else "ABAIXO") + " das regras atuais",
               "    Se a 2.a metade for muito pior, a regra so 'acertou' por acaso - nao confies nela."]
+    L += _secao_hipoteses_congeladas(percursos, atual, cfg)
+    L += _secao_hipoteses_entrada(percursos, cfg)
 
     L += _secao_pontos_finos(percursos, [r for _, r in resultados[:5]], atual, cfg)
     L += _secao_entrada_adiada(percursos, atual, cfg)
@@ -5949,6 +7182,7 @@ def analisar(cfg):
     L += _secao_filtros_a_testar(percursos, atual, cfg)
     L += _secao_carteiras(todos, atual, cfg)
     L += _secao_estrategia_post(percursos, todos, cfg)
+    L += _secao_manuais(manuais, atual, cfg)
     L += _secao_por_dia(cfg)
     L += ["", "  COMO LER", "    - 'media' ja inclui os custos simulados (slippage e taxas, a entrada e a saida).",
           "    - Fora da seccao PONTOS FINOS, tudo usa os pontos normais (DexScreener, ~30 em 30 s).",
@@ -5957,6 +7191,37 @@ def analisar(cfg):
           "      nao nas saidas: nenhuma regra de venda salva compras sem vantagem.",
           "    - Resultado em simulacao nao garante resultado com dinheiro real.", "=" * 74]
     return "\n".join(L)
+
+
+def _secao_manuais(manuais, regra, cfg):
+    """Tokens acompanhados a pedido (botao Acompanhar). Nao entram em nenhuma estatistica do laboratorio.
+    Mostra as regras atuais e o stop alternativo lado a lado, para comparares as duas com os teus tokens."""
+    if not manuais:
+        return []
+    alt = regra_alternativa(cfg)
+    L = ["", f"  TOKENS ACOMPANHADOS A MAO ({len(manuais)}; NAO entram nas estatisticas acima)",
+         f"    regras atuais (stop {regra[0]:.0f}%) contra o mesmo com stop {alt[0]:.0f}%"]
+    for pc in manuais[-15:]:
+        res, motivo = repetir_percurso(pc, regra, cfg)
+        res_a, motivo_a = repetir_percurso(pc, alt, cfg)
+        pico = (max(p[1] for p in pc["pts"]) - 1) * 100
+        p = pc.get("pontuacao")
+        L.append(f"    {time.strftime('%d/%m %H:%M', time.localtime(num(pc.get('ts'))))}  ${str(pc.get('simbolo'))[:10]:<10} "
+                 f"pontos {('%3d' % p) if p is not None else '  -'}   atuais {res:+7.2f}% ({motivo:<8})  "
+                 f"stop {alt[0]:.0f}% {res_a:+7.2f}% ({motivo_a:<8})  pico {pico:+6.1f}%   fim {pc.get('fim')}")
+    r1 = [repetir_percurso(pc, regra, cfg)[0] for pc in manuais]
+    r2 = [repetir_percurso(pc, alt, cfg)[0] for pc in manuais]
+    r3 = [_simular_recuperar([[num(p[0]), num(p[1])] for p in pc["pts"]], regra, pc.get("fim"), pc.get("liq_fim"), cfg)["pct"]
+          for pc in manuais]
+    melhor = sum(1 for a, b in zip(r1, r2) if b > a + 0.01)
+    pior = sum(1 for a, b in zip(r1, r2) if b < a - 0.01)
+    L.append(f"    media: atuais {sum(r1) / len(r1):+.2f}%   stop {alt[0]:.0f}% {sum(r2) / len(r2):+.2f}% por token   "
+             f"| stop {alt[0]:.0f}% melhor em {melhor}, pior em {pior}, igual em {len(r1) - melhor - pior}")
+    m3 = sum(1 for a, b in zip(r1, r3) if b > a + 0.01)
+    L.append(f"    recuperar entrada a 2x: media {sum(r3) / len(r3):+.2f}% por token | melhor do que as atuais em {m3} de {len(r3)}")
+    if len(manuais) < 20:
+        L.append("    Com menos de 20 tokens acompanhados isto ainda e sobretudo sorte.")
+    return L
 
 
 def _linha_grupo(nome, grupo, regra, cfg):

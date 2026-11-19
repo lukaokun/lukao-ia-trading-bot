@@ -119,6 +119,99 @@ class TelegramBotoesTests(unittest.TestCase):
         self.assertEqual(self.decisoes, [])
         self.assertIsNone(self.tg.processar({"update_id": 9, "message": {"text": "ola"}}))
 
+    def test_mensagem_de_texto_pede_analise_manual(self):
+        pedidos = []
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: (pedidos.append(txt), "RESULTADO")[1],
+                                  em_fundo=False)
+        mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        msg = lambda texto, de=CHAT, chat=CHAT: {"update_id": 5, "message": {
+            "text": texto, "from": {"id": int(de)}, "chat": {"id": int(chat)}}}
+        self.assertEqual(tg.processar(msg(mint, de="111", chat="111")), "nao_autorizado")
+        self.assertEqual(tg.processar(msg(mint, chat="-100123")), "nao_autorizado")    # grupo: ignorado
+        self.assertNotIn("sendMessage", self.api.metodos())
+        self.assertEqual(tg.processar(msg("/start")), "ajuda")
+        self.assertIn("Análise manual", [j for m, j in self.api.pedidos if m == "sendMessage"][-1]["text"])
+        self.assertEqual(tg.processar(msg("/analisar " + mint)), "analise")
+        self.assertEqual(pedidos, ["/analisar " + mint])
+        enviado = [j for m, j in self.api.pedidos if m == "sendMessage"][-1]
+        self.assertEqual((enviado["text"], enviado["chat_id"]), ("RESULTADO", CHAT))
+        tg._a_analisar.set()
+        self.assertEqual(tg.processar(msg(mint)), "ocupado")
+        tg._a_analisar.clear()
+        self.api.updates = []
+        tg.ciclo(timeout=0)
+        pedido = [j for m, j in self.api.pedidos if m == "getUpdates"][-1]
+        self.assertEqual(pedido["allowed_updates"], ["callback_query", "message"])
+
+    def test_analise_traz_botao_acompanhar(self):
+        pedidos = []
+        mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: ("ANALISE", mint), em_fundo=False,
+                                  acompanhar=lambda m: (pedidos.append(m), (True, "Vou acompanhar"))[1])
+        msg = {"update_id": 5, "message": {"text": mint, "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
+        self.assertEqual(tg.processar(msg), "analise")
+        enviado = [j for m, j in self.api.pedidos if m == "sendMessage"][-1]
+        self.assertEqual(enviado["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "w:" + mint)
+        self.assertEqual(tg.processar(clique("w:" + mint, update_id=6)), "acompanhar")
+        self.assertEqual(pedidos, [mint])
+        self.assertEqual(tg.processar(clique("w:" + mint, de="111", update_id=7)), "nao_autorizado")
+        self.assertEqual(pedidos, [mint])
+        sem = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                   post=self.api)
+        self.assertEqual(sem.processar(clique("w:" + mint, update_id=8)), "invalido")
+
+    def test_comando_acompanhados(self):
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: "x", em_fundo=False,
+                                  acompanhados=lambda: "LISTA AO VIVO")
+        msg = lambda texto, de=CHAT: {"update_id": 5, "message": {"text": texto, "from": {"id": int(de)},
+                                                                   "chat": {"id": int(de)}}}
+        self.assertEqual(tg.processar(msg("/acompanhados", de="111")), "nao_autorizado")
+        self.assertEqual(tg.processar(msg("/acompanhados")), "acompanhados")
+        self.assertEqual([j for m, j in self.api.pedidos if m == "sendMessage"][-1]["text"], "LISTA AO VIVO")
+
+    def test_comprar_e_recuperar_entrada(self):
+        mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        compras, recuperar = [], []
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: ("ANALISE", mint), em_fundo=False,
+                                  vender=lambda m: (True, "ok"), posicao_aberta=lambda m: True,
+                                  comprar=lambda m: (compras.append(m), (True, "A preparar a proposta"))[1],
+                                  recuperar=lambda m: (recuperar.append(m), (True, "pedido registado"))[1],
+                                  pode_recuperar=lambda m: True)
+        msg = {"update_id": 5, "message": {"text": mint, "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
+        tg.processar(msg)
+        teclado = [j for m, j in self.api.pedidos if m == "sendMessage"][-1]["reply_markup"]["inline_keyboard"]
+        self.assertIn("c:" + mint, [b["callback_data"] for linha in teclado for b in linha])
+        self.assertEqual(tg.processar(clique("c:" + mint, update_id=6)), "comprar")
+        self.assertEqual(compras, [mint])
+        self.assertEqual(tg.processar(clique("c:" + mint, de="111", update_id=7)), "nao_autorizado")
+        self.assertEqual(tg.processar(clique("p:" + mint, update_id=8)), "confirmar_recuperar")
+        self.assertEqual(recuperar, [])                                     # so depois do "Sim"
+        self.assertEqual(tg.processar(clique("k:" + mint, update_id=9)), "venda_cancelada")
+        self.assertEqual(tg.processar(clique("z:" + mint, update_id=10)), "recuperar")
+        self.assertEqual(recuperar, [mint])
+        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint, recuperar=True)), 2)
+        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint)), 1)
+
+    def test_parar_acompanhamento(self):
+        mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        parados = []
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: "x", em_fundo=False,
+                                  acompanhados=lambda: ("LISTA", [(mint, "VEXA")]),
+                                  deixar=lambda m: (parados.append(m), (True, "Deixei de acompanhar $VEXA."))[1])
+        msg = {"update_id": 5, "message": {"text": "/acompanhados", "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
+        self.assertEqual(tg.processar(msg), "acompanhados")
+        enviado = [j for m, j in self.api.pedidos if m == "sendMessage"][-1]
+        self.assertEqual(enviado["text"], "LISTA")
+        self.assertEqual(enviado["reply_markup"]["inline_keyboard"][0][0]["callback_data"], "d:" + mint)
+        self.assertEqual(tg.processar(clique("d:" + mint, de="111", update_id=6)), "nao_autorizado")
+        self.assertEqual(tg.processar(clique("d:" + mint, update_id=7)), "parar")
+        self.assertEqual(parados, [mint])
+
     def test_decisao_recusada_pelo_bot(self):
         tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (False, "paragem de emergencia ativa"),
                                   self.manager.esta_pendente, post=self.api)

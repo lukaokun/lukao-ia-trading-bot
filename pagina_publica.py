@@ -78,6 +78,8 @@ def _ler_trades(pasta):
                 if tipo == "COMPRA":
                     compras[r.get("mint")] = r
                 elif tipo == "VENDA":
+                    if str(r.get("motivo") or "").upper().startswith("PARCIAL"):
+                        continue  # venda parcial (recuperar entrada): a posicao continua aberta
                     c = compras.get(r.get("mint")) or {}
                     vendas.append({
                         "simbolo": str(r.get("simbolo") or "?")[:20],
@@ -365,9 +367,9 @@ class Handler(BaseHTTPRequestHandler):
             if e is None:
                 return self._enviar(503, '{"erro":"bot indisponivel"}', "application/json")
             return self._enviar(200, e, "application/json; charset=utf-8")
-        if caminho in ("/assets/mascote_oficial.png", "/assets/mascote_chifres.png"):  # lista fixa de imagens
+        if caminho == "/assets/mascote_oficial.png":
             try:
-                with open(os.path.join(self.pasta, "assets", caminho.rsplit("/", 1)[1]), "rb") as f:
+                with open(os.path.join(self.pasta, "assets", "mascote_oficial.png"), "rb") as f:
                     return self._enviar(200, f.read(3_000_000), "image/png")
             except OSError:
                 return self._enviar(404, "nao encontrado", "text/plain; charset=utf-8")

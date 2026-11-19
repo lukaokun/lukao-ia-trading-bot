@@ -499,7 +499,11 @@ def t_plataforma_web(pasta):
         # Dashboard Neural: so leitura, so GET /api/estado, sem codigos de confirmacao nem acoes.
         assert neural.startswith("<!DOCTYPE html>") and "Neural Sphere" in neural and "fetch('/api/estado',{cache:'no-store'})" in neural
         # Unica escrita autorizada (2026-11-14): POST /api/proposta/decisao, com confirmacao e chave da sessao.
-        assert neural.count("fetch(") == 2 and neural.count("method:'POST'") == 1 and "'/api/proposta/decisao'" in neural
+        assert "fetch('/api/acompanhados'" in neural
+        assert "fetch('/api/manual',{method:'POST'" in neural   # comprar (proposta) / vender / recuperar: so Paper
+        assert neural.count("fetch(") == 7 and neural.count("method:'POST'") == 3 and "'/api/proposta/decisao'" in neural
+        assert "fetch('/api/acompanhar',{method:'POST'" in neural   # acompanhar: so laboratorio, nunca compra
+        assert "fetch('/api/analisar?q='" in neural and "'X-MemeBot-Token':TOKEN" in neural   # analise manual: so GET
         assert "confirmation_code" not in neural and "__MEMEBOT_TOKEN__" not in neural
         assert "XMLHttpRequest" not in neural and "WebSocket" not in neural and "sendBeacon" not in neural
         assert "function verificarAvisos()" in neural and "Proposta de compra pendente" in neural and "Sim, recusar" in neural and "Sim, aprovar" in neural
@@ -1633,28 +1637,312 @@ def t_laboratorio_pontuacao_por_criterio(pasta):
     assert B._componentes(pcs[2], B._componentes_do_log(cfg)) == {"liquidez": 8.0, "volume": 20.0, "compras": 18.0}
 
 
-def t_tema_chifres_imagem_e_dashboard(pasta):
-    import urllib.error
-    import urllib.request
+def t_laboratorio_hipoteses_congeladas(pasta):
     bot, cfg = novo_bot(pasta)
-    bot.atualizar_snapshot()
-    cfg["painel_web"] = True
-    B.iniciar_painel_web(bot)
-    try:
-        base = f"http://127.0.0.1:{bot.servidor_web.server_address[1]}"
-        img = urllib.request.urlopen(base + "/assets/mascote_chifres.png", timeout=5)
-        assert img.headers["Content-Type"] == "image/png" and img.read(8) == b"\x89PNG\r\n\x1a\n"
-        for proibido in ("/assets/bot.py", "/assets/../bot.py", "/assets/dashboard_neural.html", "/assets/outra.png"):
-            try:
-                urllib.request.urlopen(base + proibido, timeout=5)
-                raise AssertionError("servido sem estar na lista: " + proibido)
-            except urllib.error.HTTPError as erro:
-                assert erro.code == 404
-        pagina = urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8")
-        assert '"chifres": "Chifres"' in pagina and "desenhaFoto" in pagina and "FOTO_OLHOS" in pagina
-    finally:
-        bot.servidor_web.shutdown()
-        bot.servidor_web.server_close()
+    base = {"simbolo": "X", "preco0": 0.001, "liq0": 50000, "liq_fim": 50000, "fim": "tempo"}
+    sobe = [[0, 1.0], [60, 1.3], [600, 1.6], [5400, 1.6]]          # chega a +60%: A vende a +50%
+    cai = [[0, 1.0], [60, 0.85], [120, 0.7], [5400, 0.7]]           # cai: atuais param a -12%, A a -20%
+    h = dict(B.HIPOTESES_CONGELADAS, desde_sinal=3, minimo=30)
+    pcs = [dict(base, mint=mint_de(f"H{i}"), ts=1_799_000_000 + i, pontuacao=(85 if i == 4 else 75),
+                pts=(sobe if i % 2 == 0 else cai)) for i in range(6)]
+    pcs[2]["ptsj"] = [[30, 1.1], [60, 1.3]]
+    atual = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
+             cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
+    txt = "\n".join(B._secao_hipoteses_congeladas(pcs, atual, cfg, h))
+    assert "Sinais novos: 4 (do 3.o em diante)" in txt and "faltam 26" in txt
+    assert "B) recusar pontuacao 80+" in txt and "recusados 1:" in txt and "  3 trades" in txt
+    assert "Com pontos finos e custos reais (1 dos 4 novos)" in txt
+    assert "melhor do que as atuais em" in txt
+    assert "Ainda nao ha sinais novos" in "\n".join(B._secao_hipoteses_congeladas(pcs[:2], atual, cfg, h))
+    assert B.HIPOTESES_CONGELADAS["desde_sinal"] == 37 and B.HIPOTESES_CONGELADAS["saida"] == (-20, 50, 0, 0, 30)
+    # no relatorio completo: prova dos nove com as regras atuais ao lado, e a seccao nova
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for i in range(44):
+            f.write(json.dumps(dict(base, mint=mint_de(f"P{i}"), ts=1_799_000_000 + i, pontuacao=70 + i % 20,
+                                    pts=(sobe if i % 3 else cai))) + "\n")
+    txt = B.analisar(cfg)
+    assert "regras atuais na mesma 2.a metade (22 sinais)" in txt and "das regras atuais" in txt
+    assert "HIPOTESES CONGELADAS" in txt and "Sinais novos: 8 (do 37.o em diante)" in txt
+
+
+def t_analise_manual(pasta):
+    bot, cfg = novo_bot(pasta)
+    listar("BEM")
+    listar("FRACA", liq=900)
+    antes = (dict(bot.estado["posicoes"]), len(bot.estado.get("sinais", [])), dict(bot.estado.get("percursos", {})))
+    ok, r = bot.analise_manual.analisar("olha este https://pump.fun/coin/" + mint_de("BEM"))
+    assert ok and r["simbolo"] == "BEM" and r["mint"] == mint_de("BEM") and r["link"].endswith(mint_de("BEM"))
+    assert isinstance(r["pontuacao"], int) and r["status"] in ("approved", "rejected") and r["pontos"]
+    txt = B.texto_analise_manual(r)
+    assert "ANÁLISE MANUAL" in txt and "Só análise" in txt and "/100" in txt
+    pedidos = MERCADO["pedidos"]
+    assert bot.analise_manual.analisar(mint_de("BEM")) == (True, r) and MERCADO["pedidos"] == pedidos   # cache
+    ok, msg = bot.analise_manual.analisar(mint_de("FRACA"))
+    assert not ok and "espera" in msg                                    # intervalo minimo entre analises
+    avancar(1)
+    ok, r2 = bot.analise_manual.analisar(mint_de("FRACA"))
+    assert ok and r2["status"] == "rejected" and "Liquidez" in B.texto_analise_manual(r2)
+    avancar(1)
+    assert bot.analise_manual.analisar("Bz" * 22) == (False, "não encontrei nenhum par deste token em Solana no DexScreener")
+    assert not bot.analise_manual.analisar("ola, tudo bem?")[0]
+    # so mostra: nada mudou no estado do bot (sem posicoes, sinais, propostas ou percursos novos)
+    depois = (dict(bot.estado["posicoes"]), len(bot.estado.get("sinais", [])), dict(bot.estado.get("percursos", {})))
+    assert antes == depois
+    resposta, mint = bot._analise_manual_telegram("x")
+    assert resposta.startswith("🔎 ") and "endereço" in resposta and mint is None
+    # token na curva do pump.fun (sem liquidez no DexScreener): aviso e compra indisponivel
+    listar("CURVApump")
+    del MERCADO["pares"][mint_de("CURVApump")][0]["liquidity"]
+    avancar(1)
+    texto, m, sem_compra = bot._analise_manual_telegram(mint_de("CURVApump"))
+    assert sem_compra and "sem liquidez visível" in texto and m == mint_de("CURVApump")
+    ok, msg = bot.pedir_compra_manual(mint_de("CURVApump"))
+    assert not ok and "sem liquidez visível" in msg
+
+
+def t_analise_manual_historico_e_acompanhar(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg["percurso_minutos"] = 180
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    sobe, cai = [[0, 1.0], [600, 1.6], [5400, 1.6]], [[0, 1.0], [60, 0.7], [120, 0.4]]
+    with open(cfg["ficheiro_percursos"], "w", encoding="utf-8") as f:
+        for i, (p, g) in enumerate([(75, "sinal"), (76, "sinal"), (85, "sinal"), (86, "sinal"), (92, "sinal"),
+                                    (93, "sinal"), (60, "controlo"), (61, "controlo"), (75, "manual")]):
+            f.write(json.dumps({"mint": mint_de(f"H{i}"), "simbolo": "H", "ts": 1_799_000_000 + i, "pontuacao": p,
+                                "grupo": g, "fim": "tempo" if i % 2 else "rug", "pts": sobe if i % 2 else cai,
+                                "preco0": 0.001, "liq0": 50000, "liq_fim": 50000}) + "\n")
+    listar("BEM")
+    ok, r = bot.analise_manual.analisar(mint_de("BEM"))
+    h = r["historico"]
+    assert ok and h and h["n"] == 2 and h["rug"] == 50.0 and h["a50"] == 50.0      # os "manual" nao contam
+    assert "📚 Histórico (2 " in B.texto_analise_manual(r) and "Poucos dados" in B.texto_analise_manual(r)
+    assert bot.analise_manual.historico(55)["grupo"] == "recusados com menos de 70 pontos"
+    assert bot.analise_manual.historico(None) is None
+    # acompanhar: so depois de analisar; o ciclo principal e que comeca, ao preco atual
+    assert not bot.pedir_acompanhamento(mint_de("NUNCA"))[0]
+    ok, msg = bot.pedir_acompanhamento(mint_de("BEM"))
+    assert ok and "3 h" in msg
+    assert bot.estado["percursos"] == {}                                    # ainda nao: so ficou na fila
+    mexer("BEM", preco=0.002)
+    assert bot._processar_acompanhamentos() == 1
+    pc = bot.estado["percursos"][mint_de("BEM")]
+    assert pc["grupo"] == "manual" and pc["preco0"] == 0.002 and pc["origem"] == "telegram"
+    assert bot.pedir_acompanhamento(mint_de("BEM")) == (False, "já estou a acompanhar este token")
+    cfg["percursos_manuais_max"] = 1
+    listar("DUAS"); avancar(1)
+    assert bot.analise_manual.analisar(mint_de("DUAS"))[0]
+    assert "já há 1 tokens" in bot.pedir_acompanhamento(mint_de("DUAS"))[1]
+    assert bot.estado["posicoes"] == {}
+    # 3 h depois fecha, grava como "manual" e avisa no Telegram
+    avancar(181)
+    bot.ciclo_risco()
+    assert mint_de("BEM") not in bot.estado["percursos"]
+    ultima = json.loads(open(cfg["ficheiro_percursos"], encoding="utf-8").read().splitlines()[-1])
+    assert ultima["grupo"] == "manual" and ultima["mint"] == mint_de("BEM")
+    assert any("ACOMPANHAMENTO TERMINOU" in x and "$BEM" in x and "Só laboratório" in x for x in enviados)
+    txt = B.analisar(cfg)
+    assert "Sinais analisados: 6" in txt and "TOKENS ACOMPANHADOS A MAO (2;" in txt
+
+
+def t_acompanhar_pump_fun_sem_falso_rug(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg["percurso_minutos"] = 180
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    listar("PUMP", liq=5300)                                         # pool pequena (curva do pump.fun)
+    assert bot.analise_manual.analisar(mint_de("PUMP"))[0]
+    assert bot.pedir_acompanhamento(mint_de("PUMP"))[0] and bot._processar_acompanhamentos() == 1
+    del MERCADO["pares"][mint_de("PUMP")][0]["liquidity"]           # a API deixa de mostrar a liquidez
+    avancar(1); bot.ciclo_risco()
+    assert mint_de("PUMP") in bot.estado["percursos"]                # liquidez em falta nao e rug
+    MERCADO["pares"][mint_de("PUMP")][0]["liquidity"] = {"usd": 4800}
+    mexer("PUMP", preco=0.0015)                                     # 5300 -> 4800 ainda nao e rug (piso 2650)
+    avancar(1); bot.ciclo_risco()
+    assert mint_de("PUMP") in bot.estado["percursos"]
+    mexer("PUMP", liq=900)                                           # a pool esvaziou: isto sim e rug
+    avancar(1); bot.ciclo_risco()
+    assert mint_de("PUMP") not in bot.estado["percursos"]
+    msg = enviados[-1]
+    assert "Com stop -25% teria dado" in msg
+    assert "acabou em RUG" in msg and "Seguido 3 min" in msg and ("saía no" in msg or "apanhado pelo rug" in msg) and "possível rug: )" not in msg
+    # um sinal normal continua com o piso absoluto de sempre
+    listar("SINAL", liq=20000)
+    par = MERCADO["pares"][mint_de("SINAL")][0]
+    bot.iniciar_percurso(mint_de("SINAL"), par, {"pontuacao": 75})
+    mexer("SINAL", liq=2500)
+    avancar(1); bot.ciclo_risco()
+    assert mint_de("SINAL") not in bot.estado["percursos"]
+
+
+def t_acompanhados_ao_vivo(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg["percurso_minutos"] = 180
+    cfg.update(stop_loss_pct=-12, take_profit_pct=100, trailing_ativar_pct=0, tempo_maximo_min=120)
+    bot.telegram.enviar = lambda *a, **k: None
+    assert "Não há tokens" in bot.acompanhados_texto()
+    listar("VEXA")
+    assert bot.analise_manual.analisar(mint_de("VEXA"))[0]
+    assert bot.pedir_acompanhamento(mint_de("VEXA"))[0] and bot._processar_acompanhamentos() == 1
+    assert bot.info_acompanhados and bot.info_acompanhados[0]["simbolo"] == "VEXA"
+    mexer("VEXA", preco=0.0013)
+    avancar(5); bot.ciclo_risco()
+    a = bot.info_acompanhados[0]
+    assert abs(a["agora_pct"] - 30) < 0.5 and a["sim"]["estado"] == "aberta" and a["falta_min"] == 175
+    assert a["liq"] and a["compras_pct"] is not None and a["pts"][-1][1] == a["agora_pct"]
+    txt = bot.acompanhados_texto()
+    assert "A ACOMPANHAR (1)" in txt and "$VEXA" in txt and "ainda dentro" in txt and "nenhum destes tokens foi comprado" in txt
+    mexer("VEXA", preco=0.001302)                                   # +0.15%: nao vira ponto gravado, mas aparece ao vivo
+    avancar(0.25); bot.ciclo_risco()
+    a = bot.info_acompanhados[0]
+    assert abs(a["agora_pct"] - 30.2) < 0.05 and a["pts"][-1][0] == 315
+    mexer("VEXA", preco=0.0008)                                     # -20%: as regras teriam saido no stop
+    avancar(5); bot.ciclo_risco()
+    s = bot.info_acompanhados[0]["sim"]
+    assert s["estado"] == "saiu" and s["motivo"] == "stop" and 10 <= s["min"] <= 10.3
+    assert "aos 10 min" in bot.acompanhados_texto()
+    alt = bot.info_acompanhados[0]["sim_alt"]
+    assert alt["stop"] == -25 and alt["estado"] == "aberta"            # -20% ainda nao toca no stop de -25%
+    assert "Com stop -25%: ainda dentro" in bot.acompanhados_texto()
+    mexer("VEXA", preco=0.0016)                                      # recupera: so o stop largo "ficou dentro"
+    avancar(5); bot.ciclo_risco()
+    assert bot.info_acompanhados[0]["sim"]["motivo"] == "stop" and bot.info_acompanhados[0]["sim_alt"]["pct"] > 40
+    avancar(180); bot.ciclo_risco()
+    assert bot.info_acompanhados == [] and bot.manuais_terminados[0]["simbolo"] == "VEXA"
+    assert bot.manuais_terminados[0]["terminado"] and "Terminados há pouco" in bot.acompanhados_texto()
+    assert "stop -25%: +" in bot.acompanhados_texto()
+    txt = B.analisar(cfg)
+    assert "TOKENS ACOMPANHADOS A MAO (1;" in txt and "stop -25% melhor em 1, pior em 0, igual em 0" in txt
+    assert bot.estado["posicoes"] == {}
+
+
+def t_compra_manual_e_recuperar_entrada(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg.update(stop_loss_pct=-50, take_profit_pct=0, trailing_ativar_pct=0, tempo_maximo_min=600)
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    listar("MANU")
+    # sem analise feita (ex.: depois de um reinicio) o ciclo principal analisa antes de propor
+    ok, msg = bot.pedir_compra_manual(mint_de("MANU"), "dashboard")
+    assert ok and "proposta" in msg
+    assert bot.estado["posicoes"] == {}                                   # nada comprado sem proposta + confirmacao
+    assert bot._processar_compras_manuais() == 1
+    assert any("PROPOSTA MANUAL (escolha tua)" in x for x in enviados)
+    bot._processar_respostas_aprovacao()                                  # (a fixture de teste aprova a proposta)
+    pos = bot.estado["posicoes"][mint_de("MANU")]
+    assert pos["origem"] == "manual"
+    compra = [r for r in trades(cfg) if r["tipo"] == "COMPRA"][-1]
+    assert compra["motivo"] == "manual"
+    assert "já há uma posição aberta" in bot.pedir_compra_manual(mint_de("MANU"))[1] or \
+        "já tens este token" in bot.pedir_compra_manual(mint_de("MANU"))[1]
+    # recuperar a entrada: so com lucro suficiente
+    assert bot.pedir_venda(mint_de("MANU"), "dashboard", parcial=True)[0]
+    bot._processar_vendas_manuais()
+    assert not pos.get("entrada_recuperada") and any("Não recuperei a entrada" in x for x in enviados)
+    mexer("MANU", preco=0.002)                                            # x2
+    avancar(1); bot.ciclo_risco()
+    saldo0, custo, tokens0 = bot.estado["saldo"], pos["custo"], pos["tokens"]
+    assert bot.pedir_venda(mint_de("MANU"), "telegram", parcial=True)[0]
+    assert bot._processar_vendas_manuais() == 1
+    pos = bot.estado["posicoes"][mint_de("MANU")]
+    recebido = bot.estado["saldo"] - saldo0
+    assert pos["entrada_recuperada"] and abs(recebido - custo) < 0.02 and abs(pos["recebido_parcial"] - recebido) < 1e-6
+    assert 0.4 < pos["tokens"] / tokens0 < 0.6 and pos["tokens_iniciais"] == tokens0
+    parcial = trades(cfg)[-1]
+    assert parcial["tipo"] == "VENDA" and parcial["motivo"].startswith("PARCIAL") and parcial["pnl_usd"] == ""
+    assert any("ENTRADA RECUPERADA" in x for x in enviados)
+    assert "já foi recuperada" in bot.pedir_venda(mint_de("MANU"), parcial=True)[1]
+    assert bot.estado["stats"]["fechados"] == 0                            # a parcial nao fecha a operacao
+    # venda final: o resultado soma a parte recebida
+    mexer("MANU", preco=0.003)
+    avancar(1); bot.ciclo_risco()
+    assert bot.pedir_venda(mint_de("MANU"), "dashboard")[0] and bot._processar_vendas_manuais() == 1
+    assert mint_de("MANU") not in bot.estado["posicoes"]
+    final = trades(cfg)[-1]
+    assert final["motivo"] == "MANUAL (dashboard) [manual]" and float(final["pnl_pct"]) > 100
+    assert abs(float(final["pnl_usd"]) - (float(final["valor_usd"]) + recebido - custo)) < 0.01
+    txt = B._secao_por_dia(cfg)
+    assert "COMPRAS MANUAIS (escolhas tuas; nao contam acima)" in "\n".join(txt)
+    # numa posicao do bot nao ha "recuperar entrada"
+    listar("BOTA")
+    bot.ciclo_scanner()
+    m_bot = next((m for m, p in bot.estado["posicoes"].items() if p.get("origem") != "manual"), None)
+    if m_bot:
+        assert "só nas posições compradas por ti" in bot.pedir_venda(m_bot, parcial=True)[1]
+
+
+def t_impacto_maximo_compra_manual(pasta):
+    bot, cfg = novo_bot(pasta)
+    class Cotacao:
+        def __init__(self, impacto):
+            self.impacto = impacto
+        def cotar_compra(self, mint, valor):
+            return {"estado": "ok", "impacto_pct": self.impacto}
+    cfg.update(verificar_rota_compra_jupiter=True, impacto_compra_jupiter_max_pct=1.5,
+               impacto_compra_manual_max_pct=3.0, max_slippage_pct=3.0)
+    bot.preco_rapido = Cotacao(2.24)
+    assert "acima do maximo 1.5%" in bot._bloqueio_rota_compra("M" * 44, 5.5)       # propostas do bot: 1.5%
+    assert bot._bloqueio_rota_compra("M" * 44, 5.5, manual=True) is None             # as tuas: ate 3%
+    bot.preco_rapido = Cotacao(3.4)
+    assert "acima do maximo 3%" in bot._bloqueio_rota_compra("M" * 44, 5.5, manual=True)
+    cfg["impacto_compra_manual_max_pct"] = 10                                         # nunca acima do slippage maximo
+    assert "acima do maximo 3%" in bot._bloqueio_rota_compra("M" * 44, 5.5, manual=True)
+
+
+def t_hipoteses_de_entrada(pasta):
+    bot, cfg = novo_bot(pasta)
+    base = {"simbolo": "X", "preco0": 0.001, "liq0": 50000, "liq_fim": 50000, "fim": "tempo"}
+    sobe = [[0, 1.0], [60, 1.3], [600, 1.6], [5400, 1.6]]
+    cai_e_sobe = [[0, 1.0], [60, 0.8], [120, 0.78], [600, 1.4], [5400, 1.4]]   # recua 20-22%: D entra na queda
+    pcs = [dict(base, mint=mint_de(f"E{i}"), ts=1_799_000_000 + i, pontuacao=75,
+                pts=(cai_e_sobe if i % 2 else sobe), feat={"idade_min": 45 if i % 3 else 10}) for i in range(8)]
+    h = dict(B.HIPOTESES_ENTRADA, desde_sinal=3)
+    txt = "\n".join(B._secao_hipoteses_entrada(pcs, cfg, h))
+    assert "Sinais novos: 6 (do 3.o em diante)" in txt and "faltam 24" in txt
+    assert "C) so tokens com 30 min ou mais" in txt and "saem 2:" in txt
+    assert "D) entrar na queda de 15-35%" in txt and "sem entrada (nao caiu): 3" in txt
+    assert "Ainda nao ha sinais novos" in "\n".join(B._secao_hipoteses_entrada(pcs[:2], cfg, h))
+    assert B.HIPOTESES_ENTRADA["desde_sinal"] == 78 and B.HIPOTESES_ENTRADA["idade_min"] == 30
+
+
+def t_deixar_de_acompanhar(pasta):
+    bot, cfg = novo_bot(pasta)
+    bot.telegram.enviar = lambda *a, **k: None
+    listar("PARA")
+    assert bot.analise_manual.analisar(mint_de("PARA"))[0]
+    assert bot.pedir_acompanhamento(mint_de("PARA"))[0] and bot._processar_acompanhamentos() == 1
+    texto, lista = bot.acompanhados_texto_botoes()
+    assert lista == [(mint_de("PARA"), "PARA")]
+    assert "não está a ser acompanhado" in bot.pedir_parar_acompanhamento(mint_de("NADA"))[1]
+    ok, msg = bot.pedir_parar_acompanhamento(mint_de("PARA"), "dashboard")
+    assert ok and "Deixei de acompanhar $PARA" in msg
+    assert mint_de("PARA") in bot.estado["percursos"]                  # so o ciclo principal mexe no estado
+    assert bot._processar_paragens() == 1
+    assert mint_de("PARA") not in bot.estado["percursos"] and bot.info_acompanhados == []
+    assert not os.path.exists(cfg["ficheiro_percursos"]) or mint_de("PARA") not in open(cfg["ficheiro_percursos"]).read()
+    # um sinal do bot nao se pode parar por aqui
+    listar("SINA")
+    bot.iniciar_percurso(mint_de("SINA"), MERCADO["pares"][mint_de("SINA")][0], {"pontuacao": 75})
+    assert not bot.pedir_parar_acompanhamento(mint_de("SINA"))[0]
+
+
+def t_cinco_posicoes(pasta):
+    bot, cfg = novo_bot(pasta)
+    caminho = cfg["_operational_config_path"]
+    pol = json.load(open(caminho, encoding="utf-8"))
+    pol["max_open_positions"] = 5
+    json.dump(pol, open(caminho, "w", encoding="utf-8"))
+    for i in range(7):
+        listar(f"PQ{i}")
+    for _ in range(3):
+        bot.ciclo_scanner()
+        avancar(1)
+    assert len(bot.estado["posicoes"]) == 5                                  # para nos 5, nunca 6 ou 7
+    assert "maximo de 5 posicoes abertas" in bot.executor.pode_comprar()[1]
+    assert bot._intervalo_rapido() == 7.5                                    # 5 posicoes: Jupiter mais devagar
+    pol["max_open_positions"] = 6                                            # acima do teto: compras bloqueadas
+    json.dump(pol, open(caminho, "w", encoding="utf-8"))
+    assert bot.executor.pode_comprar()[0] == 0
 
 
 def main():

@@ -22,7 +22,7 @@ ECB_USD_EUR_URL = (
 ECB_SOURCE = "European Central Bank (ECB) daily reference rate"
 MAX_RATE_AGE_DAYS = 4
 MAX_OPERATION_EUR = Decimal("5")
-MAX_OPEN_POSITIONS = 1
+MAX_OPEN_POSITIONS = 5  # teto absoluto (autorizado a 19/11/2026); a config escolhe entre 1 e 5
 # Maximum approved by the operator on 2026-11-14 (Paper only): 3% total simulated
 # slippage per entry (2% base + market impact). A missing config cap still blocks proposals.
 APPROVED_MAX_SLIPPAGE_PCT = Decimal("3")
@@ -241,8 +241,8 @@ def load_operational_config(path):
             raise OperationalConfigError("max_slippage_pct excede ou viola o limite aprovado")
 
     count = data.get("max_open_positions")
-    if isinstance(count, bool) or not isinstance(count, int) or count != MAX_OPEN_POSITIONS:
-        raise OperationalConfigError("max_open_positions tem de ser exatamente 1")
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_OPEN_POSITIONS:
+        raise OperationalConfigError(f"max_open_positions tem de ser um inteiro entre 1 e {MAX_OPEN_POSITIONS}")
 
     return {
         "mode": "paper",
