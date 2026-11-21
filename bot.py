@@ -7313,7 +7313,13 @@ def reiniciar(cfg, confirmado=False):
                 archived[label] = None
 
         journal_hashes = _journal_tree_hashes(journal_dir) if os.path.isdir(journal_dir) else None
+        # O diario de auditoria (B13) pertence a mesma simulacao: vai para o arquivo junto com o diario Paper.
+        # Se ficasse, os eventos antigos "execution_committed" ja nao batem certo com o diario Paper novo e o
+        # bot bloqueava as compras logo a seguir ao reset (aconteceu a 21/11/2026).
+        audit_path = os.path.join(os.path.dirname(state_path), "paper_audit.jsonl")
+        audit_hash = _sha256_file(audit_path) if os.path.isfile(audit_path) else None
         atomic_write_json(os.path.join(archive, "manifest.json"), {
+            "paper_audit_sha256": audit_hash,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "state_path": state_path,
             "trades_path": trades_path,
@@ -7334,6 +7340,12 @@ def reiniciar(cfg, confirmado=False):
                 os.replace(journal_dir, journal_archive)
                 if _journal_tree_hashes(journal_archive) != journal_hashes:
                     raise PaperOperationError("diario arquivado diverge do manifesto")
+
+            if audit_hash is not None:
+                audit_archive = os.path.join(archive, "paper_audit.jsonl")
+                os.replace(audit_path, audit_archive)
+                if _sha256_file(audit_archive) != audit_hash:
+                    raise PaperOperationError("diario de auditoria arquivado diverge do manifesto")
 
             atomic_write_json(state_path, estado_novo(cfg))
             header = (",".join(CABECALHO_CSV) + "\n").encode("utf-8")
@@ -7404,6 +7416,9 @@ def main(argv=None):
             preparar_demo(cfg)
         if args.reset:
             reiniciar(cfg, confirmado=args.confirmar_reset)
+            # O reset so reinicia a simulacao: nao arranca o bot (no servidor e o servico que o arranca).
+            print("Reset feito. O bot NAO foi arrancado: arranca-o pelo servico (ou com python bot.py).")
+            return 0
         bot = Bot(cfg, process_lock=process_lock)
         bot.obs_extra.ativo = bool(cfg.get("observacao_extra")) and not args.demo
         bot.obs_extra.rpc_url, bot.obs_extra.origem_rpc = configurar_rpc(pasta)

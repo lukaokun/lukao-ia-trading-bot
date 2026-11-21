@@ -376,6 +376,7 @@ def t_persistencia(pasta):
         f.write(estado_valido)
     bot3, _ = novo_bot(pasta, limpar=False)
     # --reset
+    bot3.paper_audit.append("execution_blocked", {"reason": "evento antes do reset"})
     bot3.guardar()
     with open(cfg["ficheiro_estado"], "rb") as f:
         estado_arquivo = f.read()
@@ -395,6 +396,11 @@ def t_persistencia(pasta):
         assert f.read() == estado_arquivo
     with open(os.path.join(arquivo, "trades.csv"), "rb") as f:
         assert f.read() == trades_arquivo
+    # o diario de auditoria vai para o arquivo: depois do reset, a reconciliacao nao bloqueia as compras
+    assert not os.path.exists(os.path.join(os.path.dirname(cfg["ficheiro_estado"]), "paper_audit.jsonl"))
+    assert os.path.exists(os.path.join(arquivo, "paper_audit.jsonl"))
+    bot4, _ = novo_bot(pasta, limpar=False)
+    assert not bot4.paper_audit.blocked and not bot4._emergency_stop_is_active()
 
 
 def t_api_com_problemas(pasta):

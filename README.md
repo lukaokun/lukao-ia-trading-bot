@@ -79,3 +79,17 @@ python -m unittest discover -p "teste_*.py"
 - `LEIA-ME.md` — registo detalhado de alterações e funcionalidades.
 - `REQUISITOS_OPERACAO_MANUAL.md` — requisitos de segurança da confirmação manual.
 - `AUDITORIA_FASE1.md`, `AUDITORIA_INTEGRACAO_V7.md` — auditorias.
+
+## Acrescentar um tema ao dashboard
+
+Tudo fica em `assets/dashboard_neural.html`. Um tema novo (ex.: `meutema`) precisa de 4 coisas:
+
+1. **Bloco de cores** (no `<style>`, junto dos outros `html[data-tema="..."]`): copia o bloco de um tema existente
+   (ex.: `carmesim`) e troca as cores. Sem este bloco, os painéis ficam com as cores do Neural.
+2. **Nome no menu**: em `TEMAS_NOMES` acrescenta `"meutema": "Nome que aparece"`.
+3. **Cores dos gráficos**: em `TEMAS_MAPA` acrescenta `"meutema": { ... }` com as mesmas chaves dos outros temas
+   (as cores do Neural à esquerda, as do teu tema à direita).
+4. **Fundo ao abrir a página**: no primeiro `<script>`, em `bgs`, acrescenta `meutema:"#corDeFundo"`.
+
+Opcional: CSS só deste tema com `html[data-tema="meutema"] ...` (fundo, brilhos, animações).
+Para instalar no servidor basta copiar o ficheiro para `assets/` (não é preciso reiniciar o bot).

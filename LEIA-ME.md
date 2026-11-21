@@ -152,3 +152,8 @@ Estado, histórico de operações, logs, bases SQLite, fixtures, watchlists reai
 - Dashboard: no painel "Posição aberta" aparece a caixa "⏳ À espera da queda" com cada token, o recuo atual desde o pico e os minutos que faltam.
 - Laboratório: secção nova `HIPOTESES DE SAIDA PARA A ENTRADA D`, congelada a 21/11/2026 com os primeiros 129 sinais e medida só a partir do 130.º: E) stop −30% / alvo +25% / 120 min; F) stop −20% / alvo +50% / 120 min; referência = D com as saídas atuais. Só passam se ganharem com pontos normais E com pontos finos, com 30+ sinais novos.
 - O laboratório saiu do `bot.py` para `laboratorio.py`, sem mudar nenhum cálculo (o relatório sai igual; os nomes continuam disponíveis em `bot.*`).
+
+## Correção do reset (21/11/2026)
+
+- O reset passou a arquivar também o diário de auditoria (`paper_audit.jsonl`) junto com o estado, os trades e o diário Paper. Antes ficava no sítio, e os eventos antigos de compra deixavam de bater certo com o diário Paper novo: o bot bloqueava as compras logo a seguir ao reset ("Reconciliação B13 falhou").
+- `python bot.py --reset --confirmar-reset` já não arranca o bot depois do reset: no servidor é o serviço que o arranca.
