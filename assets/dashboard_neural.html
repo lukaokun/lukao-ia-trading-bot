@@ -470,6 +470,47 @@ html[data-tema="carmesim"] .brand b{color:#fff;text-shadow:-2px 0 rgba(167,139,2
 .ev{background:linear-gradient(90deg,color-mix(in srgb,var(--k) 7%,transparent),rgba(255,255,255,.01));border-radius:0 8px 8px 0}
 .ev .a{display:inline-block;width:max-content;padding:1px 6px;border-radius:4px;background:color-mix(in srgb,var(--k) 14%,transparent);font-size:9px}
 
+
+/* ---- OBITO CINEMATIC ART + MOTION LAYER ---- */
+html[data-tema="obito"] body{
+ background-color:#050609;
+ background-image:linear-gradient(180deg,rgba(4,4,8,.34),rgba(4,4,8,.76)),url('/assets/obito-arena.png');
+ background-position:center 48%;background-size:cover;background-attachment:fixed
+}
+html[data-tema="obito"] .top{
+ position:relative;isolation:isolate;
+ background-image:linear-gradient(90deg,rgba(3,3,7,.78),rgba(3,3,7,.58) 48%,rgba(3,3,7,.72)),url('/assets/obito-header.png');
+ background-position:center 38%;background-size:cover;
+ border-color:rgba(230,45,49,.46)
+}
+html[data-tema="obito"] .top:after{
+ content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;
+ background:linear-gradient(90deg,rgba(5,5,9,.15),transparent 45%,rgba(5,5,9,.22));
+ box-shadow:inset 0 -2px 22px rgba(232,28,43,.24)
+}
+html[data-tema="obito"] .pn{
+ backdrop-filter:blur(5px);background:linear-gradient(145deg,rgba(12,9,16,.91),rgba(5,6,11,.94))
+}
+html[data-tema="obito"] .pn:hover{box-shadow:inset 0 0 24px rgba(141,108,255,.07),0 0 20px rgba(230,59,46,.13)}
+html[data-tema="obito"] .obito-fx:before{
+ content:"";position:absolute;inset:-20%;opacity:.32;mix-blend-mode:screen;
+ background:repeating-conic-gradient(from 0deg at 72% 22%,transparent 0deg 14deg,rgba(238,36,49,.22) 15deg 15.5deg,transparent 17deg 31deg);
+ animation:obitoOrbit 48s linear infinite
+}
+html[data-tema="obito"] .obito-fx:after{
+ content:"";position:absolute;inset:0;opacity:.23;
+ background:radial-gradient(ellipse at 50% 70%,transparent 18%,rgba(236,26,42,.18) 58%,transparent 72%);
+ animation:obitoPulse 6s ease-in-out infinite alternate
+}
+@keyframes obitoOrbit{to{transform:rotate(360deg)}}
+@keyframes obitoPulse{from{opacity:.12;transform:scale(.98)}to{opacity:.3;transform:scale(1.04)}}
+html[data-tema="obito"] .brand b{animation:obitoBrandGlow 4s ease-in-out infinite alternate}
+@keyframes obitoBrandGlow{from{text-shadow:0 0 8px rgba(230,59,46,.4),2px 0 rgba(141,108,255,.45)}to{text-shadow:0 0 22px rgba(255,54,45,.8),0 0 34px rgba(141,108,255,.38)}}
+@media(prefers-reduced-motion:reduce){
+ html[data-tema="obito"] .obito-fx:before,html[data-tema="obito"] .obito-fx:after,
+ html[data-tema="obito"] .brand b{animation:none}
+}
+
 /* ---- OBITO UCHIHA: máscara espiral, Sharingan e distorção Kamui ---- */
 html[data-tema="obito"]{--bg:#050609;--bg2:#0a0d14;--bg3:#111725;--txt:#f4f1ed;--txt2:#ded8d4;--txt2b:#c8c2c4;--txt3:#a79eaa;--txt3b:#b8aeb8;--mut:#807b88;--mut2:#514b60;--cinza:#9993a5;--tq:#e63b2e;--tq2:#ff6b35;--vd:#8d6cff;--vm:#c9334b;--ou:#ff7a24;--az:#b49aff;--li:#b49aff;--au:#ffd1a3;--ontq:#170805;--bg-rgb:5,6,9;--pn-rgb:10,13,20;--tq-rgb:230,59,46;--tq2-rgb:255,107,53;--vd-rgb:141,108,255;--vm-rgb:201,51,75;--ou-rgb:255,122,36;--az-rgb:180,154,255;--tqd-rgb:76,20,25;--pn:rgba(10,13,20,.88);--lin:rgba(230,59,46,.20);--lin2:rgba(255,122,36,.42)}
 html[data-tema="obito"] body::before{background:radial-gradient(55% 60% at 88% 20%,rgba(230,59,46,.17),transparent 68%),radial-gradient(42% 48% at 78% 84%,rgba(141,108,255,.16),transparent 70%),radial-gradient(50% 40% at 15% 60%,rgba(255,122,36,.07),transparent 75%)}
