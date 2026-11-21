@@ -231,12 +231,18 @@ a{color:var(--tq);text-decoration:none}a:hover{text-decoration:underline}
 .vazio{color:var(--mut);font-size:14px;padding:8px 0}
 footer{margin-top:22px;color:var(--mut);font-size:12px;text-align:center}
 @media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.big{grid-column:span 2}.duas{grid-template-columns:1fr}.big .v{font-size:28px}.v{font-size:20px}}
+header{flex-direction:column;justify-content:center;text-align:center;gap:10px}
+h1.nome{font:900 40px/1 Poppins,system-ui,sans-serif;letter-spacing:1px;color:#fff;text-shadow:-2px 0 rgba(255,60,120,.85),2px 0 rgba(34,224,200,.9),0 0 18px rgba(34,224,200,.35);animation:glitchNome 7s steps(1) infinite}
+header .sub{margin-top:8px;letter-spacing:3px}
+@keyframes glitchNome{0%,92%,100%{transform:none;text-shadow:-2px 0 rgba(255,60,120,.85),2px 0 rgba(34,224,200,.9),0 0 18px rgba(34,224,200,.35)}93%{transform:translateX(1px) skewX(-7deg);text-shadow:-5px 0 rgba(255,60,120,.9),4px 0 rgba(34,224,200,.9),0 0 18px rgba(34,224,200,.35)}95%{transform:translateX(-1px);text-shadow:3px 0 rgba(255,60,120,.9),-4px 0 rgba(34,224,200,.9),0 0 18px rgba(34,224,200,.35)}97%{transform:none;text-shadow:-1px 0 rgba(255,60,120,.85),1px 0 rgba(34,224,200,.9),0 0 24px rgba(34,224,200,.35)}}
+@media(max-width:760px){h1.nome{font-size:32px}header .sub{letter-spacing:1.2px;font-size:11px}}
+@media(prefers-reduced-motion:reduce){h1.nome{animation:none}}
 </style>
 </head>
 <body>
 <div class="w">
 <header>
- <div><h1>SpiderBot <b>//</b> Resultados</h1><div class="sub">Solana · meme coins · Paper Trading</div></div>
+ <div><h1 class="nome">SpiderBot</h1><div class="sub">Resultados · Solana · meme coins · Paper Trading</div></div>
  <span class="est" id="est"><i></i><span id="est-t">a ligar…</span></span>
 </header>
 <div class="aviso"><b>Simulação (Paper Trading).</b> Nenhuma operação usa dinheiro real. Os resultados são simulados com preços reais do mercado e custos estimados, e não garantem resultados futuros. Isto não é aconselhamento financeiro.</div>
@@ -264,15 +270,31 @@ const usd=v=>v==null?'—':(v<0?'-':'')+'$'+Math.abs(v).toFixed(2);
 const pct=v=>v==null?'—':(v>0?'+':'')+v.toFixed(1)+'%';
 const cls=v=>v==null?'':(v>=0?'pos':'neg');
 const dex=m=>/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(m||'')?'https://dexscreener.com/solana/'+m:null;
-function grafico(h,ini){const s=$('g');if(!h||h.length<2){s.innerHTML='';s.insertAdjacentHTML('afterend','<div class="vazio">Ainda sem dados suficientes</div>');return}
+function suavizar(xs,ys,maxN){const n=xs.length;if(n<=maxN)return[xs,ys];const ox=[xs[0]],oy=[ys[0]],passo=(n-2)/(maxN-2);
+ for(let k=0;k<maxN-2;k++){const i0=1+Math.floor(k*passo),i1=Math.max(i0+1,1+Math.floor((k+1)*passo));let sx=0,sy=0,c=0;for(let i=i0;i<i1&&i<n-1;i++){sx+=xs[i];sy+=ys[i];c++}if(c){ox.push(sx/c);oy.push(sy/c)}}
+ ox.push(xs[n-1]);oy.push(ys[n-1]);return[ox,oy]}
+function cometa(xs,ys){const n=xs.length,f=v=>v.toFixed(1);let d='M'+f(xs[0])+' '+f(ys[0]);if(n<3){for(let i=1;i<n;i++)d+=' L'+f(xs[i])+' '+f(ys[i]);return d}
+ for(let i=0;i<n-1;i++){const a=Math.max(0,i-1),b=Math.min(n-1,i+2);d+=' C'+f(xs[i]+(xs[i+1]-xs[a])/6)+' '+f(ys[i]+(ys[i+1]-ys[a])/6)+' '+f(xs[i+1]-(xs[b]-xs[i])/6)+' '+f(ys[i+1]-(ys[b]-ys[i])/6)+' '+f(xs[i+1])+' '+f(ys[i+1])}return d}
+let ULT_G=null;
+function grafico(h,ini){const s=$('g');ULT_G=[h,ini];if(!h||h.length<2){s.innerHTML='';if(!s.nextElementSibling||!s.nextElementSibling.classList.contains('vazio'))s.insertAdjacentHTML('afterend','<div class="vazio">Ainda sem dados suficientes</div>');return}
+ // linha do cometa (igual ao dashboard): suavizada, verde acima do inicial, vermelha abaixo
  const xs=h.map(p=>p[0]),ys=h.map(p=>p[1]).concat([ini]),x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys),py=(y1-y0)*.12||1;
- const X=t=>(t-x0)/((x1-x0)||1)*1000,Y=v=>200-(v-(y0-py))/((y1+py)-(y0-py))*190;
- const d=h.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join(' ');
- const up=h[h.length-1][1]>=ini,c=up?'#2ee6a8':'#ff6b6b';
- s.innerHTML='<defs><linearGradient id="ga" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="'+c+'" stop-opacity=".28"/><stop offset="1" stop-color="'+c+'" stop-opacity="0"/></linearGradient></defs>'+
- '<line x1="0" x2="1000" y1="'+Y(ini).toFixed(1)+'" y2="'+Y(ini).toFixed(1)+'" stroke="#7f9896" stroke-dasharray="4 6" stroke-width="1" vector-effect="non-scaling-stroke"/>'+
- 
- '<path d="'+d+' L1000 220 L0 220 Z" fill="url(#ga)"/><path d="'+d+'" fill="none" stroke="'+c+'" stroke-width="2" vector-effect="non-scaling-stroke"/>'}
+ const sx=1000/(s.clientWidth||1000),sy=220/(s.clientHeight||220),X=t=>6+(t-x0)/((x1-x0)||1)*(982-12*sx),Y=v=>205-(v-(y0-py))/((y1+py)-(y0-py))*190,[XS,YS]=suavizar(h.map(p=>X(p[0])),h.map(p=>Y(p[1])),Math.max(24,Math.min(90,Math.round((s.clientWidth||1000)/12))));
+ const d=cometa(XS,YS),yI=Y(ini).toFixed(1),xu=XS[XS.length-1],yu=YS[YS.length-1],up=h[h.length-1][1]>=ini,c=up?'46,230,168':'255,107,107';
+ const yMin=Math.min(...YS).toFixed(1),yMax=Math.max(...YS).toFixed(1),fe=' L'+xu.toFixed(1)+' '+yI+' L'+XS[0].toFixed(1)+' '+yI+' Z';
+ s.innerHTML='<defs><linearGradient id="gv" x1="0" y1="'+yMin+'" x2="0" y2="'+yI+'" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2ee6a8" stop-opacity=".30"/><stop offset="1" stop-color="#2ee6a8" stop-opacity=".02"/></linearGradient>'+
+ '<linearGradient id="gr" x1="0" y1="'+yMax+'" x2="0" y2="'+yI+'" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#ff6b6b" stop-opacity=".30"/><stop offset="1" stop-color="#ff6b6b" stop-opacity=".02"/></linearGradient>'+
+ '<linearGradient id="gc" x1="'+XS[0].toFixed(1)+'" y1="0" x2="'+xu.toFixed(1)+'" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="rgb('+c+')" stop-opacity=".2"/><stop offset=".6" stop-color="rgb('+c+')" stop-opacity=".65"/><stop offset="1" stop-color="rgb('+c+')"/></linearGradient>'+
+ '<radialGradient id="gh"><stop offset="0" stop-color="#fff" stop-opacity=".95"/><stop offset=".35" stop-color="rgb('+c+')" stop-opacity=".7"/><stop offset="1" stop-color="rgb('+c+')" stop-opacity="0"/></radialGradient>'+
+ '<clipPath id="cv"><rect x="0" y="0" width="1000" height="'+yI+'"/></clipPath><clipPath id="cr"><rect x="0" y="'+yI+'" width="1000" height="220"/></clipPath>'+
+ '</defs>'+
+ '<path d="'+d+fe+'" fill="url(#gv)" clip-path="url(#cv)"/><path d="'+d+fe+'" fill="url(#gr)" clip-path="url(#cr)"/>'+
+ '<line x1="0" x2="1000" y1="'+yI+'" y2="'+yI+'" stroke="#7f9896" stroke-dasharray="4 6" stroke-width="1" vector-effect="non-scaling-stroke"/>'+
+ '<path d="'+d+'" fill="none" stroke="rgb('+c+')" stroke-opacity=".12" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>'+
+ '<path d="'+d+'" fill="none" stroke="url(#gc)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke" style="filter:drop-shadow(0 0 5px rgb('+c+'))"/>'+
+ '<ellipse cx="'+xu.toFixed(1)+'" cy="'+yu.toFixed(1)+'" rx="'+(11*sx).toFixed(1)+'" ry="'+(11*sy).toFixed(1)+'" fill="url(#gh)"/>'+
+ '<ellipse cx="'+xu.toFixed(1)+'" cy="'+yu.toFixed(1)+'" rx="'+(2.2*sx).toFixed(2)+'" ry="'+(2.2*sy).toFixed(2)+'" fill="#fff"/>'}
+window.addEventListener('resize',()=>{if(ULT_G)grafico(ULT_G[0],ULT_G[1])});
 async function atualizar(){try{const r=await fetch('/dados.json',{cache:'no-store'});if(!r.ok)throw 0;const d=await r.json();
  $('est').classList.toggle('on',!!d.ativo);$('est-t').textContent=d.ativo?'Bot ativo':'Bot sem atividade recente';
  $('total').textContent=usd(d.total);$('pnl').innerHTML='<span class="'+cls(d.pnl_usd)+'">'+usd(d.pnl_usd)+' ('+pct(d.pnl_pct)+')</span> desde '+esc(d.inicio)+' · início $'+d.saldo_inicial.toFixed(2);

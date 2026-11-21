@@ -146,6 +146,14 @@ CONFIG = {
     "percursos_controlo_max": 12,
     "percursos_manuais_max": 5,
     "acompanhar_stop_alternativo_pct": -25,
+    "tolerancia_preco_aprovacao_pct": 3.0,   # ao aprovares: aceita se o preco subiu ate isto (ou desceu) desde a proposta
+    "tolerancia_liquidez_aprovacao_pct": 20.0,  # ... e se a liquidez nao caiu mais do que isto; senao anula como antes
+    "entrada_queda_ativa": True,       # hipotese D (validada a 21/11/2026): so propoe a compra de um sinal
+    "entrada_queda_min_pct": 15.0,     # ... depois de o preco recuar 15-35% desde o pico apos o sinal
+    "entrada_queda_max_pct": 35.0,
+    "entrada_queda_espera_min": 180.0,  # ... e desiste se isso nao acontecer neste prazo
+    "stop_manual_min_pct": -50.0,      # stop-loss escolhido por ti numa posicao aberta: de -50% ...
+    "stop_manual_max_pct": 50.0,       # ... ate +50% face a entrada (acima de 0 garante lucro)
     "compra_manual": True,           # botao Comprar (Paper) nos tokens analisados a mao: cria uma PROPOSTA (confirmacao manual)
     "recuperar_entrada_lucro_min_pct": 10,
     "impacto_compra_manual_max_pct": 3.0,  # impacto Jupiter maximo nas TUAS compras manuais (nunca acima do slippage maximo)  # "Recuperar entrada" so com a posicao manual pelo menos X% acima da entrada (liquido)  # nos acompanhados, mostra tambem como correria com ESTE stop (so comparacao)      # tokens acompanhados a pedido (botao "Acompanhar"); nunca entram nas estatisticas    # grupo de controlo: segue tambem tokens RECUSADOS, para ver se os filtros ajudam
@@ -407,7 +415,7 @@ class TelegramDecisoes:
 
     def __init__(self, token, chat, decidir, pendente, avisar=None, post=None, vender=None, posicao_aberta=None,
                  analisar=None, em_fundo=True, acompanhar=None, acompanhados=None, comprar=None,
-                 recuperar=None, pode_recuperar=None, deixar=None):
+                 recuperar=None, pode_recuperar=None, deixar=None, stop=None):
         self.token = str(token or "").strip()
         self.chat = str(chat or "").strip()
         self.decidir = decidir      # fn(proposal_id, "aprovar"|"recusar") -> (ok, mensagem)
@@ -423,6 +431,7 @@ class TelegramDecisoes:
         self.recuperar = recuperar        # fn(mint) -> (ok, msg): pede a venda da parte que paga a entrada
         self.pode_recuperar = pode_recuperar  # fn(mint) -> bool: posicao manual com a entrada por recuperar
         self.deixar = deixar              # fn(mint) -> (ok, msg): deixa de acompanhar um token (so laboratorio)
+        self.stop = stop                  # fn(mint, valor) -> (ok, msg): muda o stop-loss de uma posicao aberta
         self._a_analisar = threading.Event()
         self._post = post           # so nos testes
         # so chat privado: num grupo, outros membros poderiam carregar nos botoes
@@ -444,7 +453,17 @@ class TelegramDecisoes:
         linhas = [[{"text": "🔴 Vender agora", "callback_data": "v:" + mint}]]
         if recuperar:
             linhas.append([{"text": "💰 Recuperar entrada", "callback_data": "p:" + mint}])
+        linhas.append([{"text": f"💸 {n}%", "callback_data": f"h{n}:" + mint} for n in (10, 25, 50, 75)])
+        linhas.append([{"text": "🛑 Mudar stop-loss", "callback_data": "t:" + mint}])
         return linhas
+
+    @staticmethod
+    def botoes_stop(mint):
+        f = lambda v, t=None: {"text": t or f"{v:+d}%", "callback_data": f"u{v}:" + mint}
+        return [[f(-5), f(-10), f(-15)], [f(-20), f(-25), f(-30)],
+                [f(0, "0% (entrada)"), f(10), f(20)],
+                [{"text": "✍️ Outro valor", "callback_data": "j:" + mint},
+                 {"text": "↩️ Voltar", "callback_data": "k:" + mint}]]
 
     @staticmethod
     def botoes_confirmar_recuperar(mint):
@@ -564,8 +583,56 @@ class TelegramDecisoes:
         if mw:
             return self._processar_acompanhar(mw.group(1), callback_id, message_id)
         mc = re.fullmatch(r"c:([A-Za-z0-9]{30,50})", dados)
-        if mc:
-            return self._processar_comprar(mc.group(1), callback_id)
+        if mc:  # primeiro escolhes o valor
+            if not callable(self.comprar):
+                self._responder(callback_id, "Compra manual desligada.")
+                return "invalido"
+            self._mudar_botoes(message_id, self.botoes_valor(mc.group(1)))
+            self._responder(callback_id, "Quanto queres simular? (1 a 5 €)")
+            return "escolher_valor"
+        me = re.fullmatch(r"e([1-5]):([A-Za-z0-9]{30,50})", dados)
+        if me:
+            res = self._processar_comprar(me.group(2), callback_id, int(me.group(1)))
+            if res == "comprar":
+                self._mudar_botoes(message_id, None)
+            return res
+        mo = re.fullmatch(r"([ox]):([A-Za-z0-9]{30,50})", dados)
+        if mo and callable(self.comprar):
+            if mo.group(1) == "o":
+                self._responder(callback_id, "Escreve: /comprar <endereço> <valor>  (ex.: 2,5 para 2,50 €; de 1 a 5 €)",
+                                alerta=True)
+                return "outro_valor"
+            mint = mo.group(2)
+            self._mudar_botoes(message_id, (self.botoes_acompanhar(mint) if callable(self.acompanhar) else [])
+                               + [[{"text": "🟢 Comprar (Paper, com confirmação)", "callback_data": "c:" + mint}]])
+            self._responder(callback_id, "Cancelado.")
+            return "valor_cancelado"
+        mh = re.fullmatch(r"([hg])(10|25|50|75):([A-Za-z0-9]{30,50})", dados)
+        if mh and callable(self.vender):
+            return self._processar_parte(mh.group(1), int(mh.group(2)), mh.group(3), callback_id, message_id)
+        mt = re.fullmatch(r"([tj]):([A-Za-z0-9]{30,50})", dados)
+        if mt and callable(self.stop):
+            if mt.group(1) == "j":
+                self._responder(callback_id, "Escreve: /stop <endereço> <valor>  (ex.: -18; +10 garante lucro)",
+                                alerta=True)
+                return "stop_outro"
+            if not (callable(self.posicao_aberta) and self.posicao_aberta(mt.group(2))):
+                self._responder(callback_id, "Esta posição já está fechada.", alerta=True)
+                self._mudar_botoes(message_id, None)
+                return "venda_fechada"
+            self._mudar_botoes(message_id, self.botoes_stop(mt.group(2)))
+            self._responder(callback_id, "Escolhe o novo stop-loss (face ao preço de entrada).")
+            return "escolher_stop"
+        mu = re.fullmatch(r"u(-?\d{1,2}):([A-Za-z0-9]{30,50})", dados)
+        if mu and callable(self.stop):
+            try:
+                ok, mensagem = self.stop(mu.group(2), int(mu.group(1)))
+            except Exception:
+                log.exception("Falha ao mudar o stop pelo Telegram")
+                ok, mensagem = False, "erro interno; nada foi alterado"
+            self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+            self._mudar_botoes(message_id, self._botoes_posicao(mu.group(2)))
+            return "stop" if ok else "stop_recusado"
         mv = re.fullmatch(r"([vykpz]):([A-Za-z0-9]{30,50})", dados)  # o mesmo formato que MINT_VALIDO
         if mv:
             return self._processar_venda(mv.group(1), mv.group(2), callback_id, message_id)
@@ -607,7 +674,9 @@ class TelegramDecisoes:
              "Cola aqui o endereço (contrato/mint) de um token de Solana, ou /analisar <endereço>. "
              "Também serve um link do DexScreener ou do pump.fun.\n"
              "Respondo com a pontuação que o Analista daria e porquê. Só mostra: o bot não compra por isto.\n"
-             "/acompanhados — estado ao vivo dos tokens que pediste para acompanhar.")
+             "/acompanhados — estado ao vivo dos tokens que pediste para acompanhar.\n"
+             "/comprar <endereço> <valor> — proposta de compra Paper com o valor que escolhes (1 a 5 €).\n"
+             "/stop <endereço> <valor> — muda o stop-loss de uma posição aberta (ex.: -18 ou +10).")
 
     def _enviar(self, texto, botoes=None):
         corpo = {"chat_id": self.chat, "text": str(texto)[:4000], "disable_web_page_preview": True}
@@ -655,6 +724,36 @@ class TelegramDecisoes:
                 log.exception("Erro no /acompanhados")
                 self._enviar("⚠️ Erro técnico; tenta outra vez.")
             return "acompanhados"
+        if texto and texto.split()[0].lower().split("@")[0] == "/stop" and callable(self.stop):
+            mm = MINT_EM_TEXTO.search(texto)
+            resto = texto[mm.end():].replace("%", " ").strip() if mm else ""
+            if not mm or not resto:
+                self._enviar("Uso: /stop <endereço> <valor>  (ex.: /stop ABC…pump -18; +10 garante lucro). "
+                             "Sem sinal conta como negativo. De -50 a +50.")
+                return "stop_ajuda"
+            try:
+                ok, mensagem = self.stop(mm.group(1), resto.split()[0])
+            except Exception:
+                log.exception("Falha ao mudar o stop (/stop)")
+                ok, mensagem = False, "erro interno; nada foi alterado"
+            self._enviar(("🛑 " + mensagem) if ok else f"Não foi possível: {mensagem}")
+            return "stop" if ok else "stop_recusado"
+        if texto and texto.split()[0].lower().split("@")[0] == "/comprar" and callable(self.comprar):
+            mm = MINT_EM_TEXTO.search(texto)
+            if not mm:
+                self._enviar("Uso: /comprar <endereço> <valor em €>  (ex.: /comprar ABC…pump 2,5). De 1 a 5 €.")
+                return "comprar_ajuda"
+            resto = texto[mm.end():].strip().replace("€", "").strip()
+            if not resto:
+                self._enviar("Quanto queres simular? (Paper, 1 a 5 €)", self.botoes_valor(mm.group(1)))
+                return "escolher_valor"
+            try:
+                ok, mensagem = self.comprar(mm.group(1), resto.split()[0])
+            except Exception:
+                log.exception("Falha ao pedir compra manual (/comprar)")
+                ok, mensagem = False, "erro interno; nada foi feito"
+            self._enviar(("🟢 " + mensagem) if ok else f"Não foi possível: {mensagem}")
+            return "comprar" if ok else "comprar_recusado"
         if not texto or texto.split()[0].lower().split("@")[0] in ("/start", "/ajuda", "/help") \
                 or not MINT_EM_TEXTO.search(texto):
             self._enviar(self.AJUDA)
@@ -689,17 +788,43 @@ class TelegramDecisoes:
             correr()
         return "analise"
 
-    def _processar_comprar(self, mint, callback_id):
+    @staticmethod
+    def botoes_valor(mint):
+        return [[{"text": f"{n} €", "callback_data": f"e{n}:" + mint} for n in (1, 2, 3)],
+                [{"text": f"{n} €", "callback_data": f"e{n}:" + mint} for n in (4, 5)],
+                [{"text": "✍️ Outro valor", "callback_data": "o:" + mint},
+                 {"text": "↩️ Cancelar", "callback_data": "x:" + mint}]]
+
+    def _processar_comprar(self, mint, callback_id, valor=None):
         if not callable(self.comprar):
             self._responder(callback_id, "Compra manual desligada.")
             return "invalido"
         try:
-            ok, mensagem = self.comprar(mint)
+            ok, mensagem = self.comprar(mint, valor) if valor is not None else self.comprar(mint)
         except Exception:
             log.exception("Falha ao pedir compra manual pelo Telegram")
             ok, mensagem = False, "erro interno; nada foi feito"
         self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
         return "comprar" if ok else "comprar_recusado"
+
+    def _processar_parte(self, acao, n, mint, callback_id, message_id):
+        if not (callable(self.posicao_aberta) and self.posicao_aberta(mint)):
+            self._responder(callback_id, "Esta posição já está fechada.", alerta=True)
+            self._mudar_botoes(message_id, None)
+            return "venda_fechada"
+        if acao == "h":
+            self._mudar_botoes(message_id, [[{"text": f"✅ Sim, vender {n}%", "callback_data": f"g{n}:" + mint},
+                                             {"text": "↩️ Não", "callback_data": "k:" + mint}]])
+            self._responder(callback_id, f"Vender {n}% da posição em Paper?")
+            return "confirmar_parte"
+        try:
+            ok, mensagem = self.vender(mint, n)
+        except Exception:
+            log.exception("Falha ao pedir venda parcial pelo Telegram; nada foi vendido")
+            ok, mensagem = False, "erro interno; nada foi vendido"
+        self._responder(callback_id, mensagem if ok else f"Não foi possível: {mensagem}", alerta=not ok)
+        self._mudar_botoes(message_id, self._botoes_posicao(mint))
+        return "vender_parte" if ok else "parte_recusada"
 
     def _processar_venda(self, acao, mint, callback_id, message_id):
         aberta = callable(self.posicao_aberta) and callable(self.vender) and self.posicao_aberta(mint)
@@ -826,6 +951,9 @@ def motivo_legivel(motivo):
     x = re.match(r"STOP_LOSS ([+-][\d.]+)%", m)
     if x:
         return f"stop-loss (preço a {x.group(1)}%)"
+    x = re.match(r"STOP_MANUAL ([+-][\d.]+)% \(stop ([+-]?[\d.]+)%\)", m)
+    if x:
+        return f"o teu stop {x.group(2)}% (preço a {x.group(1)}%)"
     x = re.match(r"TAKE_PROFIT ([+-][\d.]+)%", m)
     if x:
         return f"alvo atingido (preço a {x.group(1)}%)"
@@ -954,6 +1082,13 @@ def texto_venda_parcial(simbolo, receita, custo, fracao, pnl_pct_posicao, cartei
     return "\n".join([f"💰 [PAPER] ENTRADA RECUPERADA — ${simbolo}",
                       f"Vendidos {fracao * 100:.0f}% dos tokens por ${receita:.2f} (a entrada foi ${custo:.2f}).",
                       f"A posição estava a {pnl_pct_posicao:+.1f}%. O resto continua aberto com o stop e o trailing.",
+                      f"Carteira: ${num(carteira):.2f}"])
+
+
+def texto_venda_parte(simbolo, receita, fracao, pnl_pct_posicao, carteira):
+    return "\n".join([f"💸 [PAPER] VENDA PARCIAL — ${simbolo}",
+                      f"Vendidos {fracao * 100:.0f}% dos tokens por ${receita:.2f}.",
+                      f"A posição estava a {pnl_pct_posicao:+.1f}%. O resto continua aberto com as mesmas regras.",
                       f"Carteira: ${num(carteira):.2f}"])
 
 
@@ -1720,6 +1855,7 @@ def estado_novo(cfg):
         "scanner_pending": {}, # classificacao e motivo persistidos dos mints em espera
         "scanner_counters": {"daily": {}},
         "percursos": {},   # sinais cujo preco esta a ser gravado para o laboratorio
+        "espera_queda": {},  # sinais aprovados a espera da queda de 15-35% (entrada D)
         "n_percursos": 0,  # quantos percursos completos ja foram gravados
         "ultimo_ciclo": 0, # ultima vez que o bot estava a correr (para detetar pausas)
         "stats": {"fechados": 0, "ganhos": 0, "perdas": 0, "pnl_total": 0.0,
@@ -2354,7 +2490,7 @@ class ManualApprovalManager:
                 found.append((proposal, token, accepted, reason))
         return found
 
-    def consume(self, token, mint, par, amount=None):
+    def consume(self, token, mint, par, amount=None, plano_novo_ok=False):
         if not isinstance(token, str):
             return False
         with self._lock:
@@ -2365,7 +2501,7 @@ class ManualApprovalManager:
             current_plan = par.get("_paper_execution_plan")
             return (proposal.mint == str(mint)
                     and proposal.pair_address == str(par.get("pairAddress") or "")
-                    and proposal.execution_json == current_plan
+                    and (plano_novo_ok or proposal.execution_json == current_plan)  # plano novo so com tolerancia ja validada
                     and proposal.amount_usd == (_decimal_canonico(amount) if amount is not None else ""))
 
     def proposal_id_for_token(self, token):
@@ -2444,7 +2580,7 @@ class Executor:
             positions_after = candidate_state.get("posicoes", {})
             new_mints = set(positions_after) - set(positions_before)
             maximo = _limite_posicoes(self.cfg)
-            if (debit > max_usd or debit != Decimal(_decimal_canonico(amount))
+            if (debit > max_usd or debit <= 0 or debit > Decimal(_decimal_canonico(amount))
                     or len(positions_before) >= maximo
                     or len(positions_after) > maximo or len(new_mints) != 1):
                 return False
@@ -2633,7 +2769,16 @@ class Executor:
             return f"slippage total excede o limite operacional aprovado ({cap}%); proposta bloqueada"
         return ""
 
-    def comprar(self, mint, par, analise, approval_token=None, execution_plan=None):
+    def valor_usd_de_eur(self, eur):
+        """Converte euros em dolares com a taxa BCE bloqueada da sessao (None se indisponivel)."""
+        try:
+            fx = validate_locked_session_rate(self.estado.get("operational_session") or {})
+            return float(usd_cap_from_eur(Decimal(str(eur)), fx))
+        except (EcbRateError, KeyError, TypeError, ValueError, InvalidOperation):
+            return None
+
+    def comprar(self, mint, par, analise, approval_token=None, execution_plan=None,
+                valor_pedido=None, plano_novo_ok=False):
         cfg, e = self.cfg, self.estado
         simbolo = simbolo_limpo(par)
         with self._purchase_lock:
@@ -2648,6 +2793,13 @@ class Executor:
                     approvals.discard(approval_token)
                 self.bot.acao(f"{simbolo}: aprovado ({analise['pontuacao']}) mas nao comprado - {motivo}")
                 return None
+            if valor_pedido is not None:  # valor escolhido por ti numa compra manual: nunca acima do maximo
+                if not cfg["posicao_minima_usd"] <= valor_pedido <= valor + 1e-9:
+                    if approvals is not None:
+                        approvals.discard(approval_token)
+                    self.bot.acao(f"{simbolo}: compra bloqueada - valor escolhido fora dos limites")
+                    return None
+                valor = valor_pedido
             plan = self.preparar_execucao(mint, par, valor)
             plan_fields = plan.fields()
             bloqueio_plano = self.bloqueio_plano_financeiro(plan)
@@ -2659,7 +2811,10 @@ class Executor:
             approval_par["_paper_execution_conditions"] = self.execution_conditions()
             approval_par["_paper_execution_plan"] = plan.canonical_json
             proposal_id = approvals.proposal_id_for_token(approval_token) if approvals is not None else None
-            if approvals is None or not approvals.consume(approval_token, mint, approval_par, valor):
+            consumida = approvals is not None and (
+                approvals.consume(approval_token, mint, approval_par, valor, plano_novo_ok=True) if plano_novo_ok
+                else approvals.consume(approval_token, mint, approval_par, valor))
+            if not consumida:
                 self.bot.acao(f"{simbolo}: compra bloqueada - falta aprovacao manual valida e nao utilizada")
                 return None
             if execution_plan is not None and execution_plan.canonical_json != plan.canonical_json:
@@ -2810,41 +2965,55 @@ class Executor:
         return pnl
 
 
-    def vender_parcial(self, mint, preco, liquidez, motivo="PARCIAL recuperar entrada"):
-        """Vende so a parte que paga a entrada (posicoes MANUAIS em lucro). O resto continua aberto com as
-        mesmas regras (stop, trailing, tempo). Devolve (ok, mensagem)."""
+    def vender_parcial(self, mint, preco, liquidez, motivo="PARCIAL recuperar entrada", fracao_pedida=None):
+        """Sem fracao_pedida: vende so a parte que paga a entrada (posicoes MANUAIS em lucro).
+        Com fracao_pedida (0..1): vende essa parte dos tokens de qualquer posicao (passa a contar como manual).
+        O resto continua aberto com as mesmas regras (stop, trailing, tempo). Devolve (ok, mensagem)."""
         cfg, e = self.cfg, self.estado
         with self._purchase_lock:
             pos0 = e["posicoes"].get(mint)
             if pos0 is None:
                 return False, "a posição já está fechada"
-            if pos0.get("origem") != "manual":
-                return False, "só nas posições compradas por ti"
-            if pos0.get("entrada_recuperada"):
-                return False, "a entrada desta posição já foi recuperada"
             custo = num(pos0.get("custo"))
             total, _, _ = simular_venda(cfg, pos0, preco, liquidez)
-            minimo = 1 + num(cfg.get("recuperar_entrada_lucro_min_pct"), 10) / 100.0
-            if custo <= 0 or total < custo * minimo:
-                return False, (f"só com a posição pelo menos {(minimo - 1) * 100:.0f}% acima da entrada "
-                               f"(agora {(total / custo - 1) * 100 if custo > 0 else 0:+.1f}%)")
-            fracao = custo / total
-            for _ in range(3):  # vender menos tokens tem menos impacto: acerta a fracao para receber ~ a entrada
-                receita, _, _ = simular_venda(cfg, dict(pos0, tokens=pos0["tokens"] * fracao), preco, liquidez)
-                if receita <= 0:
+            if fracao_pedida is not None:
+                if isinstance(fracao_pedida, bool) or not 0 < float(fracao_pedida) < 1:
+                    return False, "percentagem inválida"
+                if total <= 0:
                     return False, "sem preço de venda válido"
-                fracao = min(0.95, fracao * custo / receita)
+                fracao = float(fracao_pedida)
+            else:
+                if pos0.get("origem") != "manual":
+                    return False, "só nas posições compradas por ti"
+                if pos0.get("entrada_recuperada"):
+                    return False, "a entrada desta posição já foi recuperada"
+                minimo = 1 + num(cfg.get("recuperar_entrada_lucro_min_pct"), 10) / 100.0
+                if custo <= 0 or total < custo * minimo:
+                    return False, (f"só com a posição pelo menos {(minimo - 1) * 100:.0f}% acima da entrada "
+                                   f"(agora {(total / custo - 1) * 100 if custo > 0 else 0:+.1f}%)")
+                fracao = custo / total
+                for _ in range(3):  # vender menos tokens tem menos impacto: acerta a fracao para receber ~ a entrada
+                    receita, _, _ = simular_venda(cfg, dict(pos0, tokens=pos0["tokens"] * fracao), preco, liquidez)
+                    if receita <= 0:
+                        return False, "sem preço de venda válido"
+                    fracao = min(0.95, fracao * custo / receita)
             candidato = copy.deepcopy(e)
             pos = candidato["posicoes"][mint]
             tokens_v = pos["tokens"] * fracao
             receita, preco_ef, custos = simular_venda(cfg, dict(pos, tokens=tokens_v), preco, liquidez)
+            if receita <= 0:
+                return False, "sem preço de venda válido"
             candidato["saldo"] += receita
             pos.setdefault("tokens_iniciais", pos["tokens"])
             pos["tokens"] -= tokens_v
             pos["recebido_parcial"] = round(num(pos.get("recebido_parcial")) + receita, 8)
             pos["custos_parciais"] = round(num(pos.get("custos_parciais")) + custos, 8)
-            pos["entrada_recuperada"] = True
-            pos["recuperada_em"] = agora()
+            if fracao_pedida is None:
+                pos["entrada_recuperada"] = True
+                pos["recuperada_em"] = agora()
+            elif pos.get("origem") != "manual":
+                pos["origem"] = "manual"  # decisao tua: a partir daqui conta a parte, fora da estrategia
+                pos["intervencao"] = "venda parcial"
             linha = {
             "data_hora": data_txt(), "tipo": "VENDA", "simbolo": pos["simbolo"], "mint": mint,
             "preco_mercado": preco_txt(preco), "preco_efetivo": preco_txt(preco_ef),
@@ -2854,7 +3023,14 @@ class Executor:
             "saldo_depois": f"{candidato['saldo']:.4f}",
             }
             self.bot.paper_operations.commit(e, candidato, linha, "SELL")
-        pnl_pct_pos = (total / custo - 1) * 100
+        pnl_pct_pos = (total / custo - 1) * 100 if custo > 0 else 0.0
+        if fracao_pedida is not None:
+            self.bot.acao(f"VENDA PARCIAL {pos['simbolo']} [{fracao * 100:.0f}%] ${receita:.2f}")
+            try:
+                self.bot.telegram.enviar(texto_venda_parte(pos["simbolo"], receita, fracao, pnl_pct_pos, e["saldo"]))
+            except Exception:
+                log.warning("Aviso de venda parcial por Telegram falhou")
+            return True, f"vendidos {fracao * 100:.0f}% por ${receita:.2f}; o resto continua aberto"
         self.bot.acao(f"VENDA PARCIAL {pos['simbolo']} [recuperar entrada] ${receita:.2f} ({fracao * 100:.0f}% dos tokens)")
         try:
             self.bot.telegram.enviar(texto_venda_parcial(pos["simbolo"], receita, custo, fracao, pnl_pct_pos, e["saldo"]))
@@ -3074,14 +3250,17 @@ class Risco:
         else:
             self._condition(conditions, "sudden_price_drop", None, raw_price,
                             cfg["rug_queda_preco_pct"], "unavailable", 3, "preço anterior inválido")
-        # 2) Stop loss
-        if variacao <= cfg["stop_loss_pct"]:
+        # 2) Stop loss (o da estrategia, ou o que escolheste para esta posicao)
+        stop_teu = pos.get("stop_manual_pct")
+        stop = num(stop_teu) if stop_teu is not None else cfg["stop_loss_pct"]
+        if variacao <= stop:
             self._condition(conditions, "stop_loss", variacao, raw_price,
-                            cfg["stop_loss_pct"], "triggered", 4)
+                            stop, "triggered", 4)
             self._mark_remaining(conditions, "stop_loss acionado antes desta regra", cfg)
-            return f"STOP_LOSS {variacao:+.1f}%"
+            return (f"STOP_MANUAL {variacao:+.1f}% (stop {stop:+g}%)" if stop_teu is not None
+                    else f"STOP_LOSS {variacao:+.1f}%")
         self._condition(conditions, "stop_loss", variacao, raw_price,
-                        cfg["stop_loss_pct"], "not_triggered", 4)
+                        stop, "not_triggered", 4)
         # 3) Take profit
         if cfg["take_profit_pct"] and variacao >= cfg["take_profit_pct"]:
             self._condition(conditions, "take_profit", variacao, raw_price,
@@ -4021,13 +4200,29 @@ def _manual_dashboard(pedido):
     acao, mint = dados.get("acao"), dados.get("mint")
     if acao == "comprar":
         f = getattr(bot, "pedir_compra_manual", None)
-        ok, msg = f(mint, "dashboard") if callable(f) else (False, "compra manual indisponivel")
+        valor = dados.get("valor_eur")
+        if valor is not None and (isinstance(valor, bool) or not isinstance(valor, (int, float, str))):
+            return 400, {"ok": False, "mensagem": "valor invalido"}
+        if not callable(f):
+            ok, msg = False, "compra manual indisponivel"
+        else:
+            ok, msg = f(mint, "dashboard", valor) if valor is not None else f(mint, "dashboard")
+    elif acao == "stop":
+        f = getattr(bot, "pedir_stop", None)
+        valor = dados.get("stop_pct")
+        if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+            return 400, {"ok": False, "mensagem": "stop invalido"}
+        ok, msg = f(mint, valor, "dashboard") if callable(f) else (False, "indisponivel")
     elif acao == "parar":
         f = getattr(bot, "pedir_parar_acompanhamento", None)
         ok, msg = f(mint, "dashboard") if callable(f) else (False, "indisponivel")
     elif acao in ("vender", "recuperar"):
         f = getattr(bot, "pedir_venda", None)
-        ok, msg = f(mint, "dashboard", parcial=acao == "recuperar") if callable(f) else (False, "venda indisponivel")
+        fracao = dados.get("fracao")
+        if fracao is not None and (isinstance(fracao, bool) or fracao not in (10, 25, 50, 75) or acao != "vender"):
+            return 400, {"ok": False, "mensagem": "percentagem invalida"}
+        parcial = int(fracao) if fracao is not None else acao == "recuperar"
+        ok, msg = f(mint, "dashboard", parcial=parcial) if callable(f) else (False, "venda indisponivel")
     else:
         return 400, {"ok": False, "mensagem": "acao invalida"}
     return (200 if ok else 409), {"ok": ok, "mensagem": msg}
@@ -4085,7 +4280,10 @@ def _acompanhados_dashboard(pedido):
                 posicoes.append({"mint": m, "simbolo": p.get("simbolo"), "origem": p.get("origem") or "bot",
                                  "custo": round(custo, 4), "pnl_pct": round((valor / custo - 1) * 100, 2) if custo else None,
                                  "entrada_recuperada": bool(p.get("entrada_recuperada")),
-                                 "recebido": round(num(p.get("recebido_parcial")), 4)})
+                                 "recebido": round(num(p.get("recebido_parcial")), 4),
+                                 "stop_pct": num(p["stop_manual_pct"]) if p.get("stop_manual_pct") is not None
+                                 else cfg.get("stop_loss_pct"),
+                                 "stop_manual": p.get("stop_manual_pct") is not None})
     except Exception:
         log.exception("Posicoes para o painel indisponiveis")
     return 200, {"ok": True, "ativos": list(getattr(bot, "info_acompanhados", []) or []), "posicoes": posicoes,
@@ -4342,6 +4540,7 @@ class Bot:
         self._propostas_manuais = {}           # mint -> ate quando (as cotacoes destes tambem se atualizam no Risco)
         self.info_acompanhados = []            # lista pronta para o painel / Telegram (feita no ciclo principal)
         self.manuais_terminados = collections.deque(maxlen=10)
+        self._stops_fila = queue.Queue()  # (mint, stop %, origem): stop-loss escolhido por ti
         self._vendas_manuais = queue.Queue()  # mints com venda manual pedida (o ciclo principal e que vende)
         self._ultimo_motivo_log = {}
         self.analisados = 0
@@ -4618,6 +4817,29 @@ class Bot:
             else:
                 # A failure or missing response invalidates the prior quote for approval.
                 self._latest_market_pairs[mint] = (observado_em, None)
+
+    def _variacao_tolerada(self, antigo_json, novo_json):
+        """Se o plano so mudou no preco/liquidez e dentro da tolerancia, devolve a variacao do preco em %;
+        senao None (a proposta e anulada como antes). Preco mais baixo e sempre aceite."""
+        try:
+            a, n = json.loads(antigo_json), json.loads(novo_json)
+            for campo in ("mint", "pair_address", "debit_total_usd", "taxa_pct", "slippage_base_pct",
+                          "execution_conditions", "liquidity_status", "impact_fallback"):
+                if a.get(campo) != n.get(campo):
+                    return None
+            if n.get("liquidity_status") != "observed":
+                return None
+            p0, p1 = Decimal(a["reference_price_usd"]), Decimal(n["reference_price_usd"])
+            l0, l1 = Decimal(a["liquidity_observed_usd"]), Decimal(n["liquidity_observed_usd"])
+            tol_p = Decimal(str(self.cfg.get("tolerancia_preco_aprovacao_pct", 3.0)))
+            tol_l = Decimal(str(self.cfg.get("tolerancia_liquidez_aprovacao_pct", 20.0)))
+        except (KeyError, TypeError, ValueError, InvalidOperation, AttributeError):
+            return None
+        if not all(x.is_finite() and x > 0 for x in (p0, p1, l0, l1)) or tol_p < 0 or tol_l < 0:
+            return None
+        if p1 > p0 * (1 + tol_p / 100) or l1 < l0 * (1 - tol_l / 100):
+            return None
+        return float((p1 / p0 - 1) * 100)
 
     def _cotacao_atual_para_proposta(self, proposta):
         mint = proposta["mint"]
@@ -5008,8 +5230,11 @@ class Bot:
                 "valor_atual_usd": receita, "pnl_usd": receita + num(pos.get("recebido_parcial")) - num(pos.get("custo")),
                 "intervalo_seg": (cfg.get("intervalo_preco_rapido_seg", 3) if pos.get("fonte_preco") == "jupiter"
                                   else cfg.get("intervalo_risco_com_posicao_seg", cfg["intervalo_risco_seg"])),
-                "regras_saida": {k: cfg.get(k) for k in ("stop_loss_pct", "take_profit_pct", "trailing_ativar_pct",
-                                                          "trailing_distancia_pct", "tempo_maximo_min")},
+                "regras_saida": dict({k: cfg.get(k) for k in ("stop_loss_pct", "take_profit_pct", "trailing_ativar_pct",
+                                                               "trailing_distancia_pct", "tempo_maximo_min")},
+                                     **({"stop_loss_pct": num(pos["stop_manual_pct"])}
+                                        if pos.get("stop_manual_pct") is not None else {})),
+                "stop_manual": pos.get("stop_manual_pct") is not None,
             })
         dados = {
             "modo": self.modo, "hora": hora_txt(), "agora": agora(),
@@ -5062,6 +5287,12 @@ class Bot:
             "sinais": list(reversed(e["sinais"][-cfg["max_sinais"]:])),
             "acoes": list(reversed(e["acoes"][-12:])),
             "propostas_paper": self.manual_approvals.public_pending(),
+            "espera_queda": [{"mint": m if MINT_VALIDO.fullmatch(m) else "", "simbolo": w.get("simbolo"),
+                              "pontuacao": w.get("pontuacao"), "recuo": round(num(w.get("recuo")), 1),
+                              "falta_min": max(0, round((num(w.get("fim")) - agora()) / 60))}
+                             for m, w in list(self._espera_queda.items()) if isinstance(w, dict)],
+            "entrada_queda": ([num(cfg.get("entrada_queda_min_pct"), 15), num(cfg.get("entrada_queda_max_pct"), 35)]
+                              if cfg.get("entrada_queda_ativa") else None),
             "rpc_observacao": getattr(getattr(self, "obs_extra", None), "origem_rpc", "publico")
                               if getattr(getattr(self, "obs_extra", None), "ativo", False) else "inativa",
             "paper_purchase_readiness": {
@@ -5341,77 +5572,16 @@ class Bot:
                 self.registar_sinal(mint, par, analise, False)
                 self.iniciar_percurso(mint, par, analise)
                 continue
-            if valor <= 0:
-                self.acao(f"{simbolo_limpo(par)}: aprovado ({analise['pontuacao']}) mas sem proposta - {motivo}")
-                self._registar_auditoria_aprovacao("execution_blocked", {
-                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
-                    "amount_usd": None, "price_usd": par.get("priceUsd"),
-                }, motivo)
+            if self._entrada_queda_ativa():
+                # Entrada na queda (hipotese D, validada no laboratorio): so propoe quando o preco recuar
+                # 15-35% desde o pico depois do sinal. O sinal e o percurso ficam registados ja.
                 self.registar_sinal(mint, par, analise, False)
                 self.iniciar_percurso(mint, par, analise)
+                self._esperar_queda(mint, par, analise)
                 continue
-            bloqueio_rota = self._bloqueio_rota_compra(mint, valor)
-            if bloqueio_rota:
-                self.acao(f"{simbolo_limpo(par)}: aprovado mas sem proposta - {bloqueio_rota}")
-                self._registar_auditoria_aprovacao("execution_blocked", {
-                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
-                    "amount_usd": valor, "price_usd": par.get("priceUsd"),
-                }, bloqueio_rota)
-                self.registar_sinal(mint, par, analise, False)
-                self.iniciar_percurso(mint, par, analise)
-                continue
-            try:
-                execution_plan = self.executor.preparar_execucao(mint, par, valor)
-            except (TypeError, ValueError, InvalidOperation) as exc:
-                self.acao(f"{simbolo_limpo(par)}: sem proposta - plano financeiro indisponível")
-                self._registar_auditoria_aprovacao("execution_blocked", {
-                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
-                    "amount_usd": valor, "price_usd": par.get("priceUsd"),
-                }, f"plano financeiro inválido ({type(exc).__name__})")
-                self.registar_sinal(mint, par, analise, False)
-                self.iniciar_percurso(mint, par, analise)
-                continue
-            plan_block = self.executor.bloqueio_plano_financeiro(execution_plan)
-            if plan_block:
-                self.acao(f"{simbolo_limpo(par)}: aprovado mas proposta bloqueada - {plan_block}")
-                self._registar_auditoria_aprovacao("execution_blocked", {
-                    "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
-                    "amount_usd": valor, "price_usd": par.get("priceUsd"),
-                }, plan_block)
-                self.registar_sinal(mint, par, analise, False)
-                self.iniciar_percurso(mint, par, analise)
-                continue
-            if isinstance(self.manual_approvals, ManualApprovalManager):
-                proposta = self.manual_approvals.propose(
-                    mint, par, analise, valor, execution_plan)
-            else:
-                proposta = self.manual_approvals.propose(mint, par, analise, valor)
-            propostas += 1
-            log.info("PROPOSTA PAPER %s %s valor=$%.4f score=%s expira em 90s",
-                     proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"], proposta["score"])
-            try:
-                tgd = getattr(self, "tg_decisoes", None)
-                pid = proposta["proposal_id"]
-                if tgd is not None and tgd.ativo and isinstance(pid, str):
-                    self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
-                                                        proposta["amount_usd"], par, com_botoes=True),
-                                         botoes=tgd.botoes_proposta(pid),
-                                         ao_enviar=lambda mid, texto, pid=pid: tgd.registar_mensagem(pid, mid, texto))
-                else:
-                    self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
-                                                        proposta["amount_usd"], par))
-            except Exception:
-                log.warning("Aviso de proposta por Telegram falhou")
-            if not self._registar_auditoria_aprovacao("proposed", proposta):
-                cancel = getattr(self.manual_approvals, "cancel", None)
-                if callable(cancel):
-                    cancel(proposta["proposal_id"], "diário de auditoria indisponível")
-                self.acao("Proposta cancelada: diário de auditoria indisponível")
-                continue
-            self.registar_sinal(mint, par, analise, False, proposta["proposal_id"])
-            self.iniciar_percurso(mint, par, analise)
-            _, compras = self._processar_respostas_aprovacao()
-            compras_confirmadas += compras
+            p, c = self._propor_sinal(mint, par, analise)
+            propostas += p
+            compras_confirmadas += c
         self.atualizar_snapshot()
         self.ultimo_scan = (f"{hora_txt()} - {len(candidatos)} analisados, {len(aprovados)} aprovados, "
                             f"{propostas} propostas manuais, 0 compras automaticas, {len(e['pendentes'])} em espera"
@@ -5419,6 +5589,170 @@ class Bot:
         _, compras = self._processar_respostas_aprovacao()
         compras_confirmadas += compras
         return compras_confirmadas
+
+    def _propor_sinal(self, mint, par, analise, registar=True):
+        """Cria a proposta Paper de um sinal aprovado (confirmacao manual). Devolve (propostas, compras)."""
+        valor, motivo = self.executor.pode_comprar()
+        if valor <= 0:
+            self.acao(f"{simbolo_limpo(par)}: aprovado ({analise['pontuacao']}) mas sem proposta - {motivo}")
+            self._registar_auditoria_aprovacao("execution_blocked", {
+                "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                "amount_usd": None, "price_usd": par.get("priceUsd"),
+            }, motivo)
+            if registar:
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+            return 0, 0
+        bloqueio_rota = self._bloqueio_rota_compra(mint, valor)
+        if bloqueio_rota:
+            self.acao(f"{simbolo_limpo(par)}: aprovado mas sem proposta - {bloqueio_rota}")
+            self._registar_auditoria_aprovacao("execution_blocked", {
+                "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                "amount_usd": valor, "price_usd": par.get("priceUsd"),
+            }, bloqueio_rota)
+            if registar:
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+            return 0, 0
+        try:
+            execution_plan = self.executor.preparar_execucao(mint, par, valor)
+        except (TypeError, ValueError, InvalidOperation) as exc:
+            self.acao(f"{simbolo_limpo(par)}: sem proposta - plano financeiro indisponível")
+            self._registar_auditoria_aprovacao("execution_blocked", {
+                "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                "amount_usd": valor, "price_usd": par.get("priceUsd"),
+            }, f"plano financeiro inválido ({type(exc).__name__})")
+            if registar:
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+            return 0, 0
+        plan_block = self.executor.bloqueio_plano_financeiro(execution_plan)
+        if plan_block:
+            self.acao(f"{simbolo_limpo(par)}: aprovado mas proposta bloqueada - {plan_block}")
+            self._registar_auditoria_aprovacao("execution_blocked", {
+                "mint": mint, "pair_address": str(par.get("pairAddress") or ""),
+                "amount_usd": valor, "price_usd": par.get("priceUsd"),
+            }, plan_block)
+            if registar:
+                self.registar_sinal(mint, par, analise, False)
+                self.iniciar_percurso(mint, par, analise)
+            return 0, 0
+        if isinstance(self.manual_approvals, ManualApprovalManager):
+            proposta = self.manual_approvals.propose(
+                mint, par, analise, valor, execution_plan)
+        else:
+            proposta = self.manual_approvals.propose(mint, par, analise, valor)
+        log.info("PROPOSTA PAPER %s %s valor=$%.4f score=%s expira em 90s",
+                 proposta["proposal_id"], proposta["symbol"], proposta["amount_usd"], proposta["score"])
+        try:
+            tgd = getattr(self, "tg_decisoes", None)
+            pid = proposta["proposal_id"]
+            if tgd is not None and tgd.ativo and isinstance(pid, str):
+                self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
+                                                    proposta["amount_usd"], par, com_botoes=True),
+                                     botoes=tgd.botoes_proposta(pid),
+                                     ao_enviar=lambda mid, texto, pid=pid: tgd.registar_mensagem(pid, mid, texto))
+            else:
+                self.telegram.enviar(texto_proposta(self.cfg, proposta["symbol"], mint, proposta["score"],
+                                                    proposta["amount_usd"], par))
+        except Exception:
+            log.warning("Aviso de proposta por Telegram falhou")
+        if not self._registar_auditoria_aprovacao("proposed", proposta):
+            cancel = getattr(self.manual_approvals, "cancel", None)
+            if callable(cancel):
+                cancel(proposta["proposal_id"], "diário de auditoria indisponível")
+            self.acao("Proposta cancelada: diário de auditoria indisponível")
+            return 0, 0
+        if registar:
+            self.registar_sinal(mint, par, analise, False, proposta["proposal_id"])
+            self.iniciar_percurso(mint, par, analise)
+        else:
+            self._ligar_sinal_a_proposta(mint, proposta["proposal_id"])
+        _, compras = self._processar_respostas_aprovacao()
+        return 1, compras
+
+    @property
+    def _espera_queda(self):
+        """Sinais a espera da queda (entrada D), guardados no estado.json: continuam depois de um reinicio."""
+        espera = self.estado.get("espera_queda")
+        if not isinstance(espera, dict):
+            espera = self.estado["espera_queda"] = {}
+        return espera
+
+    def _entrada_queda_ativa(self):
+        return bool(self.cfg.get("entrada_queda_ativa"))
+
+    def _ligar_sinal_a_proposta(self, mint, proposal_id):
+        for item in reversed(self.estado.get("sinais", [])):
+            if item.get("mint") == mint:
+                item["proposal_id"] = proposal_id
+                item["estado"] = "aguarda_confirmacao"
+                return
+
+    def _esperar_queda(self, mint, par, analise):
+        cfg = self.cfg
+        preco = num(par.get("priceUsd"))
+        lo, hi = num(cfg.get("entrada_queda_min_pct"), 15), num(cfg.get("entrada_queda_max_pct"), 35)
+        minutos = num(cfg.get("entrada_queda_espera_min"), 180)
+        try:
+            analise_j = json.loads(json.dumps(analise, default=str))  # vai para o estado.json
+        except (TypeError, ValueError):
+            analise_j = {"pontuacao": analise.get("pontuacao"), "motivo": str(analise.get("motivo") or "")}
+        self._espera_queda[mint] = {"t0": agora(), "fim": agora() + minutos * 60, "pico": preco,
+                                    "par": str(par.get("pairAddress") or ""), "analise": analise_j,
+                                    "simbolo": simbolo_limpo(par), "recuo": 0.0,
+                                    "pontuacao": analise.get("pontuacao")}
+        self.acao(f"{simbolo_limpo(par)}: aprovado ({analise['pontuacao']}) - à espera de uma queda de "
+                  f"{lo:g}-{hi:g}% para propor (até {minutos:g} min)")
+        try:
+            self.telegram.enviar(f"⏳ [PAPER] ${simbolo_limpo(par)} aprovado ({analise['pontuacao']}/100). "
+                                 f"Vou esperar uma queda de {lo:g}–{hi:g}% desde o pico para te propor a compra "
+                                 f"(até {minutos:g} min).")
+        except Exception:
+            pass
+
+    def _verificar_quedas(self, pares):
+        """Hipotese D: com o preco novo de cada token em espera, propoe quando recuar lo-hi% desde o pico.
+        Se recuar mais do que hi%, espera que volte a zona (como no laboratorio). Desiste no fim do prazo,
+        com o token sem preco/par, ou com a liquidez abaixo do minimo de rug."""
+        cfg = self.cfg
+        lo, hi = num(cfg.get("entrada_queda_min_pct"), 15), num(cfg.get("entrada_queda_max_pct"), 35)
+        propostas = 0
+        for mint, w in list(self._espera_queda.items()):
+            if mint in self.estado["posicoes"]:
+                self._espera_queda.pop(mint, None)
+                continue
+            if agora() > w["fim"]:
+                self._espera_queda.pop(mint, None)
+                self.acao(f"{w['simbolo']}: sem queda de {lo:g}-{hi:g}% no prazo - sem proposta")
+                continue
+            lista = (pares or {}).get(mint)
+            if not isinstance(lista, list):
+                continue
+            par = next((p for p in lista if isinstance(p, dict) and str(p.get("pairAddress") or "") == w["par"]), None)
+            if par is None:
+                continue
+            preco = num(par.get("priceUsd"))
+            if preco <= 0:
+                continue
+            if num(obter(par, "liquidity", "usd")) < num(cfg.get("rug_liquidez_minima_usd"), 0):
+                self._espera_queda.pop(mint, None)
+                self.acao(f"{w['simbolo']}: liquidez caiu durante a espera - sem proposta")
+                continue
+            w["pico"] = max(num(w.get("pico")), preco)
+            recuo = (1 - preco / w["pico"]) * 100 if w["pico"] > 0 else 0.0
+            w["recuo"] = recuo
+            if recuo > hi or recuo < lo:
+                continue
+            self._espera_queda.pop(mint, None)
+            self.acao(f"{w['simbolo']}: recuou {recuo:.0f}% desde o pico - a preparar a proposta")
+            self.guardar()
+            try:
+                p, _ = self._propor_sinal(mint, par, w["analise"], registar=False)
+                propostas += p
+            except Exception:
+                log.exception("Proposta na queda falhou para %s", mint)
+        return propostas
 
     def _processar_respostas_aprovacao(self):
         """Executa respostas no thread principal, mantendo o leitor de terminal fora do Risk."""
@@ -5469,6 +5803,15 @@ class Bot:
             par = proposta["pair"]
             valor_proposto = (proposta.amount_usd if isinstance(proposta, PaperProposal)
                               else proposta["amount_usd"])
+            analise_p = proposta["analysis"] if isinstance(proposta["analysis"], dict) else {}
+            valor_escolhido = None
+            try:
+                vp = float(Decimal(str(valor_proposto)))
+            except (InvalidOperation, TypeError, ValueError):
+                vp = 0.0
+            if (analise_p.get("origem") == "manual" and valor > 0 and vp < valor - 1e-9
+                    and vp >= self.cfg["posicao_minima_usd"]):
+                valor = valor_escolhido = vp  # compra manual com o valor que escolheste (abaixo do maximo)
             if valor <= 0 or _decimal_canonico(valor) != _decimal_canonico(valor_proposto):
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
@@ -5496,7 +5839,11 @@ class Bot:
                         proposta["mint"], par, proposta["amount_usd"]).canonical_json
                 except (TypeError, ValueError, InvalidOperation):
                     execution_json = None
-            if plano_atual is None or plano_atual.canonical_json != execution_json:
+            plano_novo_ok, variacao = False, None
+            if plano_atual is not None and execution_json is not None and plano_atual.canonical_json != execution_json:
+                variacao = self._variacao_tolerada(execution_json, plano_atual.canonical_json)
+                plano_novo_ok = variacao is not None
+            if plano_atual is None or (plano_atual.canonical_json != execution_json and not plano_novo_ok):
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
                 self._registar_auditoria_aprovacao(
@@ -5519,8 +5866,13 @@ class Bot:
                 continue
             self._last_paper_operation_id = None
             try:
+                extra = {}
+                if valor_escolhido is not None:
+                    extra["valor_pedido"] = valor_escolhido
+                if plano_novo_ok:
+                    extra["plano_novo_ok"] = True
                 posicao = self.executor.comprar(proposta["mint"], cotacao,
-                                                proposta["analysis"], token, plano_atual)
+                                                proposta["analysis"], token, plano_atual, **extra)
             except (PaperOperationAuthorizationError, PaperOperationError) as exc:
                 descartar(token)
                 resolver_sinal(proposta["proposal_id"], "sem_vaga")
@@ -5532,6 +5884,14 @@ class Bot:
                 continue
             if posicao:
                 compras += 1
+                if plano_novo_ok:
+                    nota = (f"preço mudou {variacao:+.2f}% entre a proposta e a aprovação "
+                            f"(aceite: limite +{self.cfg['tolerancia_preco_aprovacao_pct']:g}%)")
+                    self.acao(f"Proposta PAPER {proposta['proposal_id'][:12]}: {nota}")
+                    try:
+                        self.telegram.enviar(f"ℹ️ [PAPER] ${proposta['symbol']}: {nota}.")
+                    except Exception:
+                        pass
                 resolver_sinal(proposta["proposal_id"], "comprado")
                 self._registar_auditoria_aprovacao("executed", proposta, "operacao Paper persistida")
             else:
@@ -5545,6 +5905,9 @@ class Bot:
     def ciclo_risco(self):
         e = self.estado
         mints = list(e["posicoes"]) + [m for m in e["percursos"] if m not in e["posicoes"]]
+        for m in getattr(self, "_espera_queda", {}):  # sinais a espera da queda: precisam do preco
+            if m not in mints:
+                mints.append(m)
         for m, ate in list(getattr(self, "_propostas_manuais", {}).items()):  # propostas manuais: cotacao fresca
             if ate < agora():
                 self._propostas_manuais.pop(m, None)  # noqa
@@ -5563,6 +5926,11 @@ class Bot:
                 pass
             return 0
         self._guardar_cotacoes_recentes(pares)
+        if getattr(self, "_espera_queda", None):
+            try:
+                self._verificar_quedas(pares)
+            except Exception:
+                log.exception("Erro ao verificar as quedas")
         self._pares_risco = {m: pares.get(m) for m in e["posicoes"] if pares.get(m) is not None}
         vendas = self.risco.verificar(pares)
         try:
@@ -5655,6 +6023,11 @@ class Bot:
 
     def _vigiar_posicao_no_scanner(self):
         """Chamado entre analises do scanner: se houver posicao aberta e ja for hora, le o preco rapido."""
+        if self.estado["posicoes"] and not self._stops_fila.empty():
+            try:
+                self._processar_stops()
+            except Exception:
+                log.exception("Erro ao mudar um stop-loss (durante o scanner)")
         if self.estado["posicoes"] and not self._vendas_manuais.empty():
             try:
                 self._processar_vendas_manuais()  # uma venda pedida no Telegram nao espera pelo scanner
@@ -5864,8 +6237,8 @@ class Bot:
         except Exception:
             log.warning("Aviso de fim de acompanhamento por Telegram falhou")
 
-    def _pedido_venda_telegram(self, mint):
-        return self.pedir_venda(mint, "telegram")
+    def _pedido_venda_telegram(self, mint, parcial=None):
+        return self.pedir_venda(mint, "telegram", parcial=parcial or False)
 
     def pedir_venda(self, mint, origem="telegram", parcial=False):
         """Regista o pedido; a venda e feita pelo ciclo principal (nunca a partir da thread do Telegram/dashboard)."""
@@ -5874,20 +6247,88 @@ class Bot:
             return False, "modo Paper indisponivel; nada foi feito"
         if not isinstance(mint, str) or not self._posicao_aberta(mint):
             return False, "a posicao ja esta fechada"
-        if parcial:
+        if parcial is True:
             pos = self.estado["posicoes"].get(mint) or {}
             if pos.get("origem") != "manual":
                 return False, "só nas posições compradas por ti"
             if pos.get("entrada_recuperada"):
                 return False, "a entrada desta posição já foi recuperada"
-        self._vendas_manuais.put((mint, origem, bool(parcial)))
-        return True, ("pedido registado: vou vender só a parte que paga a entrada" if parcial else "pedido registado")
+        elif parcial:  # vender uma parte: 10, 25, 50 ou 75% dos tokens
+            if isinstance(parcial, bool) or parcial not in (10, 25, 50, 75):
+                return False, "percentagem inválida (10, 25, 50 ou 75%)"
+        else:
+            parcial = False
+        self._vendas_manuais.put((mint, origem, parcial))
+        return True, ("pedido registado: vou vender só a parte que paga a entrada" if parcial is True
+                      else f"pedido registado: vou vender {parcial}% da posição" if parcial else "pedido registado")
+
+    def pedir_stop(self, mint, valor, origem="telegram"):
+        """Muda o stop-loss de uma posicao aberta (em % face ao preco de entrada). Aplicado pelo ciclo principal.
+        Texto sem sinal conta como negativo ("18" = -18%). Uma posicao do bot com stop teu passa a contar a parte."""
+        cfg = self.cfg
+        if cfg.get("mode") != "paper" or cfg.get("live_trading_enabled") is not False:
+            return False, "modo Paper indisponivel; nada foi feito"
+        if not isinstance(mint, str) or not self._posicao_aberta(mint):
+            return False, "a posição já está fechada"
+        try:
+            if isinstance(valor, bool):
+                raise ValueError
+            if isinstance(valor, str):
+                t = valor.strip().replace("%", "").replace(",", ".").replace("−", "-")
+                v = float(t)
+                if t and t[0].isdigit():
+                    v = -v
+            else:
+                v = float(valor)
+        except (TypeError, ValueError):
+            return False, "valor inválido"
+        lo, hi = num(cfg.get("stop_manual_min_pct"), -50.0), num(cfg.get("stop_manual_max_pct"), 50.0)
+        if not math.isfinite(v) or not lo <= v <= hi:
+            return False, f"o stop tem de estar entre {lo:+g}% e {hi:+g}%"
+        v = round(v, 1)
+        self._stops_fila.put((mint, v, origem))
+        pos = self.estado["posicoes"].get(mint) or {}
+        pe = num(pos.get("preco_entrada"))
+        var = (num(pos.get("preco_atual")) / pe - 1) * 100 if pe > 0 else None
+        aviso = " O preço já está abaixo deste stop: vende já." if var is not None and var <= v else ""
+        return True, f"stop de ${pos.get('simbolo', '?')} passa a {v:+g}%.{aviso}"
+
+    def _processar_stops(self):
+        feitos = 0
+        while True:
+            try:
+                mint, v, origem = self._stops_fila.get_nowait()
+            except queue.Empty:
+                break
+            pos = self.estado["posicoes"].get(mint)
+            if pos is None:
+                continue
+            antes = pos.get("stop_manual_pct")
+            pos["stop_manual_pct"] = v
+            if pos.get("origem") != "manual":
+                pos["origem"] = "manual"  # decisao tua: esta trade sai das estatisticas da estrategia
+                pos["intervencao"] = "stop"
+            feitos += 1
+            pe = num(pos.get("preco_entrada"))
+            var = (num(pos.get("preco_atual")) / pe - 1) * 100 if pe > 0 else 0.0
+            de = f"{num(antes):+g}%" if antes is not None else f"{self.cfg['stop_loss_pct']:+g}% (estratégia)"
+            self.acao(f"STOP {pos.get('simbolo')}: {de} -> {v:+g}% ({origem})")
+            try:
+                self.telegram.enviar(f"🛑 [PAPER] Stop-loss de ${pos.get('simbolo')}: {de} → {v:+g}% "
+                                     f"(preço agora {var:+.1f}%)."
+                                     + (" O preço já está abaixo: vende no próximo ciclo." if var <= v else ""))
+            except Exception:
+                pass
+        if feitos:
+            self.guardar()
+            self.atualizar_snapshot()
+        return feitos
 
     def _pode_recuperar(self, mint):
         pos = self.estado["posicoes"].get(mint) or {}
         return pos.get("origem") == "manual" and not pos.get("entrada_recuperada")
 
-    def pedir_compra_manual(self, mint, origem="telegram"):
+    def pedir_compra_manual(self, mint, origem="telegram", valor_eur=None):
         """Pede uma PROPOSTA de compra Paper para um token analisado a mao. Nunca compra direto: a proposta
         segue o caminho normal (confirmacao manual, revalidacao do Executor, 5 EUR, 1 posicao, slippage)."""
         cfg = self.cfg
@@ -5908,8 +6349,20 @@ class Bot:
             return False, f"já tens {len(self.estado['posicoes'])} posições abertas (máximo {_limite_posicoes(cfg)}); vende uma primeiro"
         if self._emergency_stop_is_active():
             return False, "paragem de emergência ativa; compras bloqueadas"
-        self._compras_manuais.put((mint, origem))
-        return True, "A analisar e a preparar a proposta: confirma-a nos próximos 90 s (Telegram ou dashboard)."
+        if valor_eur is not None:  # valor escolhido por ti: 1 EUR ate ao maximo por operacao (5 EUR)
+            maximo = min(Decimal(str(cfg.get("max_eur_per_operation") or MAX_OPERATION_EUR)), MAX_OPERATION_EUR)
+            try:
+                if isinstance(valor_eur, bool):
+                    raise ValueError
+                v = Decimal(str(valor_eur).strip().replace("€", "").replace(",", ".")).quantize(Decimal("0.01"))
+            except (InvalidOperation, TypeError, ValueError):
+                return False, "valor inválido"
+            if not v.is_finite() or not Decimal("1") <= v <= maximo:
+                return False, f"o valor tem de estar entre 1 € e {maximo.normalize():f} €"
+            valor_eur = v
+        self._compras_manuais.put((mint, origem, valor_eur))
+        quanto = f" de {str(valor_eur).replace('.', ',')} €" if valor_eur is not None else ""
+        return True, f"A preparar a proposta{quanto}: confirma-a nos próximos 90 s (Telegram ou dashboard)."
 
     def _processar_compras_manuais(self):
         """Cria as propostas pedidas (preco atual). A compra so acontece se a confirmares; o resto do caminho
@@ -5917,9 +6370,11 @@ class Bot:
         feitas = 0
         while True:
             try:
-                mint, origem = self._compras_manuais.get_nowait()
+                item = self._compras_manuais.get_nowait()
             except queue.Empty:
                 return feitas
+            mint, origem = item[0], item[1]
+            valor_eur = item[2] if len(item) > 2 else None
             def recusa(motivo, par=None):
                 simbolo = simbolo_limpo(par) if isinstance(par, dict) else mint[:8] + "…"
                 self.acao(f"{simbolo}: compra manual sem proposta - {motivo}")
@@ -5946,6 +6401,15 @@ class Bot:
             if valor <= 0:
                 recusa(motivo, par)
                 continue
+            if valor_eur is not None:
+                v_usd = self.executor.valor_usd_de_eur(valor_eur)
+                if v_usd is None:
+                    recusa("taxa BCE indisponível para converter o valor", par)
+                    continue
+                valor = min(valor, v_usd)  # nunca acima do maximo permitido
+                if valor < self.cfg["posicao_minima_usd"]:
+                    recusa("valor abaixo do mínimo por posição", par)
+                    continue
             bloqueio_rota = self._bloqueio_rota_compra(mint, valor, manual=True)
             if bloqueio_rota:
                 recusa(bloqueio_rota, par)
@@ -6010,7 +6474,18 @@ class Bot:
                 self._vendas_manuais.put((mint, origem, parcial))
                 return vendas
             try:
-                if parcial:
+                if parcial and parcial is not True:
+                    ok, msg = self.executor.vender_parcial(mint, preco, liq, motivo=f"PARCIAL {parcial}%",
+                                                           fracao_pedida=parcial / 100.0)
+                    if ok:
+                        vendas += 1
+                    else:
+                        self.acao(f"Venda de {parcial}% de {pos.get('simbolo')} recusada - {msg}")
+                        try:
+                            self.telegram.enviar(f"💸 [PAPER] Não vendi {parcial}% de ${pos.get('simbolo')}: {msg}.")
+                        except Exception:
+                            pass
+                elif parcial:
                     ok, msg = self.executor.vender_parcial(mint, preco, liq)
                     if ok:
                         vendas += 1
@@ -6364,11 +6839,13 @@ class Bot:
                                                     if cfg.get("analise_manual", True) else None,
                                                     acompanhados=self.acompanhados_texto_botoes
                                                     if cfg.get("analise_manual", True) else None,
-                                                    comprar=(lambda m: self.pedir_compra_manual(m, "telegram"))
+                                                    comprar=(lambda m, v=None: self.pedir_compra_manual(m, "telegram", v))
                                                     if cfg.get("compra_manual", True) else None,
                                                     recuperar=(lambda m: self.pedir_venda(m, "telegram", parcial=True))
                                                     if manual else None,
-                                                    pode_recuperar=self._pode_recuperar)
+                                                    pode_recuperar=self._pode_recuperar,
+                                                    stop=(lambda m, v: self.pedir_stop(m, v, "telegram"))
+                                                    if manual else None)
                 if self.tg_decisoes.ativo:
                     self.tg_decisoes.iniciar()
                 log.info("Botoes Aprovar/Recusar no Telegram: %s", "ligados" if self.tg_decisoes.ativo
@@ -6389,6 +6866,11 @@ class Bot:
                 t = agora()
                 aprovacao_alterou, _ = self._processar_respostas_aprovacao()
                 mexeu = aprovacao_alterou
+                try:
+                    if not self._stops_fila.empty() and self._processar_stops():
+                        mexeu = True
+                except Exception:
+                    log.exception("Erro ao mudar um stop-loss")
                 try:
                     if self._processar_vendas_manuais():
                         mexeu = True
@@ -6687,876 +7169,44 @@ def texto_acompanhados(lista, terminados=()):
     return "\n".join(L)[:4000]
 
 
-def _serie_fina(pc):
-    """Serie de precos tal como o bot a ve: pontos finos (preco de venda Jupiter) onde existem e pontos
-    normais (DexScreener) no resto. Devolve [(seg, rel, e_fino), ...]. O ultimo ponto e sempre o ultimo
-    ponto normal, que e o que marca o fim do percurso (tempo, rug ou desaparecimento)."""
-    pts = [(num(p[0]), num(p[1]), False) for p in pc["pts"]]
-    fim = pts[-1][0]
-    finos = sorted((num(p[0]), num(p[1])) for p in (pc.get("ptsj") or [])
-                   if isinstance(p, (list, tuple)) and len(p) == 2 and num(p[1]) > 0 and 0 < num(p[0]) < fim)
-    if not finos:
-        return pts
-    tempos = [f[0] for f in finos]
-
-    def coberto(seg):  # ha um ponto fino a menos de 45 s: o ponto normal e redundante (e mais atrasado)
-        i = bisect.bisect_left(tempos, seg)
-        return any(0 <= j < len(tempos) and abs(tempos[j] - seg) <= 45 for j in (i - 1, i))
-
-    meio = [p for p in pts[1:-1] if not coberto(p[0])] + [(s, r, True) for s, r in finos]
-    return [pts[0]] + sorted(meio, key=lambda p: p[0]) + [pts[-1]]
-
-
-def repetir_serie(pc, serie, regra, cfg, valor_usd=12.0, custos="simulados"):
-    """Como repetir_percurso, mas sobre uma serie [(seg, rel, e_fino)] e com dois modelos de custos:
-      "simulados" - os do bot: slippage + taxa, a entrada e a saida (igual a repetir_percurso);
-      "reais"     - entrada pela cotacao real do Jupiter gravada no sinal (se existir); saida pelo preco de
-                    venda Jupiter quando o ponto de saida e fino (ja inclui impacto e comissao da pool);
-                    mais a taxa de rede estimada, uma vez por transacao.
-    Devolve (resultado liquido em %, motivo, usou_cotacao_real_na_entrada)."""
-    stop, alvo, ativar, dist, minutos = regra
-    pico, preco, motivo, trailing, fino = 1.0, 1.0, "fim", False, False
-    for i, (seg, preco, fino) in enumerate(serie[1:], 1):
-        pico = max(pico, preco)
-        v = (preco - 1) * 100
-        if preco <= 0:
-            return -100.0, "desapareceu", False
-        if i == len(serie) - 1 and pc.get("fim") == "rug":
-            motivo = "rug"
-            break
-        if v <= stop:
-            motivo = "stop"
-            break
-        if alvo and v >= alvo:
-            motivo = "alvo"
-            break
-        if ativar and (pico - 1) * 100 >= ativar:
-            trailing = True
-        if trailing and preco <= pico * (1 - dist / 100.0):
-            motivo = "trailing"
-            break
-        if seg >= minutos * 60:
-            motivo = "tempo"
-            break
-    s_ent = cfg["slippage_pct"] / 100.0
-    s_sai = s_ent
-    if motivo == "rug":  # com a liquidez a desaparecer, a venda sai muito pior
-        liq = num(pc.get("liq_fim"))
-        s_sai = min(0.95, s_ent + (valor_usd / (liq / 2.0) if liq > 0 else 1.0))
-    taxa = cfg["taxa_pct"] / 100.0
-    if custos != "reais":
-        liquido = (1 - taxa) / (1 + s_ent) * preco * (1 - s_sai) * (1 - taxa)
-        return (liquido - 1) * 100.0, motivo, False
-    real = num(obter(pc, "obs", "jupiter", "slippage_real_pct"), None)
-    tem_real = real is not None and -10.0 <= real <= 50.0
-    entrada = (1 + real / 100.0) if tem_real else (1 + s_ent) / (1 - taxa)
-    # ponto fino = preco a que a posicao se vendia mesmo; ponto normal (ou rug) = preco medio, leva os custos simulados
-    saida = preco if (fino and motivo != "rug") else preco * (1 - s_sai) * (1 - taxa)
-    rede = 2 * max(0.0, num(cfg.get("lab_taxa_rede_usd"), 0.05)) / valor_usd if valor_usd > 0 else 0.0
-    return (saida / entrada - rede - 1) * 100.0, motivo, tem_real
-
-
-def _mediana(valores):
-    v = sorted(valores)
-    return v[len(v) // 2] if v else None
-
-
-# Hipoteses escritas a 17/11/2026 com os primeiros 36 sinais (analise do Grok + laboratorio). NAO se mudam:
-# so se medem nos sinais que vieram depois. Se falharem, deitam-se fora (nao se escolhe outra com os mesmos sinais).
-HIPOTESES_CONGELADAS = {
-    "data": "17/11/2026",
-    "desde_sinal": 37,                 # o 37.o sinal (por ordem de tempo) e o primeiro que nenhuma regra viu
-    "saida": (-20, 50, 0, 0, 30),      # A) stop -20%, alvo +50%, sem trailing, 30 min
-    "pontuacao_max": 79,               # B) recusar pontuacao 80 ou mais (saida = regras atuais)
-    "minimo": 30,                      # sinais novos para poder decidir
-}
-
-
-def _secao_hipoteses_congeladas(percursos, atual, cfg, h=None):
-    """Mede as hipoteses congeladas SO nos sinais que chegaram depois de elas serem escritas."""
-    h = h or HIPOTESES_CONGELADAS
-    novos = percursos[h["desde_sinal"] - 1:]
-    L = ["", f"  HIPOTESES CONGELADAS (escritas a {h['data']} com os primeiros {h['desde_sinal'] - 1} sinais; "
-         "medidas SO nos sinais seguintes)"]
-    if not novos:
-        return L + [f"    Ainda nao ha sinais novos (comecam no {h['desde_sinal']}.o)."]
-    saida, pmax = h["saida"], h["pontuacao_max"]
-    L.append(f"    Sinais novos: {len(novos)} (do {h['desde_sinal']}.o em diante)")
-    m0, a0 = _medir(novos, atual, cfg)
-    L.append(f"    {'regras atuais (referencia)':<36}{len(novos):>3} trades   acerto {a0:5.1f}%   media {m0:+7.2f}%")
-    mA, aA = _medir(novos, saida, cfg)
-    melhorA = sum(1 for pc in novos if repetir_percurso(pc, saida, cfg)[0] > repetir_percurso(pc, atual, cfg)[0])
-    L.append(f"    {'A) saida -20% / +50% / 30 min':<36}{len(novos):>3} trades   acerto {aA:5.1f}%   media {mA:+7.2f}%"
-             f"   | melhor do que as atuais em {melhorA} de {len(novos)}")
-    ficam = [pc for pc in novos if num(pc.get("pontuacao")) <= pmax]
-    saem = [pc for pc in novos if num(pc.get("pontuacao")) > pmax]
-    linha = f"    {'B) recusar pontuacao %d+' % (pmax + 1):<36}"
-    if ficam:
-        mB, aB = _medir(ficam, atual, cfg)
-        linha += f"{len(ficam):>3} trades   acerto {aB:5.1f}%   media {mB:+7.2f}%"
-    else:
-        linha += "  0 trades"
-    if saem:
-        linha += f"   | recusados {len(saem)}: media {_medir(saem, atual, cfg)[0]:+.2f}% (com as regras atuais)"
-    L.append(linha)
-    com = [pc for pc in novos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
-    if com:
-        valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
-
-        def fr(grupo, regra):
-            r = [repetir_serie(pc, _serie_fina(pc), regra, cfg, valor_usd=valor, custos="reais")[0] for pc in grupo]
-            return f"{sum(r) / len(r):+7.2f}% ({len(r)})" if r else "    sem dados"
-        L.append(f"    Com pontos finos e custos reais ({len(com)} dos {len(novos)} novos):")
-        L.append(f"      atuais {fr(com, atual)}   A) {fr(com, saida)}   "
-                 f"B) {fr([pc for pc in com if num(pc.get('pontuacao')) <= pmax], atual)}")
-    falta = h["minimo"] - len(novos)
-    L += [f"    Decisao: so com {h['minimo']} ou mais sinais novos" + (f" (faltam {falta})." if falta > 0 else " (ja ha)."),
-          "    Uma hipotese so passa se ganhar as regras atuais aqui E com pontos finos e custos reais.",
-          "    As hipoteses nao se mudam: se falharem, deitam-se fora (nao se escolhe outra com os mesmos sinais)."]
-    return L
-
-
-# 2.o conjunto (18/11/2026, com os primeiros 77 sinais): A e B falharam; o problema esta nas ENTRADAS.
-# Duas hipoteses de entrada que se repetiram em todas as leituras. NAO se mudam; medem-se do 78.o sinal em diante.
-HIPOTESES_ENTRADA = {
-    "data": "18/11/2026",
-    "desde_sinal": 78,
-    "idade_min": 30,          # C) so entrar em tokens com 30 min ou mais
-    "queda": (15, 35),        # D) depois do sinal, esperar um recuo de 15-35% e so entao entrar
-    "minimo": 30,
-}
-
-
-def _secao_hipoteses_entrada(percursos, cfg, h=None):
-    """Hipoteses de ENTRADA congeladas (C e D), medidas so nos sinais que chegaram depois de escritas."""
-    h = h or HIPOTESES_ENTRADA
-    novos = percursos[h["desde_sinal"] - 1:]
-    L = ["", f"  HIPOTESES DE ENTRADA CONGELADAS (escritas a {h['data']} com os primeiros {h['desde_sinal'] - 1} sinais;"
-         " medidas SO nos sinais seguintes)",
-         "    (A e B, as de 17/11, falharam com 41 sinais novos e foram postas de parte.)"]
-    if not novos:
-        return L + [f"    Ainda nao ha sinais novos (comecam no {h['desde_sinal']}.o)."]
-    atual = dict(stop=cfg["stop_loss_pct"], parcial_2x=False, trail_dist=cfg["trailing_distancia_pct"],
-                 trail_ativar=cfg["trailing_ativar_pct"] or None, alvo=cfg["take_profit_pct"] or None,
-                 minutos=cfg["tempo_maximo_min"])
-    L.append(f"    Sinais novos: {len(novos)} (do {h['desde_sinal']}.o em diante)")
-    n0, m0, a0 = _medir_avancado(novos, cfg, **atual)
-    if n0:
-        L.append(f"    {'regras atuais (referencia)':<36}{n0:>3} trades   acerto {a0:5.1f}%   media {m0:+7.2f}%")
-    idade = lambda pc: num(obter(pc, "feat", "idade_min", defeito=None), -1)
-    ficam = [pc for pc in novos if idade(pc) >= h["idade_min"]]
-    saem = [pc for pc in novos if 0 <= idade(pc) < h["idade_min"]]
-    sem_dado = len(novos) - len(ficam) - len(saem)
-    linha = f"    {'C) so tokens com %d min ou mais' % h['idade_min']:<36}"
-    nc, mc, ac = _medir_avancado(ficam, cfg, **atual) if ficam else (0, None, None)
-    linha += f"{nc:>3} trades   acerto {ac:5.1f}%   media {mc:+7.2f}%" if nc else "  0 trades"
-    if saem:
-        linha += f"   | saem {len(saem)}: media {_medir_avancado(saem, cfg, **atual)[1]:+.2f}%"
-    if sem_dado:
-        linha += f"   | sem idade: {sem_dado}"
-    L.append(linha)
-    nd, md, ad = _medir_avancado(novos, cfg, **dict(atual, queda=h["queda"]))
-    q0, q1 = h["queda"]
-    L.append(f"    {'D) entrar na queda de %d-%d%%' % (q0, q1):<36}" +
-             (f"{nd:>3} trades   acerto {ad:5.1f}%   media {md:+7.2f}%   | sem entrada (nao caiu): {len(novos) - nd}"
-              if nd else "  0 trades (nenhum recuou o suficiente)"))
-    com = [pc for pc in ficam if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
-    todos_f = [pc for pc in novos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
-    if todos_f:
-        valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
-        regra = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
-                 cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
-
-        def fr(grupo):
-            r = [repetir_serie(pc, _serie_fina(pc), regra, cfg, valor_usd=valor, custos="reais")[0] for pc in grupo]
-            return f"{sum(r) / len(r):+7.2f}% ({len(r)})" if r else "    sem dados"
-        L.append(f"    Com pontos finos e custos reais: atuais {fr(todos_f)}   C) {fr(com)}   "
-                 "(D usa os pontos normais)")
-    falta = h["minimo"] - len(novos)
-    L += [f"    Decisao: so com {h['minimo']} ou mais sinais novos" + (f" (faltam {falta})." if falta > 0 else " (ja ha)."),
-          "    Uma hipotese de entrada so passa se ganhar as regras atuais com margem clara E nao deixar quase tudo de fora.",
-          "    As hipoteses nao se mudam: se falharem, deitam-se fora."]
-    return L
-
-
-def _secao_pontos_finos(percursos, melhores, atual, cfg):
-    """As mesmas regras, nos mesmos percursos, com pontos normais e com pontos finos, e com os dois custos."""
-    com = [pc for pc in percursos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
-    L = ["", f"  PONTOS FINOS (preco de venda real no Jupiter) - {len(com)} de {len(percursos)} percursos com pontos finos"]
-    if not com:
-        return L + [f"    Ainda sem dados: o bot grava-os nos primeiros {num(cfg.get('percurso_fino_minutos'), 30):.0f} min "
-                    "de cada sinal desde 15/11/2026; aparecem aqui quando esses percursos fecharem."]
-    valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
-    series = [(pc, _serie_fina(pc)) for pc in com]
-
-    def medir(regra, modo):
-        if modo == "normais":
-            r = [repetir_percurso(pc, regra, cfg)[0] for pc, _ in series]
-        elif modo == "finos":
-            r = [repetir_serie(pc, s, regra, cfg)[0] for pc, s in series]
-        else:
-            r = [repetir_serie(pc, s, regra, cfg, valor_usd=valor, custos="reais")[0] for pc, s in series]
-        return sum(r) / len(r), sum(1 for x in r if x > 0) / len(r) * 100.0
-
-    def intervalos(chave):
-        saltos = []
-        for pc in com:
-            tempos = sorted(num(p[0]) for p in pc.get(chave) or [] if isinstance(p, (list, tuple)) and len(p) == 2)
-            saltos += [b - a for a, b in zip(tempos, tempos[1:]) if b > a]
-        return _mediana(saltos)
-
-    i_fino, i_normal = intervalos("ptsj"), intervalos("pts")
-    if i_fino is not None and i_normal is not None:
-        L.append(f"    Intervalo mediano entre pontos: finos {i_fino:.0f} s, normais {i_normal:.0f} s")
-    com_real = sum(1 for pc, s in series if repetir_serie(pc, s, atual, cfg, valor_usd=valor, custos="reais")[2])
-    L.append("    REGRAS ATUAIS, nos mesmos percursos:")
-    for nome, modo in (("pontos normais, custos simulados", "normais"), ("pontos finos,   custos simulados", "finos"),
-                       ("pontos finos,   custos reais", "reais")):
-        media, acerto = medir(atual, modo)
-        L.append(f"      {nome:<34} acerto {acerto:5.1f}%   media {media:+6.2f}% por trade")
-    L.append(f"      (custos reais: {com_real} de {len(com)} com cotacao real de entrada; taxa de rede "
-             f"${num(cfg.get('lab_taxa_rede_usd'), 0.05):.2f} por transacao, HIPOTESE por medir; operacao de ${valor:.2f})")
-    if melhores:
-        L.append("    AS MELHORES COMBINACOES (escolhidas com pontos normais em todos os sinais), nestes percursos:")
-        for regra in melhores[:5]:
-            a, b, c = medir(regra, "normais")[0], medir(regra, "finos")[0], medir(regra, "reais")[0]
-            L.append(f"      {_regra_txt(regra)}   normais {a:+6.2f}%   finos {b:+6.2f}%   finos+reais {c:+6.2f}%")
-    L += ["    - 'pontos finos, custos simulados' e o mais parecido com o que o bot Paper regista hoje.",
-          "    - Se uma regra so ganha com pontos normais, o ganho vem da lentidao dos dados, nao da regra."]
-    if len(com) < 40:
-        L.append(f"    - ATENCAO: {len(com)} percursos com pontos finos e pouco; abaixo de 40 isto e sobretudo sorte.")
-    return L
-
-
-def _secao_por_dia(cfg):
-    """Operacoes Paper fechadas, por dia (resultado real registado pelo bot, nao o do laboratorio)."""
-    L = ["", "  OPERACOES PAPER FECHADAS, POR DIA (o que o bot registou mesmo, nao o laboratorio)"]
-    try:
-        todas = [t for t in (ler_trades_paper(cfg) or []) if t.get("tipo") == "VENDA" and t.get("pnl_usd") is not None]
-    except Exception:
-        todas = []
-    manuais = [t for t in todas if "[manual]" in str(t.get("motivo") or "")]
-    vendas = [t for t in todas if "[manual]" not in str(t.get("motivo") or "")]
-    if not todas:
-        return L + ["    Ainda sem operacoes fechadas (ou trades.csv indisponivel)."]
-
-    def por_dia(grupo):
-        dias = {}
-        for t in grupo:
-            dias.setdefault(str(t.get("data_hora") or "")[:10], []).append(t)
-        for dia in sorted(dias):
-            g = dias[dia]
-            pnl = sum(num(t["pnl_usd"]) for t in g)
-            ganhas = sum(1 for t in g if num(t["pnl_usd"]) > 0)
-            media = sum(num(t.get("pnl_pct")) for t in g) / len(g)
-            L.append(f"    {dia}   {len(g):>3} fechadas   {ganhas:>2} ganhas   resultado ${pnl:+7.2f}   media {media:+6.2f}% por operacao")
-    por_dia(vendas)
-    if manuais:
-        L.append("  COMPRAS MANUAIS (escolhas tuas; nao contam acima)")
-        por_dia(manuais)
-    L += ["    As regras do bot mudaram pelo caminho (confirmacao manual e limite de 5 EUR desde 14/11, preco rapido",
-          "    desde 15/11): compara dias com as mesmas regras, nao o total."]
-    return L
-
-
-def repetir_avancado(pc, cfg, queda=None, stop=-25.0, parcial_2x=True, trail_dist=20.0, trail_ativar=None,
-                     alvo=None, minutos=180, valor_usd=12.0):
-    """Laboratorio: estrategia com entrada na queda e/ou venda de metade a 2x (so simulacao).
-
-    queda=(min, max): so compra quando o preco recua entre min% e max% desde o pico apos o sinal
-    (se cair mais do que max% de uma vez, nao compra). parcial_2x: vende metade ao dobrar; o resto
-    sai por trailing (trail_dist% abaixo do pico), stop, tempo ou rug.
-    Devolve (resultado liquido em %, motivo) ou None se nunca chegou a comprar."""
-    pts = pc["pts"]
-    if not pts or len(pts) < 2:
-        return None
-    s_ent = cfg["slippage_pct"] / 100.0
-    taxa = cfg["taxa_pct"] / 100.0
-    rug_final = pc.get("fim") == "rug"
-    inicio, entrada = 0, 1.0
-    if queda:
-        lo, hi = queda
-        pico = 1.0
-        inicio = None
-        for i, (seg, preco) in enumerate(pts[1:], 1):
-            if preco <= 0 or (i == len(pts) - 1 and rug_final):
-                break
-            pico = max(pico, preco)
-            recuo = (1 - preco / pico) * 100
-            if recuo > hi:          # caiu demais desde o pico: faca a cair, so compra se voltar a zona 15-35%
-                continue
-            if recuo >= lo:
-                inicio, entrada = i, preco
-                break
-        if inicio is None:
-            return None
-    t0 = pts[inicio][0]
-    vendido, recebido = 0.0, 0.0     # fracao da posicao ja vendida e valor recebido (relativo ao preco de entrada)
-    pico, trailing, motivo, rel = 1.0, False, "fim", 1.0
-    for i in range(inicio + 1, len(pts)):
-        seg, preco = pts[i]
-        if preco <= 0:
-            motivo, rel = "desapareceu", 0.0
-            break
-        rel = preco / entrada
-        pico = max(pico, rel)
-        v = (rel - 1) * 100
-        if i == len(pts) - 1 and rug_final:
-            motivo = "rug"
-            break
-        if v <= stop:
-            motivo = "stop"
-            break
-        if alvo and v >= alvo:
-            motivo = "alvo"
-            break
-        if parcial_2x and vendido == 0 and rel >= 2.0:
-            vendido, recebido = 0.5, 0.5 * rel * (1 - s_ent) * (1 - taxa)  # vende metade ao preco visto
-            trailing = True
-        if trail_ativar is not None and (pico - 1) * 100 >= trail_ativar:
-            trailing = True
-        if trailing and rel <= pico * (1 - trail_dist / 100.0):
-            motivo = "trailing"
-            break
-        if seg - t0 >= minutos * 60:
-            motivo = "tempo"
-            break
-    s_sai = s_ent
-    if motivo == "rug":
-        liq = num(pc.get("liq_fim"))
-        s_sai = min(0.95, s_ent + (valor_usd / (liq / 2.0) if liq > 0 else 1.0))
-    resto = (1 - vendido) * rel * (1 - s_sai) * (1 - taxa)
-    liquido = (1 - taxa) / (1 + s_ent) * (recebido + resto)
-    return (liquido - 1) * 100.0, motivo
-
-
-def _medir_avancado(percursos, cfg, **regra):
-    r = [x for x in (repetir_avancado(pc, cfg, **regra) for pc in percursos) if x is not None]
-    if not r:
-        return 0, None, None
-    return len(r), sum(x[0] for x in r) / len(r), sum(1 for x in r if x[0] > 0) / len(r) * 100.0
-
-
-def _secao_estrategia_post(percursos, todos, cfg):
-    """Estrategia vista num post do X: entrada na queda de 15-35%, metade a 2x + trailing, stop -25%."""
-    atual = dict(stop=cfg["stop_loss_pct"], parcial_2x=False, trail_dist=cfg["trailing_distancia_pct"],
-                 trail_ativar=cfg["trailing_ativar_pct"] or None, alvo=cfg["take_profit_pct"] or None,
-                 minutos=cfg["tempo_maximo_min"])
-    variantes = (
-        ("regras atuais (referencia)", atual),
-        ("post completo", dict(queda=(15, 35), stop=-25, parcial_2x=True, trail_dist=20, minutos=180)),
-        ("so entrada na queda", dict(atual, queda=(15, 35))),
-        ("so saida do post", dict(stop=-25, parcial_2x=True, trail_dist=20, minutos=180)),
-        ("so stop -25%", dict(atual, stop=-25)),
-    )
-    L = ["", "  ESTRATEGIA DO POST (X): comprar na queda de 15-35%, vender metade a 2x + trailing 20%, stop -25%"]
-    for titulo, grupo in (("sinais aprovados", percursos), ("aprovados + controlo", todos)):
-        if not grupo:
-            continue
-        L.append(f"    {titulo} ({len(grupo)} percursos):")
-        for nome, regra in variantes:
-            n, media, acerto = _medir_avancado(grupo, cfg, **regra)
-            if n == 0:
-                L.append(f"      {nome:<28} nunca chegou a comprar")
-                continue
-            sem = len(grupo) - n
-            extra = f"   ({sem} sem entrada)" if sem else ""
-            L.append(f"      {nome:<28} {n:>4} trades   media {media:+6.2f}%   acerto {acerto:5.1f}%{extra}")
-    L.append("    Teste so no laboratorio: nada disto muda o que o bot compra ou vende.")
-    return L
-
-
-def ler_percursos(cfg):
-    percursos = []
-    try:
-        with open(cfg["ficheiro_percursos"], "r", encoding="utf-8") as f:
-            for linha in f:
-                try:
-                    pc = json.loads(linha)
-                    if isinstance(pc.get("pts"), list) and len(pc["pts"]) >= 2:
-                        percursos.append(pc)
-                except (ValueError, AttributeError):
-                    continue
-    except OSError:
-        pass
-    return sorted(percursos, key=lambda pc: num(pc.get("ts")))
-
-
-def _medir(percursos, regra, cfg):
-    r = [repetir_percurso(pc, regra, cfg)[0] for pc in percursos]
-    return sum(r) / len(r), sum(1 for x in r if x > 0) / len(r) * 100.0
-
-
-def _regra_txt(regra):
-    stop, alvo, ativar, dist, minutos = regra
-    return (f"stop {stop:>4.0f}%  alvo {('+%d%%' % alvo) if alvo else 'sem':>5}  "
-            f"trailing {('%d/%d' % (ativar, dist)) if ativar else 'nao':>6}  {minutos:>3} min")
-
-
-def analisar(cfg):
-    """Devolve o texto do relatorio do laboratorio."""
-    lidos = ler_percursos(cfg)
-    manuais = [pc for pc in lidos if pc.get("grupo") == "manual"]
-    todos = [pc for pc in lidos if pc.get("grupo") != "manual"]
-    percursos = [pc for pc in todos if pc.get("grupo", "sinal") != "controlo"]
-    controlo = [pc for pc in todos if pc.get("grupo") == "controlo"]
-    n = len(percursos)
-    L = ["", "=" * 74, "  LABORATORIO - regras testadas nos percursos REAIS gravados pelo bot", "=" * 74]
-    if n == 0:
-        L += ["  Ainda nao ha percursos completos de sinais aprovados.",
-              f"  O bot grava o preco de cada sinal durante {cfg['percurso_minutos']} minutos.",
-              "  Deixa-o a correr e volta a tentar mais tarde."]
-        if controlo:
-            atual = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
-                     cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
-            L += _secao_controlo(percursos, controlo, atual, cfg)
-            L += _secao_caracteristicas(todos, atual, cfg)
-            L += _secao_estrategia_post(percursos, todos, cfg)
-        L += _secao_manuais(manuais, regra_atual(cfg), cfg)
-        return "\n".join(L)
-    dias = (num(percursos[-1].get("ts")) - num(percursos[0].get("ts"))) / 86400.0
-    L.append(f"  Sinais analisados: {n}   (ao longo de {dias:.1f} dias)")
-    if n < 100:
-        L.append(f"  ATENCAO: {n} sinais e pouco. Abaixo de 100 os resultados sao sobretudo sorte.")
-    atual = (cfg["stop_loss_pct"], cfg["take_profit_pct"], cfg["trailing_ativar_pct"],
-             cfg["trailing_distancia_pct"], cfg["tempo_maximo_min"])
-    media, acerto = _medir(percursos, atual, cfg)
-    L += ["", "  REGRAS ATUAIS", f"    {_regra_txt(atual)}   acerto {acerto:5.1f}%   media {media:+6.2f}% por trade"]
-
-    # ate onde chegaram os precos (responde a: vale a pena deixar correr os ganhos?)
-    maximos = [max(p[1] for p in pc["pts"]) for pc in percursos]
-    minimos = [min(p[1] for p in pc["pts"]) for pc in percursos]
-    L += ["", f"  O QUE OS PRECOS FIZERAM (nos {cfg['percurso_minutos']} min depois do sinal)"]
-    for alvo in (25, 50, 100, 300):
-        L.append(f"    chegaram a +{alvo}%: {sum(1 for m in maximos if m >= 1 + alvo / 100) / n * 100:5.1f}%")
-    L.append(f"    cairam 50% ou mais:  {sum(1 for m in minimos if m <= 0.5) / n * 100:5.1f}%")
-    L.append(f"    acabaram em rug ou desapareceram: {sum(1 for pc in percursos if pc.get('fim') != 'tempo') / n * 100:5.1f}%")
-
-    grelha = [(s, a, t[0], t[1], m) for s in (-6, -10, -15, -20, -30) for a in (25, 50, 100, 0)
-              for t in ((0, 0), (10, 8), (20, 15), (30, 20)) for m in (30, 60, 120, 180)
-              if m <= cfg["percurso_minutos"]]
-    if not grelha:
-        return "\n".join(L + ["", "  (percurso_minutos e demasiado curto para testar combinacoes)", "=" * 74])
-    resultados = sorted(((_medir(percursos, r, cfg), r) for r in grelha), key=lambda x: -x[0][0])
-    L += ["", f"  AS 8 MELHORES de {len(grelha)} combinacoes (por media por trade)"]
-    for (media, acerto), r in resultados[:8]:
-        L.append(f"    {_regra_txt(r)}   acerto {acerto:5.1f}%   media {media:+6.2f}%")
-    positivas = sum(1 for (media, _), _ in resultados if media > 0)
-    L.append(f"    Combinacoes com media positiva: {positivas} de {len(grelha)}")
-
-    if n >= 40:  # a melhor regra da 1.a metade continua boa na 2.a? (protege contra "regra feita a medida")
-        a, b = percursos[:n // 2], percursos[n // 2:]
-        melhor = max(grelha, key=lambda r: _medir(a, r, cfg)[0])
-        m_a, _ = _medir(a, melhor, cfg)
-        m_b, ac_b = _medir(b, melhor, cfg)
-        m_at, ac_at = _medir(b, atual, cfg)
-        dif = m_b - m_at
-        L += ["", "  PROVA DOS NOVE (a melhor regra da 1.a metade dos sinais, testada na 2.a metade)",
-              f"    {_regra_txt(melhor)}",
-              f"    1.a metade: {m_a:+6.2f}% por trade     2.a metade: {m_b:+6.2f}% por trade (acerto {ac_b:.1f}%)",
-              f"    regras atuais na mesma 2.a metade ({len(b)} sinais): {m_at:+6.2f}% por trade (acerto {ac_at:.1f}%)",
-              f"    -> na 2.a metade a regra escolhida fica {abs(dif):.2f} pontos "
-              + ("ACIMA" if dif > 0 else "ABAIXO") + " das regras atuais",
-              "    Se a 2.a metade for muito pior, a regra so 'acertou' por acaso - nao confies nela."]
-    L += _secao_hipoteses_congeladas(percursos, atual, cfg)
-    L += _secao_hipoteses_entrada(percursos, cfg)
-
-    L += _secao_pontos_finos(percursos, [r for _, r in resultados[:5]], atual, cfg)
-    L += _secao_entrada_adiada(percursos, atual, cfg)
-    L += _secao_observacao_extra(percursos, atual, cfg)
-    L += ["", "  POR FONTE DE DESCOBERTA (com as regras atuais)"]
-    for fonte in ("dexscreener", "geckoterminal"):
-        grupo = [pc for pc in percursos if pc.get("fonte", "dexscreener") == fonte]
-        if grupo:
-            media, acerto = _medir(grupo, atual, cfg)
-            L.append(f"    {fonte:<14} {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
-    L += ["", "  POR PONTUACAO DO ANALISTA (com as regras atuais)"]
-    for lo, hi in ((70, 79), (80, 89), (90, 100)):
-        grupo = [pc for pc in percursos if lo <= num(pc.get("pontuacao")) <= hi]
-        if grupo:
-            media, acerto = _medir(grupo, atual, cfg)
-            L.append(f"    {lo}-{hi}: {len(grupo):>4} sinais   acerto {acerto:5.1f}%   media {media:+6.2f}%")
-    L += _secao_controlo(percursos, controlo, atual, cfg)
-    L += _secao_caracteristicas(todos, atual, cfg)
-    L += _secao_pontuacao_por_criterio(percursos, atual, cfg)
-    L += _secao_filtros_a_testar(percursos, atual, cfg)
-    L += _secao_carteiras(todos, atual, cfg)
-    L += _secao_estrategia_post(percursos, todos, cfg)
-    L += _secao_manuais(manuais, atual, cfg)
-    L += _secao_por_dia(cfg)
-    L += ["", "  COMO LER", "    - 'media' ja inclui os custos simulados (slippage e taxas, a entrada e a saida).",
-          "    - Fora da seccao PONTOS FINOS, tudo usa os pontos normais (DexScreener, ~30 em 30 s).",
-          "    - Conta cada sinal como um trade, sem o limite de posicoes abertas.",
-          "    - Se NENHUMA combinacao tiver media positiva, o problema esta nas entradas (o Analista),",
-          "      nao nas saidas: nenhuma regra de venda salva compras sem vantagem.",
-          "    - Resultado em simulacao nao garante resultado com dinheiro real.", "=" * 74]
-    return "\n".join(L)
-
-
-def _secao_manuais(manuais, regra, cfg):
-    """Tokens acompanhados a pedido (botao Acompanhar). Nao entram em nenhuma estatistica do laboratorio.
-    Mostra as regras atuais e o stop alternativo lado a lado, para comparares as duas com os teus tokens."""
-    if not manuais:
-        return []
-    alt = regra_alternativa(cfg)
-    L = ["", f"  TOKENS ACOMPANHADOS A MAO ({len(manuais)}; NAO entram nas estatisticas acima)",
-         f"    regras atuais (stop {regra[0]:.0f}%) contra o mesmo com stop {alt[0]:.0f}%"]
-    for pc in manuais[-15:]:
-        res, motivo = repetir_percurso(pc, regra, cfg)
-        res_a, motivo_a = repetir_percurso(pc, alt, cfg)
-        pico = (max(p[1] for p in pc["pts"]) - 1) * 100
-        p = pc.get("pontuacao")
-        L.append(f"    {time.strftime('%d/%m %H:%M', time.localtime(num(pc.get('ts'))))}  ${str(pc.get('simbolo'))[:10]:<10} "
-                 f"pontos {('%3d' % p) if p is not None else '  -'}   atuais {res:+7.2f}% ({motivo:<8})  "
-                 f"stop {alt[0]:.0f}% {res_a:+7.2f}% ({motivo_a:<8})  pico {pico:+6.1f}%   fim {pc.get('fim')}")
-    r1 = [repetir_percurso(pc, regra, cfg)[0] for pc in manuais]
-    r2 = [repetir_percurso(pc, alt, cfg)[0] for pc in manuais]
-    r3 = [_simular_recuperar([[num(p[0]), num(p[1])] for p in pc["pts"]], regra, pc.get("fim"), pc.get("liq_fim"), cfg)["pct"]
-          for pc in manuais]
-    melhor = sum(1 for a, b in zip(r1, r2) if b > a + 0.01)
-    pior = sum(1 for a, b in zip(r1, r2) if b < a - 0.01)
-    L.append(f"    media: atuais {sum(r1) / len(r1):+.2f}%   stop {alt[0]:.0f}% {sum(r2) / len(r2):+.2f}% por token   "
-             f"| stop {alt[0]:.0f}% melhor em {melhor}, pior em {pior}, igual em {len(r1) - melhor - pior}")
-    m3 = sum(1 for a, b in zip(r1, r3) if b > a + 0.01)
-    L.append(f"    recuperar entrada a 2x: media {sum(r3) / len(r3):+.2f}% por token | melhor do que as atuais em {m3} de {len(r3)}")
-    if len(manuais) < 20:
-        L.append("    Com menos de 20 tokens acompanhados isto ainda e sobretudo sorte.")
-    return L
-
-
-def _linha_grupo(nome, grupo, regra, cfg):
-    media, acerto = _medir(grupo, regra, cfg)
-    pico = sum(max(p[1] for p in pc["pts"]) for pc in grupo) / len(grupo)
-    rugs = sum(1 for pc in grupo if pc.get("fim") != "tempo") / len(grupo) * 100.0
-    return (f"    {nome:<26} {len(grupo):>4}   media {media:+6.2f}%   acerto {acerto:5.1f}%   "
-            f"pico medio {100 * (pico - 1):+6.1f}%   rug {rugs:5.1f}%")
-
-
-def _secao_controlo(percursos, controlo, regra, cfg):
-    """Aprovados vs. recusados (grupo de controlo), com as mesmas regras de saida."""
-    L = ["", "  APROVADOS vs. RECUSADOS (grupo de controlo, com as regras atuais)"]
-    if not controlo:
-        return L + ["    Ainda sem grupo de controlo: so os percursos gravados depois desta versao o tem."]
-    if percursos:
-        L.append(_linha_grupo("aprovados (sinais)", percursos, regra, cfg))
-    L.append(_linha_grupo("recusados (controlo)", controlo, regra, cfg))
-    L.append("    Se os recusados derem igual ou melhor do que os aprovados, a pontuacao/filtros nao estao a ajudar.")
-    return L
-
-
-def _secao_caracteristicas(todos, regra, cfg):
-    """Resultado por caracteristica do par no momento do sinal (aprovados + controlo)."""
-    com = [pc for pc in todos if isinstance(pc.get("feat"), dict)]
-    L = ["", f"  POR CARACTERISTICA DE ENTRADA - {len(com)} percursos com dados (aprovados + controlo)"]
-    if not com:
-        return L + ["    Ainda sem dados: so os percursos gravados depois desta versao os tem."]
-
-    def f(pc, k):
-        v = pc["feat"].get(k)
-        return num(v, None) if v is not None else None
-
-    def racio(pc, janela):
-        c, v = f(pc, "compras_" + janela), f(pc, "vendas_" + janela)
-        return c / v if c is not None and v else None
-
-    blocos = (
-        ("subida 5 min", lambda pc: f(pc, "m5"), ((None, 0, "< 0%"), (0, 10, "0 a 10%"), (10, 30, "10 a 30%"), (30, None, "> 30%"))),
-        ("subida 1 h", lambda pc: f(pc, "h1"), ((None, 0, "< 0%"), (0, 50, "0 a 50%"), (50, 100, "50 a 100%"), (100, None, "> 100%"))),
-        ("compras/vendas 5 min", lambda pc: racio(pc, "m5"), ((None, 1, "< 1 (mais vendas)"), (1, 1.5, "1 a 1.5"), (1.5, None, "> 1.5"))),
-        ("idade do par", lambda pc: f(pc, "idade_min"), ((None, 30, "< 30 min"), (30, 120, "30 min a 2 h"), (120, None, "> 2 h"))),
-    )
-    for titulo, valor, faixas in blocos:
-        L.append(f"    {titulo}:")
-        for lo, hi, nome in faixas:
-            g = [pc for pc in com if valor(pc) is not None and (lo is None or valor(pc) >= lo)
-                 and (hi is None or valor(pc) < hi)]
-            if g:
-                L.append("  " + _linha_grupo(nome, g, regra, cfg))
-    L.append("    Com poucos percursos por faixa (menos de 20) as diferencas ainda sao sobretudo sorte.")
-    return L
-
-
-def _top10_sem_pool(pc):
-    """Top 10 de holders sem a conta da pool do par; None se nao der para saber."""
-    top, pool = obter(pc, "obs", "holders", "top"), pc.get("par")
-    validos = [x for x in top if isinstance(x, list) and len(x) == 2] if isinstance(top, list) else []
-    if not pool or not any(x[0] == pool for x in validos):
-        return None
-    return sum(num(x[1]) for x in [x for x in validos if x[0] != pool][:10])
-
-
-CRITERIOS_PONTUACAO = (("liquidez", "Liquidez", 20), ("mcap/liq", "Market cap/liquidez", 10), ("idade", "Idade", 10),
-                       ("volume", "Volume", 20), ("compras", "Pressao compradora", 20), ("momento", "Momento", 5),
-                       ("acumulacao", "Acumulacao", 5), ("rugcheck", "RugCheck", 10))
-_ANALISE_LOG_RE = re.compile(r"\(([A-Za-z0-9]{30,50})\): (?:APROVADO|REPROVADO) (\d+)/100 \[([^\]]*)\]")
-
-
-def _componentes_do_log(cfg):
-    """Pontos de cada criterio por token, lidos das linhas ANALISE do bot.log (para os percursos antigos).
-    Devolve {mint: [(pontuacao, {criterio: pontos}), ...]}. Nunca lanca excecoes."""
-    resultado = {}
-    try:
-        with open(cfg["ficheiro_log"], encoding="utf-8", errors="replace") as f:
-            for linha in f:
-                if "ANALISE " not in linha or "/100 [" not in linha:
-                    continue
-                m = _ANALISE_LOG_RE.search(linha)
-                if not m:
-                    continue
-                pontos = {}
-                for parte in m.group(3).split():
-                    nome, _, valor = parte.rpartition("=")
-                    if nome and valor.replace(".", "", 1).isdigit():
-                        pontos[nome] = float(valor)
-                if pontos:
-                    resultado.setdefault(m.group(1), []).append((int(m.group(2)), pontos))
-    except (OSError, KeyError, TypeError):
-        pass
-    return resultado
-
-
-def _componentes(pc, do_log):
-    """Pontos de cada criterio deste sinal: os gravados no percurso, ou os do bot.log com a mesma pontuacao."""
-    comp = pc.get("comp")
-    if isinstance(comp, dict) and comp:
-        return {k: num(v) for k, v in comp.items()}
-    candidatos = do_log.get(pc.get("mint")) or []
-    iguais = [p for total, p in candidatos if total == int(num(pc.get("pontuacao"), -1))]
-    return (iguais or [p for _, p in candidatos] or [None])[-1]
-
-
-def _secao_pontuacao_por_criterio(percursos, regra, cfg):
-    """Que criterio da pontuacao separa os sinais bons dos maus? So relatorio."""
-    do_log = _componentes_do_log(cfg)
-    com = [(pc, c) for pc in percursos for c in [_componentes(pc, do_log)] if c]
-    L = ["", f"  PONTUACAO POR CRITERIO (o que distingue 70-79 de 80+?) - {len(com)} de {len(percursos)} sinais com detalhe"]
-    if not com:
-        return L + ["    Ainda sem dados: o detalhe vem do bot.log ou dos percursos gravados a partir de 17/11/2026."]
-    baixo = [c for pc, c in com if num(pc.get("pontuacao")) < 80]
-    alto = [c for pc, c in com if num(pc.get("pontuacao")) >= 80]
-    media = lambda grupo, k: sum(num(c.get(k)) for c in grupo) / len(grupo) if grupo else None
-    txt = lambda v: "   -  " if v is None else f"{v:5.1f}"
-    L.append(f"    {'criterio':<20} {'max':>3}  {'70-79':>6} {'80+':>6}   |  com MAIS pontos neste criterio  |  com MENOS pontos")
-    L.append(f"    {'':<20} {'':>3}  {f'({len(baixo)})':>6} {f'({len(alto)})':>6}   |  (a mediana conta como 'mais')  |")
-    for chave, nome, maximo in CRITERIOS_PONTUACAO:
-        valores = sorted(num(c.get(chave)) for _, c in com if chave in c)
-        if not valores:
-            continue
-        mediana = valores[len(valores) // 2]
-        mais = [pc for pc, c in com if chave in c and num(c.get(chave)) >= mediana]
-        menos = [pc for pc, c in com if chave in c and num(c.get(chave)) < mediana]
-        partes = []
-        for grupo in (mais, menos):
-            if grupo:
-                m, a = _medir(grupo, regra, cfg)
-                partes.append(f"{len(grupo):>3}: media {m:+7.2f}%  acerto {a:5.1f}%")
-            else:
-                partes.append(f"{'0':>3}: (todos iguais)            ")
-        L.append(f"    {nome:<20} {maximo:>3}  {txt(media(baixo, chave)):>6} {txt(media(alto, chave)):>6}   |  "
-                 + "  |  ".join(partes))
-    L += ["    Colunas 70-79 e 80+: pontos medios desse criterio em cada grupo. Um criterio que da mais pontos aos 80+",
-          "    e cujos sinais 'com mais pontos' correm pior e o candidato a estar a premiar a coisa errada.",
-          "    Com poucos sinais de cada lado, as diferencas sao sobretudo sorte."]
-    return L
-
-
-def _secao_filtros_a_testar(percursos, regra, cfg):
-    """Hipoteses de filtros aplicadas aos sinais ja gravados. Nenhuma esta ativa no bot."""
-    def f(pc, chave):
-        v = obter(pc, "feat", chave)
-        return num(v, None) if v is not None else None
-
-    def soma_h1(pc):
-        c, v = f(pc, "compras_h1"), f(pc, "vendas_h1")
-        return c + v if c is not None and v is not None else None
-
-    def compras_h1(pc):
-        total = soma_h1(pc)
-        return f(pc, "compras_h1") / total * 100 if total else None
-
-    def teste(valor, minimo=None, maximo=None):
-        def aplica(pc):
-            v = valor(pc)
-            if v is None:
-                return None
-            return (minimo is None or v >= minimo) and (maximo is None or v <= maximo)
-        return aplica
-
-    def autoridades(pc):
-        m = obter(pc, "obs", "mint")
-        if not isinstance(m, dict) or m.get("mint_authority") is None or m.get("freeze_authority") is None:
-            return None
-        return m.get("mint_authority") == "revoked" and m.get("freeze_authority") == "revoked"
-
-    externos = [
-        ("liquidez >= $25.000", teste(lambda pc: num(pc.get("liq0")) or None, 25000)),
-        ("idade 15 a 90 min", teste(lambda pc: f(pc, "idade_min"), 15, 90)),
-        ("market cap $50k a $1,5M", teste(lambda pc: f(pc, "fdv"), 50000, 1500000)),
-        ("volume 1h >= $15.000", teste(lambda pc: f(pc, "vol_h1"), 15000)),
-        ("transacoes 1h >= 50", teste(soma_h1, 50)),
-        ("subida 1h <= 80%", teste(lambda pc: f(pc, "h1"), None, 80)),
-        ("subida 5 min <= 40%", teste(lambda pc: f(pc, "m5"), None, 40)),
-    ]
-
-    def todos_juntos(pc):
-        r = [t(pc) for _, t in externos]
-        return None if any(x is None for x in r) else all(r)
-
-    testes = externos + [
-        ("os 7 de cima juntos", todos_juntos),
-        ("compras 1h <= 80%", teste(compras_h1, None, 80)),
-        ("pontuacao 70 a 79", teste(lambda pc: num(pc.get("pontuacao"), None), 70, 79)),
-        ("top10 sem a pool <= 40%", teste(_top10_sem_pool, None, 40)),
-        ("mint e freeze revogadas", autoridades),
-    ]
-    L = ["", f"  FILTROS A TESTAR (hipoteses; NENHUM esta ativo no bot) - {len(percursos)} sinais aprovados, regras atuais"]
-    for nome, aplica in testes:
-        resultados = [(pc, aplica(pc)) for pc in percursos]
-        ficam = [pc for pc, r in resultados if r is True]
-        saem = [pc for pc, r in resultados if r is False]
-        if not ficam and not saem:
-            L.append(f"    {nome:<26} ainda sem dados")
-            continue
-        partes = []
-        for rotulo, grupo in (("ficam", ficam), ("saem", saem)):
-            if grupo:
-                media, acerto = _medir(grupo, regra, cfg)
-                partes.append(f"{rotulo} {len(grupo):>3}: media {media:+7.2f}%  acerto {acerto:5.1f}%")
-            else:
-                partes.append(f"{rotulo}   0" + " " * 35)
-        L.append(f"    {nome:<26} " + "   |   ".join(partes))
-    L += ["    Um filtro so ajuda se os que FICAM forem claramente melhores do que os que SAEM, com dezenas de",
-          "    sinais de cada lado. Com poucos sinais, estas diferencas sao sobretudo sorte."]
-    return L
-
-
-def repetir_entrada_adiada(pc, regra, cfg, espera_seg, queda_max_pct):
-    """Laboratorio: em vez de comprar no sinal, espera `espera_seg` e so entra se o preco real (ponto fino)
-    nao tiver caido mais de `queda_max_pct` face ao preco do sinal. Devolve (estado, resultado em % ou None),
-    com estado "entrou", "evitada" ou "sem_dados" (sem ponto fino perto do fim da espera)."""
-    serie = _serie_fina(pc)
-    idx = next((i for i, p in enumerate(serie) if p[2] and p[0] >= espera_seg), None)
-    if idx is None or idx >= len(serie) - 1:
-        return "sem_dados", None
-    seg0, rel0, _ = serie[idx]
-    if seg0 > espera_seg + 60 or rel0 <= 0:
-        return "sem_dados", None
-    if rel0 < 1 - queda_max_pct / 100.0:
-        return "evitada", None
-    nova = [(0, 1.0, True)] + [(s - seg0, r / rel0, fino) for s, r, fino in serie[idx + 1:]]
-    return "entrou", repetir_serie(pc, nova, regra, cfg)[0]
-
-
-def _secao_entrada_adiada(percursos, regra, cfg):
-    """Esperar uns minutos antes de entrar ajudava? So nos percursos com pontos finos."""
-    com = [pc for pc in percursos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
-    L = ["", f"  ENTRADA ADIADA (hipotese; o bot NAO faz isto) - {len(com)} percursos com pontos finos, regras atuais"]
-    if not com:
-        return L + ["    Ainda sem dados: precisa de percursos com pontos finos."]
-    imediato = {id(pc): repetir_serie(pc, _serie_fina(pc), regra, cfg)[0] for pc in com}
-    media = lambda valores: sum(valores) / len(valores)
-    L.append(f"    entrar logo no sinal (referencia)      {len(com):>3} entradas   media {media(list(imediato.values())):+7.2f}%")
-    for espera, queda in ((60, 5), (120, 5), (180, 5), (300, 5), (180, 0), (180, 100)):
-        r = [(pc, *repetir_entrada_adiada(pc, regra, cfg, espera, queda)) for pc in com]
-        entrou = [x[2] for x in r if x[1] == "entrou"]
-        evitadas = [imediato[id(x[0])] for x in r if x[1] == "evitada"]
-        sem = sum(1 for x in r if x[1] == "sem_dados")
-        condicao = ("sem condicao" if queda >= 100 else "se nao caiu" if queda == 0 else f"se caiu menos de {queda}%")
-        linha = f"    esperar {espera // 60} min, {condicao:<21} {len(entrou):>3} entradas"
-        linha += f"   media {media(entrou):+7.2f}%" if entrou else "   media     -   "
-        linha += f"   | evitadas {len(evitadas)}" + (f" (dariam {media(evitadas):+.2f}% entrando logo)" if evitadas else "")
-        L.append(linha + (f"   | sem dados {sem}" if sem else ""))
-    L += ["    'evitadas' = sinais em que nao se entrava; entre parenteses, o que deram a quem entrou logo.",
-          "    O preco de entrada adiada e o de VENDA no Jupiter (um pouco abaixo do de compra): resultado algo otimista.",
-          "    Adiar so ajuda se as entradas ficarem melhores E as evitadas forem as mas. Com poucos percursos e sorte."]
-    return L
-
-
-def _secao_carteiras(todos, regra, cfg):
-    """Carteiras seguidas (wallet_watchlist.json) e donos que se repetem nos sinais. So observacao."""
-    L = ["", "  CARTEIRAS (so observacao: nada disto decide compras)"]
-    com = [pc for pc in todos if obter(pc, "obs", "carteiras", "estado") in ("ok", "parcial")]
-    if com:
-        dentro = lambda pc: int(num(obter(pc, "obs", "carteiras", "dentro")))
-        L.append(f"    Carteiras seguidas: {len(com)} percursos com a lista consultada (aprovados + controlo)")
-        for nome, escolhe in (("nenhuma carteira seguida dentro", lambda pc: dentro(pc) == 0),
-                              ("1 carteira seguida dentro", lambda pc: dentro(pc) == 1),
-                              ("2 ou mais dentro", lambda pc: dentro(pc) >= 2)):
-            grupo = [pc for pc in com if escolhe(pc)]
-            if grupo:
-                L.append(_linha_grupo(nome, grupo, regra, cfg))
-    else:
-        L.append("    Carteiras seguidas: ainda sem dados (wallet_watchlist.json vazio, ou sem sinais desde que existe).")
-    vistos, com_donos = {}, 0
-    for pc in todos:
-        top = obter(pc, "obs", "holders", "top")
-        if not isinstance(top, list):
-            continue
-        com_donos += 1
-        subiu = max(num(p[1]) for p in pc["pts"]) >= 1.5
-        donos = {x[0] for x in top if isinstance(x, list) and len(x) == 2 and isinstance(x[0], str)
-                 and x[0] and x[0] != pc.get("par")}
-        for dono in donos:
-            registo = vistos.setdefault(dono, [0, 0, 0])
-            registo[0] += 1
-            registo[1] += 1 if subiu else 0
-            registo[2] += 1 if pc.get("fim") != "tempo" else 0
-    repetidos = sorted(((d, r) for d, r in vistos.items() if r[0] >= 3),
-                       key=lambda x: (-x[1][1] / x[1][0], -x[1][0], x[0]))
-    L.append(f"    Donos que se repetem entre as maiores contas ({com_donos} percursos com dados; minimo 3 aparicoes):")
-    if not repetidos:
-        L.append("      Ainda nenhum: precisa de mais sinais gravados (os donos sao guardados desde 15/11/2026).")
-    for dono, (n, subiram, rugs) in repetidos[:12]:
-        L.append(f"      {dono:<44} {n:>3} sinais   {subiram:>2} chegaram a +50%   {rugs:>2} acabaram em rug")
-    L += ["    Um dono repetido pode ser uma boa carteira, mas tambem um bot, uma bolsa, a propria DEX ou o criador",
-          "    dos tokens. Com poucas aparicoes e sobretudo sorte: serve para escolher candidatas, nao para copiar."]
-    return L
-
-
-def _secao_observacao_extra(percursos, regra, cfg):
-    """Laboratorio: cruza a observacao extra (so leitura) com o resultado real dos percursos."""
-    com = [pc for pc in percursos if isinstance(pc.get("obs"), dict)]
-    L = ["", f"  OBSERVACAO EXTRA (holders, mint e Jupiter) - {len(com)} de {len(percursos)} percursos com dados"]
-    if not com:
-        return L + ["    Ainda sem dados: so os percursos gravados depois desta versao os tem."]
-
-    def grupo(nome, sel):
-        g = [pc for pc in com if sel(pc)]
-        if not g:
-            return
-        media, acerto = _medir(g, regra, cfg)
-        maxi = sum(max(p[1] for p in pc["pts"]) for pc in g) / len(g)
-        L.append(f"    {nome:<34} {len(g):>4}   media {media:+6.2f}%   acerto {acerto:5.1f}%   pico medio {100 * (maxi - 1):+6.1f}%")
-
-    top10 = lambda pc: num(obter(pc, "obs", "holders", "top10_pct"), -1)
-    grupo("top10 holders <= 40%", lambda pc: 0 <= top10(pc) <= 40)
-    grupo("top10 holders 40-70%", lambda pc: 40 < top10(pc) <= 70)
-    grupo("top10 holders > 70%", lambda pc: top10(pc) > 70)
-
-    def sem_pool(pc):  # top 10 sem a conta da pool (que costuma ser o maior "holder"); None se nao der para saber
-        top, pool = obter(pc, "obs", "holders", "top"), pc.get("par")
-        validos = [x for x in top if isinstance(x, list) and len(x) == 2] if isinstance(top, list) else []
-        if not pool or not any(x[0] == pool for x in validos):
-            return None
-        return sum(num(x[1]) for x in [x for x in validos if x[0] != pool][:10])
-
-    com_donos = [pc for pc in com if isinstance(obter(pc, "obs", "holders", "top"), list)]
-    if com_donos:
-        L.append(f"    Donos das maiores contas: {len(com_donos)} percursos com dados; pool do par identificada em "
-                 f"{sum(1 for pc in com_donos if sem_pool(pc) is not None)}")
-        grupo("top10 SEM a pool <= 25%", lambda pc: sem_pool(pc) is not None and sem_pool(pc) <= 25)
-        grupo("top10 SEM a pool 25-50%", lambda pc: sem_pool(pc) is not None and 25 < sem_pool(pc) <= 50)
-        grupo("top10 SEM a pool > 50%", lambda pc: sem_pool(pc) is not None and sem_pool(pc) > 50)
-    estado_auth = lambda pc, k: obter(pc, "obs", "mint", k)
-    grupo("mint ou freeze authority ATIVA", lambda pc: "active" in (estado_auth(pc, "mint_authority"), estado_auth(pc, "freeze_authority")))
-    grupo("mint e freeze authority revogadas", lambda pc: estado_auth(pc, "mint_authority") == "revoked" and estado_auth(pc, "freeze_authority") == "revoked")
-    reais = [(num(obter(pc, "obs", "jupiter", "slippage_real_pct"), None), num(obter(pc, "obs", "slippage_simulado_pct"), None)) for pc in com]
-    reais = [(r, s) for r, s in reais if r is not None and s is not None]
-    if reais:
-        L.append(f"    Slippage de entrada: simulado medio {sum(s for _, s in reais) / len(reais):.2f}%   "
-                 f"real Jupiter medio {sum(r for r, _ in reais) / len(reais):.2f}%   ({len(reais)} cotacoes)")
-    L.append("    (So observacao: estes dados ainda nao filtram compras.)")
-    return L
+import laboratorio as _laboratorio  # noqa: E402  (o laboratorio, separado do bot.py a 21/11/2026)
+_laboratorio.ligar(globals())
+from laboratorio import (  # noqa: E402,F401  (os mesmos nomes de sempre continuam em bot.*)
+    _serie_fina,
+    repetir_serie,
+    _mediana,
+    HIPOTESES_CONGELADAS,
+    _secao_hipoteses_congeladas,
+    HIPOTESES_ENTRADA,
+    HIPOTESES_SAIDA_D,
+    _pts_finos,
+    _secao_hipoteses_saida_d,
+    _secao_hipoteses_entrada,
+    _secao_pontos_finos,
+    _secao_por_dia,
+    repetir_avancado,
+    _medir_avancado,
+    _secao_estrategia_post,
+    ler_percursos,
+    _medir,
+    _regra_txt,
+    analisar,
+    _secao_manuais,
+    _linha_grupo,
+    _secao_controlo,
+    _secao_caracteristicas,
+    _top10_sem_pool,
+    CRITERIOS_PONTUACAO,
+    _ANALISE_LOG_RE,
+    _componentes_do_log,
+    _componentes,
+    _secao_pontuacao_por_criterio,
+    _secao_filtros_a_testar,
+    repetir_entrada_adiada,
+    _secao_entrada_adiada,
+    _secao_carteiras,
+    _secao_observacao_extra,
+)
 
 
 def _pedido_de_paragem(*_):

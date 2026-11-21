@@ -56,7 +56,7 @@ class _AutoApprovalFixture:
         result, self.pending = self.pending, []
         return result
 
-    def consume(self, token, mint, pair, amount=None):
+    def consume(self, token, mint, pair, amount=None, plano_novo_ok=False):
         if token in self.used or not token or not token.startswith("fixture-token-"):
             return False
         self.used.add(token)
@@ -184,7 +184,8 @@ def novo_bot(pasta, limpar=True):
                painel_web=False, porta_web=0, ficheiro_percursos=os.path.join(pasta, "percursos.jsonl"),
                # os testes usam regras fixas, independentes dos valores por defeito do bot
                stop_loss_pct=-6.0, take_profit_pct=25.0, trailing_ativar_pct=10.0, trailing_distancia_pct=8.0,
-               tempo_maximo_min=60, percurso_minutos=90)
+               tempo_maximo_min=60, percurso_minutos=90,
+               entrada_queda_ativa=False)  # os testes antigos propoem logo; a entrada na queda tem teste proprio
     # Test-only approved ceiling. The project operational config remains unset and fail-closed.
     PTL.APPROVED_MAX_SLIPPAGE_PCT = Decimal("95")
     policy_path = os.path.join(pasta, "config_operacoes.json")
@@ -1943,6 +1944,133 @@ def t_cinco_posicoes(pasta):
     pol["max_open_positions"] = 6                                            # acima do teto: compras bloqueadas
     json.dump(pol, open(caminho, "w", encoding="utf-8"))
     assert bot.executor.pode_comprar()[0] == 0
+
+
+def t_compra_manual_valor_escolhido(pasta):
+    bot, cfg = novo_bot(pasta)
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    listar("VALO")
+    m = mint_de("VALO")
+    for mau in ("9", "0,5", "abc", "nan", True):                            # fora de 1..5 EUR: recusado
+        assert not bot.pedir_compra_manual(m, "dashboard", mau)[0]
+    ok, msg = bot.pedir_compra_manual(m, "dashboard", "2,5")
+    assert ok and "2,50 €" in msg
+    assert bot._processar_compras_manuais() == 1
+    mexer("VALO", preco=0.00102)                                          # +2% antes de aprovares: ainda aceite
+    bot.ciclo_risco()
+    bot._processar_respostas_aprovacao()
+    pos = bot.estado["posicoes"][m]
+    alvo = bot.executor.valor_usd_de_eur(B.Decimal("2.50"))
+    assert alvo and abs(pos["custo"] - alvo) < 1e-6 and alvo < bot.executor.valor_usd_de_eur(B.Decimal("5"))
+    assert abs(pos["preco_entrada"] - 0.00102) < 1e-12
+    assert any("preço mudou +2.00%" in x for x in enviados)
+
+
+def t_tolerancia_preco_na_aprovacao(pasta):
+    bot, cfg = novo_bot(pasta)
+    m = mint_de("TOLE")
+    plano = lambda preco, liq=60000: bot.executor.preparar_execucao(m, par("TOLE", preco=preco, liq=liq), 5.0).canonical_json
+    base = plano(0.001)
+    assert abs(bot._variacao_tolerada(base, plano(0.00102)) - 2.0) < 1e-9   # +2%: aceite
+    assert bot._variacao_tolerada(base, plano(0.00104)) is None             # +4%: anulada como antes
+    assert bot._variacao_tolerada(base, plano(0.0009)) < 0                  # desceu: sempre aceite
+    assert bot._variacao_tolerada(base, plano(0.001, liq=40000)) is None    # liquidez -33%: anulada
+    outro = bot.executor.preparar_execucao(m, par("TOLE", preco=0.001), 4.0).canonical_json
+    assert bot._variacao_tolerada(base, outro) is None                      # valor diferente: anulada
+
+
+def t_stop_escolhido_e_venda_de_parte(pasta):
+    bot, cfg = novo_bot(pasta)
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    listar("BOM")
+    assert bot.ciclo_scanner() == 1
+    m = mint_de("BOM")
+    pos = bot.estado["posicoes"][m]
+    assert pos.get("origem") != "manual"                                   # compra do sinal
+    for mau in ("abc", "-60", 70, True, None):
+        assert not bot.pedir_stop(m, mau, "dashboard")[0]
+    assert not bot.pedir_stop(mint_de("NADA"), -10)[0]                     # sem posicao
+    ok, msg = bot.pedir_stop(m, "18", "telegram")                          # sem sinal = -18%
+    assert ok and "-18%" in msg
+    assert bot._processar_stops() == 1
+    assert pos["stop_manual_pct"] == -18 and pos["origem"] == "manual"      # passa a contar a parte
+    bot.atualizar_snapshot()
+    snap = json.loads(bot.snapshot)["posicoes"][0]
+    assert snap["regras_saida"]["stop_loss_pct"] == -18 and snap["stop_manual"] is True
+    mexer("BOM", preco=0.00086)                                            # -14%: o stop da estrategia venderia
+    avancar(1); bot.ciclo_risco()
+    assert m in bot.estado["posicoes"]                                     # o teu stop -18% ainda nao
+    # vender uma parte
+    assert not bot.pedir_venda(m, "dashboard", parcial=30)[0]
+    tokens0, saldo0 = pos["tokens"], bot.estado["saldo"]
+    assert bot.pedir_venda(m, "dashboard", parcial=25)[0]
+    assert bot._processar_vendas_manuais() == 1
+    pos = bot.estado["posicoes"][m]
+    assert abs(pos["tokens"] - tokens0 * 0.75) < 1e-6 and bot.estado["saldo"] > saldo0
+    venda = [r for r in trades(cfg) if r["tipo"] == "VENDA"][-1]
+    assert venda["motivo"] == "PARCIAL 25% [manual]"
+    assert any("VENDA PARCIAL" in x and "25%" in x for x in enviados)
+    # stop acima do preco atual: vende logo, com o motivo do teu stop
+    assert "vende já" in bot.pedir_stop(m, 0, "dashboard")[1]
+    bot._processar_stops()
+    avancar(1); bot.ciclo_risco()
+    assert m not in bot.estado["posicoes"]
+    final = [r for r in trades(cfg) if r["tipo"] == "VENDA"][-1]
+    assert final["motivo"].startswith("STOP_MANUAL") and final["motivo"].endswith("[manual]")
+    assert B.motivo_legivel("STOP_MANUAL -14.0% (stop +0%)") == "o teu stop +0% (preço a -14.0%)"
+
+
+def t_entrada_na_queda(pasta):
+    bot, cfg = novo_bot(pasta)
+    cfg["entrada_queda_ativa"] = True
+    enviados = []
+    bot.telegram.enviar = lambda texto, *a, **k: enviados.append(texto)
+    listar("QUED")
+    m = mint_de("QUED")
+    assert bot.ciclo_scanner() == 0                                      # aprovado, mas sem proposta ainda
+    assert bot.estado["posicoes"] == {} and m in bot._espera_queda and m in bot.estado["percursos"]
+    assert any("esperar uma queda de 15–35%" in x for x in enviados)
+    assert bot.estado["sinais"][-1]["mint"] == m
+    mexer("QUED", preco=0.0012)                                          # sobe: novo pico
+    avancar(1); bot.ciclo_risco()
+    assert bot.estado["posicoes"] == {} and abs(bot._espera_queda[m]["pico"] - 0.0012) < 1e-12
+    mexer("QUED", preco=0.00108)                                         # -10% do pico: ainda nao
+    avancar(1); bot.ciclo_risco()
+    assert bot.estado["posicoes"] == {} and m in bot._espera_queda
+    mexer("QUED", preco=0.00096)                                         # -20% do pico: propoe (a fixture aprova)
+    avancar(1); bot.ciclo_risco()
+    assert m not in bot._espera_queda
+    pos = bot.estado["posicoes"][m]
+    assert abs(pos["preco_entrada"] - 0.00096) < 1e-12 and pos.get("origem") != "manual"
+    assert bot.estado["sinais"][-1]["proposal_id"]
+    # caiu demais (>35%) e nao voltou: sem proposta; fim do prazo: desiste
+    bot2, cfg2 = novo_bot(pasta)
+    cfg2["entrada_queda_ativa"] = True
+    listar("FACA")
+    m2 = mint_de("FACA")
+    assert bot2.ciclo_scanner() == 0
+    mexer("FACA", preco=0.0005)                                          # -50%: faca a cair
+    avancar(1); bot2.ciclo_risco()
+    assert bot2.estado["posicoes"] == {} and m2 in bot2._espera_queda
+    bot2._espera_queda[m2]["fim"] = 0; bot2.ciclo_risco()                  # fim do prazo (sem mexer no relogio)
+    assert m2 not in bot2._espera_queda and bot2.estado["posicoes"] == {}
+    # a espera fica no estado.json: continua depois de um reinicio
+    listar("GUAR")
+    assert bot2.ciclo_scanner() == 0 and mint_de("GUAR") in bot2._espera_queda
+    bot2.guardar()
+    bot2.atualizar_snapshot()
+    snap = json.loads(bot2.snapshot)
+    assert snap["espera_queda"][0]["simbolo"] == "GUAR" and snap["entrada_queda"] == [15, 35]
+    bot3, _ = novo_bot(pasta, limpar=False)
+    assert mint_de("GUAR") in bot3._espera_queda
+    # hipoteses de saida para a entrada D: so a partir do sinal 130
+    pcs = [{"pts": [[0, 1.0], [60, 1.2], [120, 0.95], [600, 1.3], [3600, 1.0]], "feat": {"idade_min": 40},
+            "fim": "tempo", "grupo": "sinal"}] * 3
+    txt = "\n".join(B._secao_hipoteses_saida_d(pcs, cfg2, dict(B.HIPOTESES_SAIDA_D, desde_sinal=1)))
+    assert "D + saidas atuais (referencia)" in txt and "E) stop -30%" in txt and "faltam 27" in txt
+    assert "Ainda nao ha sinais novos" in "\n".join(B._secao_hipoteses_saida_d(pcs, cfg2))
 
 
 def main():

@@ -218,7 +218,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
         self.assertEqual(limits["mode"], "paper")
         self.assertIs(limits["live_trading_enabled"], False)
         self.assertEqual(limits["max_eur_per_operation"], Decimal("5.0"))
-        self.assertEqual(limits["max_open_positions"], 1)
+        self.assertEqual(limits["max_open_positions"], 5)
         self.assertTrue(limits["reject_duplicate_orders"])
 
     def test_ecb_csv_parses_usd_per_eur_and_accepts_fresh_reference_day(self):
@@ -502,7 +502,7 @@ class PaperTradingLimitsTests(unittest.TestCase):
         instance = bot.Bot(cfg)
         try:
             data = json.loads(instance.snapshot)
-            self.assertEqual(data["limites_operacionais"]["max_open_positions"], 1)
+            self.assertEqual(data["limites_operacionais"]["max_open_positions"], 5)
             self.assertEqual(data["limites_operacionais"]["max_eur_per_operation"], "5")
             self.assertEqual(data["limites_operacionais"]["fx_status"], "valida")
             self.assertEqual(data["limites_operacionais"]["fx_usd_per_eur"], "1.2")

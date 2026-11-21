@@ -178,23 +178,54 @@ class TelegramBotoesTests(unittest.TestCase):
         tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
                                   post=self.api, analisar=lambda txt: ("ANALISE", mint), em_fundo=False,
                                   vender=lambda m: (True, "ok"), posicao_aberta=lambda m: True,
-                                  comprar=lambda m: (compras.append(m), (True, "A preparar a proposta"))[1],
+                                  comprar=lambda m, v=None: (compras.append((m, v)), (True, "A preparar a proposta"))[1],
                                   recuperar=lambda m: (recuperar.append(m), (True, "pedido registado"))[1],
                                   pode_recuperar=lambda m: True)
         msg = {"update_id": 5, "message": {"text": mint, "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
         tg.processar(msg)
         teclado = [j for m, j in self.api.pedidos if m == "sendMessage"][-1]["reply_markup"]["inline_keyboard"]
         self.assertIn("c:" + mint, [b["callback_data"] for linha in teclado for b in linha])
-        self.assertEqual(tg.processar(clique("c:" + mint, update_id=6)), "comprar")
-        self.assertEqual(compras, [mint])
+        self.assertEqual(tg.processar(clique("c:" + mint, update_id=6)), "escolher_valor")   # primeiro o valor
+        self.assertEqual(compras, [])
+        self.assertEqual(tg.processar(clique("x:" + mint, update_id=61)), "valor_cancelado")
+        self.assertEqual(tg.processar(clique("o:" + mint, update_id=62)), "outro_valor")
+        self.assertEqual(tg.processar(clique("e3:" + mint, update_id=63)), "comprar")
+        self.assertEqual(tg.processar(clique("e9:" + mint, update_id=64)), "invalido")
+        cmd = lambda t, u: {"update_id": u, "message": {"text": t, "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
+        self.assertEqual(tg.processar(cmd("/comprar " + mint + " 2,5", 65)), "comprar")
+        self.assertEqual(tg.processar(cmd("/comprar " + mint, 66)), "escolher_valor")
+        self.assertEqual(compras, [(mint, 3), (mint, "2,5")])
         self.assertEqual(tg.processar(clique("c:" + mint, de="111", update_id=7)), "nao_autorizado")
         self.assertEqual(tg.processar(clique("p:" + mint, update_id=8)), "confirmar_recuperar")
         self.assertEqual(recuperar, [])                                     # so depois do "Sim"
         self.assertEqual(tg.processar(clique("k:" + mint, update_id=9)), "venda_cancelada")
         self.assertEqual(tg.processar(clique("z:" + mint, update_id=10)), "recuperar")
         self.assertEqual(recuperar, [mint])
-        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint, recuperar=True)), 2)
-        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint)), 1)
+        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint, recuperar=True)), 4)
+        self.assertEqual(len(bot.TelegramDecisoes.botoes_venda(mint)), 3)
+
+    def test_vender_parte_e_mudar_stop(self):
+        mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+        vendas, stops = [], []
+        tg = bot.TelegramDecisoes("123:abc", CHAT, lambda pid, d: (True, "ok"), self.manager.esta_pendente,
+                                  post=self.api, analisar=lambda txt: ("ANALISE", mint), em_fundo=False,
+                                  vender=lambda m, f=None: (vendas.append((m, f)), (True, "pedido registado"))[1],
+                                  posicao_aberta=lambda m: True,
+                                  stop=lambda m, v: (stops.append((m, v)), (True, "stop mudado"))[1])
+        self.assertEqual(tg.processar(clique("h25:" + mint, update_id=20)), "confirmar_parte")
+        self.assertEqual(vendas, [])                                       # so depois do "Sim"
+        self.assertEqual(tg.processar(clique("g25:" + mint, update_id=21)), "vender_parte")
+        self.assertEqual(tg.processar(clique("g30:" + mint, update_id=22)), "invalido")
+        self.assertEqual(vendas, [(mint, 25)])
+        self.assertEqual(tg.processar(clique("t:" + mint, update_id=23)), "escolher_stop")
+        self.assertEqual(tg.processar(clique("u-15:" + mint, update_id=24)), "stop")
+        self.assertEqual(tg.processar(clique("u10:" + mint, update_id=25)), "stop")
+        self.assertEqual(tg.processar(clique("j:" + mint, update_id=26)), "stop_outro")
+        cmd = lambda t, u: {"update_id": u, "message": {"text": t, "from": {"id": int(CHAT)}, "chat": {"id": int(CHAT)}}}
+        self.assertEqual(tg.processar(cmd("/stop " + mint + " -18%", 27)), "stop")
+        self.assertEqual(tg.processar(cmd("/stop " + mint, 28)), "stop_ajuda")
+        self.assertEqual(stops, [(mint, -15), (mint, 10), (mint, "-18")])
+        self.assertEqual(tg.processar(clique("u-15:" + mint, de="111", update_id=29)), "nao_autorizado")
 
     def test_parar_acompanhamento(self):
         mint = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"

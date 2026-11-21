@@ -86,9 +86,11 @@ class DecisaoDashboardTests(unittest.TestCase):
         self.stub = stub
         stub.info_acompanhados = [{"simbolo": "VEXA", "agora_pct": 12.5}]
         stub.manuais = []
-        stub.pedir_compra_manual = lambda mint, origem: (stub.manuais.append(("comprar", mint, origem)), (True, "proposta"))[1]
+        stub.pedir_compra_manual = lambda mint, origem, valor=None: (
+            stub.manuais.append(("comprar", mint, origem) + ((valor,) if valor is not None else ())), (True, "proposta"))[1]
         stub.pedir_venda = lambda mint, origem, parcial=False: (
-            stub.manuais.append(("recuperar" if parcial else "vender", mint, origem)), (True, "pedido"))[1]
+            stub.manuais.append(("recuperar" if parcial is True else "vender", mint, origem)
+                                + ((parcial,) if parcial not in (True, False) else ())), (True, "pedido"))[1]
         stub.manuais_terminados = []
         stub.analise_manual = AnaliseFalsa({"analise_manual": True, "analise_manual_intervalo_seg": 0}, lambda: None)
         bot.iniciar_painel_web(stub)
@@ -215,6 +217,15 @@ class DecisaoDashboardTests(unittest.TestCase):
             self.assertEqual(self.post(porta, {"acao": acao, "mint": mint}, caminho="/api/manual")[0], 200)
         self.assertEqual(self.stub.manuais, [("comprar", mint, "dashboard"), ("vender", mint, "dashboard"),
                                              ("recuperar", mint, "dashboard")])
+        self.assertEqual(self.post(porta, {"acao": "comprar", "mint": mint, "valor_eur": 2.5}, caminho="/api/manual")[0], 200)
+        self.assertEqual(self.stub.manuais[-1], ("comprar", mint, "dashboard", 2.5))
+        self.assertEqual(self.post(porta, {"acao": "comprar", "mint": mint, "valor_eur": [5]}, caminho="/api/manual")[0], 400)
+        self.stub.pedir_stop = lambda mint, v, origem: (self.stub.manuais.append(("stop", mint, v)), (True, "ok"))[1]
+        self.assertEqual(self.post(porta, {"acao": "stop", "mint": mint, "stop_pct": -18}, caminho="/api/manual")[0], 200)
+        self.assertEqual(self.post(porta, {"acao": "stop", "mint": mint, "stop_pct": "x"}, caminho="/api/manual")[0], 400)
+        self.assertEqual(self.post(porta, {"acao": "vender", "mint": mint, "fracao": 25}, caminho="/api/manual")[0], 200)
+        self.assertEqual(self.post(porta, {"acao": "vender", "mint": mint, "fracao": 33}, caminho="/api/manual")[0], 400)
+        self.assertEqual(self.stub.manuais[-2:], [("stop", mint, -18), ("vender", mint, "dashboard", 25)])
         self.assertEqual(manager.drain_results(), [])                      # o dashboard nunca aprova nada sozinho
 
     def test_pagina_recebe_chave_da_sessao_e_so_tem_um_post(self):

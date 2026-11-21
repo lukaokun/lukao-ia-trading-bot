@@ -124,3 +124,31 @@ python teste_offline.py
 Estado, histórico de operações, logs, bases SQLite, fixtures, watchlists reais, credenciais e backups são dados locais e estão excluídos pelo `.gitignore`. Não confie apenas no `.gitignore`: reveja o conteúdo e os ficheiros staged antes de cada commit. A configuração de exemplo e `wallet_watchlist.example.json` contêm apenas parâmetros sanitizados/placeholders.
 
 `AUDITORIA_FASE1.md` e `AUDITORIA_INTEGRACAO_V7.md` são relatórios históricos, não especificações do estado atual. `REQUISITOS_OPERACAO_MANUAL.md` descreve requisitos futuros, não autoriza nem ativa execução real.
+
+## Valor escolhido nas compras à mão e tolerância de preço (19/11/2026)
+
+- Compras à mão: escolhes o valor de 1 € a 5 € (máximo por operação continua 5 €). Dashboard: botões 1–5 € ou valor livre. Telegram: botões 1–5 € depois de "Comprar", ou `/comprar <endereço> <valor>`.
+- O valor escolhido é uma ordem completa desse tamanho (sem compras parciais); nunca acima do máximo permitido.
+- Ao aprovares uma proposta, se o preço mudou: aceita se desceu ou subiu até `tolerancia_preco_aprovacao_pct` (3%) e a liquidez não caiu mais de `tolerancia_liquidez_aprovacao_pct` (20%). O limite de slippage continua a ser verificado. Senão é anulada como antes. A variação aparece no registo e no Telegram.
+
+## Stop-loss escolhido por ti e vender parte da posição (19/11/2026)
+
+- Em qualquer posição aberta podes mudar o stop-loss quando quiseres, de -50% a +50% face à entrada (acima de 0 garante lucro). Dashboard: janela "Ver ao vivo" e painel Acompanhados. Telegram: botão "🛑 Mudar stop-loss" nas mensagens de compra, ou `/stop <endereço> <valor>` (sem sinal conta como negativo).
+- Se o preço já estiver abaixo do novo stop, a posição vende no ciclo seguinte (o dashboard pede confirmação).
+- Vender parte: 10%, 25%, 50% ou 75% dos tokens, com confirmação. O resto continua aberto com as mesmas regras.
+- Uma posição do bot onde mudes o stop ou vendas uma parte passa a contar como decisão tua ([manual]): sai das estatísticas da estratégia no laboratório. Os percursos do laboratório não mudam.
+- A venda pelo teu stop aparece como `STOP_MANUAL`.
+
+## Entrada na queda (hipótese D) — 21/11/2026
+
+- Com 52 sinais novos, a hipótese D (entrar só depois de o preço recuar 15–35% desde o pico após o sinal) deu +3,5% por trade contra −5,3% das regras atuais, sem deixar sinais de fora. A C (só tokens com 30 min ou mais) não passou (deixa 73% de fora e perdeu força).
+- O laboratório mede agora também a D com pontos finos (`D com pontos finos (custos simulados)`).
+- Com `entrada_queda_ativa` (ligado), um sinal aprovado é registado e o percurso começa logo, mas a proposta só é enviada quando o preço recuar 15–35% desde o pico; se recuar mais de 35%, espera que volte à zona. Desiste ao fim de 180 min ou se a liquidez cair abaixo do mínimo de rug. Recebes no Telegram "⏳ aprovado, à espera da queda". A confirmação manual (90 s), os 5 EUR e o resto das verificações são as mesmas. As saídas não mudam.
+- A lista de espera fica em memória: num reinício, os sinais à espera perdem-se.
+
+## 21/11/2026 — espera persistida, hipóteses de saída para a D, laboratório separado
+
+- Os sinais à espera da queda ficam no `estado.json` (`espera_queda`) e continuam depois de um reinício.
+- Dashboard: no painel "Posição aberta" aparece a caixa "⏳ À espera da queda" com cada token, o recuo atual desde o pico e os minutos que faltam.
+- Laboratório: secção nova `HIPOTESES DE SAIDA PARA A ENTRADA D`, congelada a 21/11/2026 com os primeiros 129 sinais e medida só a partir do 130.º: E) stop −30% / alvo +25% / 120 min; F) stop −20% / alvo +50% / 120 min; referência = D com as saídas atuais. Só passam se ganharem com pontos normais E com pontos finos, com 30+ sinais novos.
+- O laboratório saiu do `bot.py` para `laboratorio.py`, sem mudar nenhum cálculo (o relatório sai igual; os nomes continuam disponíveis em `bot.*`).
