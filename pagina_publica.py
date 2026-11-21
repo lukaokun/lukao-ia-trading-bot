@@ -389,10 +389,17 @@ class Handler(BaseHTTPRequestHandler):
             if e is None:
                 return self._enviar(503, '{"erro":"bot indisponivel"}', "application/json")
             return self._enviar(200, e, "application/json; charset=utf-8")
-        if caminho == "/assets/mascote_oficial.png":
+        # Lista fechada de imagens publicas: nao expor outros ficheiros de assets.
+        imagens_publicas = {
+            "/assets/mascote_oficial.png": "mascote_oficial.png",
+            "/assets/obito-header.png": "obito-header.png",
+            "/assets/obito-arena.png": "obito-arena.png",
+        }
+        if caminho in imagens_publicas:
             try:
-                with open(os.path.join(self.pasta, "assets", "mascote_oficial.png"), "rb") as f:
-                    return self._enviar(200, f.read(3_000_000), "image/png")
+                nome = imagens_publicas[caminho]
+                with open(os.path.join(self.pasta, "assets", nome), "rb") as f:
+                    return self._enviar(200, f.read(8_000_000), "image/png")
             except OSError:
                 return self._enviar(404, "nao encontrado", "text/plain; charset=utf-8")
         if caminho == "/dados.json":
