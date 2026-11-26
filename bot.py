@@ -148,7 +148,7 @@ CONFIG = {
     "acompanhar_stop_alternativo_pct": -25,
     "tolerancia_preco_aprovacao_pct": 3.0,   # ao aprovares: aceita se o preco subiu ate isto (ou desceu) desde a proposta
     "tolerancia_liquidez_aprovacao_pct": 20.0,  # ... e se a liquidez nao caiu mais do que isto; senao anula como antes
-    "entrada_queda_ativa": True,       # hipotese D (validada a 21/11/2026): so propoe a compra de um sinal
+    "entrada_queda_ativa": False,      # hipotese D: desligada a 26/11/2026 (nos sinais 130-195 perdeu para a entrada logo no sinal)
     "entrada_queda_min_pct": 15.0,     # ... depois de o preco recuar 15-35% desde o pico apos o sinal
     "entrada_queda_max_pct": 35.0,
     "entrada_queda_espera_min": 180.0,  # ... e desiste se isso nao acontecer neste prazo

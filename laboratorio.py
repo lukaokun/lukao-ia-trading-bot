@@ -168,6 +168,43 @@ HIPOTESES_SAIDA_D = {
 }
 
 
+# 4.o conjunto (26/11/2026, com os primeiros 195 sinais): a entrada D falhou e foi desligada; a prova dos nove
+# passou pela 1.a vez com esta saida. Entrada logo no sinal. NAO se muda; mede-se do 196.o sinal em diante.
+HIPOTESES_SAIDA_G = {
+    "data": "26/11/2026",
+    "desde_sinal": 196,
+    "minimo": 30,
+    "regra": (-20, 25, 0, 0, 30),     # G) stop -20%, alvo +25%, sem trailing, 30 min
+}
+
+
+def _secao_hipoteses_saida_g(percursos, atual, cfg, h=None):
+    """Saida G (entrada logo no sinal), medida so nos sinais que chegaram depois de escrita."""
+    h = h or HIPOTESES_SAIDA_G
+    novos = percursos[h["desde_sinal"] - 1:]
+    L = ["", f"  HIPOTESE DE SAIDA G (escrita a {h['data']} com os primeiros {h['desde_sinal'] - 1} sinais;"
+         " medida SO nos sinais seguintes; entrada logo no sinal)"]
+    if not novos:
+        return L + [f"    Ainda nao ha sinais novos (comecam no {h['desde_sinal']}.o)."]
+    g = h["regra"]
+    com = [pc for pc in novos if isinstance(pc.get("ptsj"), list) and len(pc["ptsj"]) >= 2]
+    valor = max(0.01, num(cfg.get("percurso_fino_valor_usd"), 5.5))
+
+    def finos(regra, custos):
+        r = [repetir_serie(pc, _serie_fina(pc), regra, cfg, valor_usd=valor, custos=custos)[0] for pc in com]
+        return f"{sum(r) / len(r):+7.2f}%" if r else "   sem dados"
+    L.append(f"    Sinais novos: {len(novos)} (do {h['desde_sinal']}.o em diante); {len(com)} com pontos finos")
+    for nome, regra in (("regras atuais (referencia)", atual), ("G) stop -20% / alvo +25% / 30 min", g)):
+        m, a = _medir(novos, regra, cfg)
+        L.append(f"    {nome:<36}{len(novos):>3} trades   acerto {a:5.1f}%   media {m:+7.2f}%"
+                 f"   | finos {finos(regra, 'simulados')}   finos+reais {finos(regra, 'reais')}")
+    falta = h["minimo"] - len(novos)
+    L += [f"    Decisao: so com {h['minimo']} ou mais sinais novos" + (f" (faltam {falta})." if falta > 0 else " (ja ha)."),
+          "    G so passa se ganhar as regras atuais com pontos normais E com pontos finos e custos reais.",
+          "    Nao se muda: se falhar, deita-se fora."]
+    return L
+
+
 def _pts_finos(pc):
     """O percurso com a serie fina (preco de venda Jupiter onde existe), no formato dos pontos normais."""
     return dict(pc, pts=[[sg, rl] for sg, rl, _ in _serie_fina(pc)])
@@ -542,6 +579,7 @@ def analisar(cfg):
     L += _secao_hipoteses_congeladas(percursos, atual, cfg)
     L += _secao_hipoteses_entrada(percursos, cfg)
     L += _secao_hipoteses_saida_d(percursos, cfg)
+    L += _secao_hipoteses_saida_g(percursos, atual, cfg)
 
     L += _secao_pontos_finos(percursos, [r for _, r in resultados[:5]], atual, cfg)
     L += _secao_entrada_adiada(percursos, atual, cfg)

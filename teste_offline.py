@@ -2077,6 +2077,13 @@ def t_entrada_na_queda(pasta):
     txt = "\n".join(B._secao_hipoteses_saida_d(pcs, cfg2, dict(B.HIPOTESES_SAIDA_D, desde_sinal=1)))
     assert "D + saidas atuais (referencia)" in txt and "E) stop -30%" in txt and "faltam 27" in txt
     assert "Ainda nao ha sinais novos" in "\n".join(B._secao_hipoteses_saida_d(pcs, cfg2))
+    import laboratorio as LAB
+    atual = (cfg2["stop_loss_pct"], cfg2["take_profit_pct"], cfg2["trailing_ativar_pct"],
+             cfg2["trailing_distancia_pct"], cfg2["tempo_maximo_min"])
+    txt = "\n".join(LAB._secao_hipoteses_saida_g(pcs, atual, cfg2, dict(LAB.HIPOTESES_SAIDA_G, desde_sinal=1)))
+    assert "G) stop -20% / alvo +25% / 30 min" in txt and "faltam 27" in txt
+    assert "Ainda nao ha sinais novos (comecam no 196.o)" in "\n".join(LAB._secao_hipoteses_saida_g(pcs, atual, cfg2))
+    assert B.CONFIG["entrada_queda_ativa"] is False                      # D desligada a 26/11/2026
 
 
 def main():

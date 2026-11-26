@@ -157,3 +157,9 @@ Estado, histórico de operações, logs, bases SQLite, fixtures, watchlists reai
 
 - O reset passou a arquivar também o diário de auditoria (`paper_audit.jsonl`) junto com o estado, os trades e o diário Paper. Antes ficava no sítio, e os eventos antigos de compra deixavam de bater certo com o diário Paper novo: o bot bloqueava as compras logo a seguir ao reset ("Reconciliação B13 falhou").
 - `python bot.py --reset --confirmar-reset` já não arranca o bot depois do reset: no servidor é o serviço que o arranca.
+
+## 26/11/2026 — entrada D desligada; hipótese de saída G
+
+- Nos sinais 130–195 (desde que a D foi ativada) a entrada na queda deu −9,1% por trade contra cerca de +7% da entrada logo no sinal; as compras reais confirmaram (19 fechadas, 4 ganhas, −$7,86). `entrada_queda_ativa` passa a `False`: as propostas voltam a chegar logo no sinal. O código da D fica, desligado.
+- As saídas E e F (para a D) falharam.
+- Nova hipótese congelada G (com os primeiros 195 sinais; medida do 196.º em diante, entrada logo no sinal): stop −20%, alvo +25%, sem trailing, 30 min — a regra que passou a prova dos nove. Só passa se ganhar as regras atuais com pontos normais E com pontos finos e custos reais, com 30+ sinais novos.
