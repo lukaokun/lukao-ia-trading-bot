@@ -2084,6 +2084,9 @@ def t_entrada_na_queda(pasta):
     assert "G) stop -20% / alvo +25% / 30 min" in txt and "faltam 27" in txt
     assert "Ainda nao ha sinais novos (comecam no 196.o)" in "\n".join(LAB._secao_hipoteses_saida_g(pcs, atual, cfg2))
     assert B.CONFIG["entrada_queda_ativa"] is False                      # D desligada a 26/11/2026
+    txt = "\n".join(LAB._secao_hipoteses_saida_h(pcs, atual, cfg2, dict(LAB.HIPOTESES_SAIDA_H, desde_sinal=1)))
+    assert "H) stop -30% / alvo +25% / 20/15 / 30 min" in txt and "faltam 27" in txt
+    assert "comecam no 227.o" in "\n".join(LAB._secao_hipoteses_saida_h(pcs, atual, cfg2))
 
 
 def main():

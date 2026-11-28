@@ -163,3 +163,8 @@ Estado, histórico de operações, logs, bases SQLite, fixtures, watchlists reai
 - Nos sinais 130–195 (desde que a D foi ativada) a entrada na queda deu −9,1% por trade contra cerca de +7% da entrada logo no sinal; as compras reais confirmaram (19 fechadas, 4 ganhas, −$7,86). `entrada_queda_ativa` passa a `False`: as propostas voltam a chegar logo no sinal. O código da D fica, desligado.
 - As saídas E e F (para a D) falharam.
 - Nova hipótese congelada G (com os primeiros 195 sinais; medida do 196.º em diante, entrada logo no sinal): stop −20%, alvo +25%, sem trailing, 30 min — a regra que passou a prova dos nove. Só passa se ganhar as regras atuais com pontos normais E com pontos finos e custos reais, com 30+ sinais novos.
+
+## 28/11/2026 — G falhou; hipótese de saída H
+
+- G (stop −20%, alvo +25%, 30 min) falhou nos 31 sinais novos: ganhava com pontos normais (−0,4% contra −5,5%) mas perdia com o preço real (−8,7% contra −5,7%). O stop −20% é apertado demais para o preço real.
+- Nova hipótese congelada H (com os primeiros 226 sinais; medida do 227.º em diante, entrada logo no sinal): stop −30%, alvo +25%, trailing 20/15, 30 min — a família stop −30% / alvo +25% esteve sempre no topo, e esta variante é a melhor com preço real e custos reais (+1,4% contra −3,3% nos 208 percursos com pontos finos, escolhida com esses mesmos dados). Decide-se com 30+ sinais novos e só passa se ganhar com pontos finos E com custos reais.
